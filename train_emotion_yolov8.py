@@ -6,14 +6,24 @@ from pathlib import Path
 from ultralytics import YOLO
 
 
+EXPECTED_EMOTION_CLASSES = {
+    "anger",
+    "disgust",
+    "fear",
+    "happy",
+    "sad",
+    "surprise",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a YOLOv8 classification model for facial expression recognition."
+        description="Train a YOLOv8 classification model for 6-class facial expression recognition."
     )
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path(r"G:\731\emotion_cls_data"),
+        default=Path(r"G:\731\prepared_datasets\emotion"),
         help="Prepared classification dataset root with train/val folders.",
     )
     parser.add_argument(
@@ -46,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--name",
         type=str,
-        default="emotion_yolov8n_cls",
+        default="emotion_yolov8n_cls_v2",
         help="Training run name.",
     )
     parser.add_argument("--patience", type=int, default=10, help="Early stop patience.")
@@ -59,6 +69,15 @@ def validate_dataset_root(data_root: Path) -> None:
     if missing:
         raise FileNotFoundError(
             "Prepared dataset is missing required folders: " + ", ".join(missing)
+        )
+
+    discovered_classes = {
+        path.name for path in (data_root / "train").iterdir() if path.is_dir()
+    }
+    if discovered_classes != EXPECTED_EMOTION_CLASSES:
+        raise ValueError(
+            "Emotion dataset classes do not match the expected 6-class set. "
+            f"Expected {sorted(EXPECTED_EMOTION_CLASSES)}, got {sorted(discovered_classes)}."
         )
 
 
