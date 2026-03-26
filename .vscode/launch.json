@@ -1,0 +1,57 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Prepare Dataset",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\prepare_dataset.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--overwrite"
+      ]
+    },
+    {
+      "name": "Train YOLOv8 Emotion Model",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\train_emotion_yolov8.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--epochs",
+        "30",
+        "--batch",
+        "64",
+        "--device",
+        "0"
+      ]
+    },
+    {
+      "name": "Train timm Eye Model",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\train_eye_timm.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--device",
+        "cuda:0",
+        "--overwrite"
+      ]
+    },
+    {
+      "name": "Run Focus Monitor",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\realtime_emotion_webcam.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--device",
+        "0",
+        "--window-width",
+        "1280",
+        "--window-height",
+        "720"
+      ]
+    }
+  ]
+}

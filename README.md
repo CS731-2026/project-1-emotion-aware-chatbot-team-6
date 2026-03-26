@@ -1,7 +1,11 @@
-# YOLOv8 webcam facial expression recognition
+# Face Detection + timm Classification Focus Monitor
 
-This project trains a YOLOv8 classification model on the dataset under `G:\731\dataset`,
-then uses a webcam for real-time facial expression recognition.
+This project now uses:
+
+- YOLO face detection for face boxes
+- `timm` image classification for emotion recognition
+- `timm` image classification for open-eye / closed-eye recognition
+- geometry-based eye boxes drawn inside each detected face
 
 ## Python version note
 
@@ -10,25 +14,45 @@ the recommended choice is Python `3.11`, otherwise training will fall back to CP
 
 ## Project files
 
-- `prepare_dataset.py`: rebuilds the dataset into YOLOv8 classification format.
-- `train_emotion_yolov8.py`: trains a YOLOv8 classification model.
-- `realtime_emotion_webcam.py`: runs real-time webcam inference.
-- `.vscode/`: VS Code interpreter, tasks, and launch configs.
+- `prepare_dataset.py`: prepares `emotion` and `eye` datasets into folder-based classification format.
+- `train_emotion_yolov8.py`: older YOLOv8 emotion training script kept for comparison.
+- `train_emotion_timm.py`: trains the timm emotion classifier benchmark.
+- `train_eye_timm.py`: trains the timm eye-state classifier.
+- `realtime_emotion_webcam.py`: runs real-time face detection with timm emotion and eye-state recognition.
+- `summarize_timm_benchmark.py`: summarizes multiple emotion timm runs.
+- `.vscode/`: VS Code interpreter and launch configs.
 
-## Important dataset note
+## Dataset layout
 
-`labels.csv` contains the effective label for each image. The original folder names are not
-fully reliable, so `prepare_dataset.py` uses the `label` column as ground truth.
+The source dataset is expected under `G:\731\dataset`:
 
-## Recommended workflow
+- `emotion/`: folder-based classification dataset with `train`, `valid`, `test`
+- `eye/`: classification dataset exported with `_classes.csv`
+- `Affectnet-HQ/`: optional extra emotion dataset in `labels.csv + folders` format
 
-1. Open `G:\731` in VS Code.
-2. Create a virtual environment and install dependencies.
-3. Prepare the dataset split.
-4. Train the YOLOv8 classification model.
-5. Run the webcam program.
+`prepare_dataset.py` converts them into:
 
-## Commands
+- `G:\731\prepared_datasets\emotion`
+- `G:\731\prepared_datasets\eye`
+
+The emotion task is standardized to 6 classes only:
+
+- `anger`
+- `disgust`
+- `fear`
+- `happy`
+- `sad`
+- `surprise`
+
+The eye task uses 2 classes:
+
+- `closed_eye`
+- `open_eye`
+
+If `Affectnet-HQ` exists, it is merged into the emotion training split automatically.
+Rows with labels outside those 6 classes are skipped.
+
+## Environment setup
 
 ```powershell
 cd G:\731
@@ -36,19 +60,69 @@ py -3.11 -m venv .venv311
 .\.venv311\Scripts\python.exe -m pip install --upgrade pip
 .\.venv311\Scripts\python.exe -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu130
 .\.venv311\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv311\Scripts\python.exe prepare_dataset.py --overwrite
-.\.venv311\Scripts\python.exe train_emotion_yolov8.py --epochs 30 --batch 64 --device 0
-.\.venv311\Scripts\python.exe realtime_emotion_webcam.py --device 0
 ```
 
-## Optional settings
+## Data preparation
 
-- `prepare_dataset.py --min-confidence 0.8`: keep only higher-confidence labels.
-- `train_emotion_yolov8.py --model yolov8s-cls.pt`: switch to a larger classifier.
-- `realtime_emotion_webcam.py --skip-frames 1`: improve FPS on slower machines.
+```powershell
+.\.venv311\Scripts\python.exe prepare_dataset.py --overwrite
+```
 
-## Output locations
+## Training
 
-- Prepared dataset: `G:\731\emotion_cls_data`
-- Training runs: `G:\731\runs`
-- Best model: `G:\731\runs\emotion_yolov8n_cls\weights\best.pt`
+Emotion benchmark model example:
+
+```powershell
+.\.venv311\Scripts\python.exe train_emotion_timm.py --model-key resnet50 --epochs 20 --batch-size 32 --img-size 224 --device cuda --overwrite
+```
+
+Eye model:
+
+```powershell
+.\.venv311\Scripts\python.exe train_eye_timm.py --device cuda:0 --overwrite
+```
+
+The eye training script is fixed to `EfficientNet-B0` and writes to:
+
+- `G:\731\runs_timm\eye_efficientnet_b0\best_model.pth`
+- `G:\731\runs_timm\eye_efficientnet_b0\metadata.json`
+
+If you want to compare all five emotion models, run:
+
+- `resnet50`
+- `efficientnet_b0`
+- `efficientnet_b3`
+- `swin_tiny`
+- `mobilenet_v2`
+
+Then summarize them with:
+
+```powershell
+.\.venv311\Scripts\python.exe summarize_timm_benchmark.py --run-names resnet50 efficientnet_b0 efficientnet_b3 swin_tiny mobilenet_v2
+```
+
+## Real-time inference
+
+```powershell
+.\.venv311\Scripts\python.exe realtime_emotion_webcam.py --device 0 --window-width 1280 --window-height 720
+```
+
+`realtime_emotion_webcam.py` now resolves classifiers from `G:\731\runs_timm`, not from `G:\731\runs`.
+It reads each run's `metadata.json` and `best_model.pth`.
+
+You can also pass explicit checkpoints or run directories:
+
+```powershell
+.\.venv311\Scripts\python.exe realtime_emotion_webcam.py `
+  --emotion-model G:\731\runs_timm\resnet50 `
+  --eye-model G:\731\runs_timm\eye_efficientnet_b0 `
+  --device 0
+```
+
+## Runtime behavior
+
+- Green boxes show faces and emotion labels.
+- Blue boxes show eyes and eye-state labels.
+- When the primary face stays closed-eyed for 3 seconds or more, the overlay shows `Please stay focused`.
+- Window size is adjustable with `--window-width` and `--window-height`.
+- Capture resolution is adjustable with `--capture-width` and `--capture-height`.

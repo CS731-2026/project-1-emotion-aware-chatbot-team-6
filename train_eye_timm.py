@@ -19,93 +19,37 @@ from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 
 
-EXPECTED_CLASSES = {
-    "anger",
-    "disgust",
-    "fear",
-    "happy",
-    "sad",
-    "surprise",
+EXPECTED_CLASSES = {"closed_eye", "open_eye"}
+MODEL_SPEC = {
+    "model_key": "efficientnet_b0",
+    "timm_name": "efficientnet_b0",
+    "display_name": "EfficientNet-B0",
 }
-
-MODEL_SPECS = {
-    "resnet50": {
-        "timm_name": "resnet50",
-        "display_name": "ResNet50",
-    },
-    "efficientnet_b0": {
-        "timm_name": "efficientnet_b0",
-        "display_name": "EfficientNet-B0",
-    },
-    "efficientnet_b3": {
-        "timm_name": "efficientnet_b3",
-        "display_name": "EfficientNet-B3",
-    },
-    "swin_tiny": {
-        "timm_name": "swin_tiny_patch4_window7_224",
-        "display_name": "Swin Transformer Tiny",
-    },
-    "mobilenet_v2": {
-        "timm_name": "mobilenetv2_100",
-        "display_name": "MobileNetV2",
-    },
-}
-
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a timm emotion classifier under a fixed benchmark setting."
+        description="Train a timm eye-state classifier with a fixed EfficientNet-B0 setup."
     )
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path(r"G:\731\prepared_datasets\emotion"),
+        default=Path(r"G:\731\prepared_datasets\eye"),
         help="Prepared dataset root with train/val/test folders.",
     )
+    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
+    parser.add_argument("--img-size", type=int, default=224, help="Model input size.")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for AdamW.")
     parser.add_argument(
-        "--model-key",
-        type=str,
-        choices=sorted(MODEL_SPECS),
-        required=True,
-        help="Benchmark model key.",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=20,
-        help="Number of training epochs.",
-    )
-    parser.add_argument(
-        "--img-size",
-        type=int,
-        default=224,
-        help="Shared input size for all models.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Shared batch size for all models.",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-3,
-        help="Learning rate for AdamW.",
-    )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=1e-4,
-        help="Weight decay for AdamW.",
+        "--weight-decay", type=float, default=1e-4, help="Weight decay for AdamW."
     )
     parser.add_argument(
         "--label-smoothing",
         type=float,
-        default=0.1,
+        default=0.0,
         help="Label smoothing for cross-entropy loss.",
     )
     parser.add_argument(
@@ -120,23 +64,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Data loader workers. Use 0 on Windows if multiprocess loading is unstable.",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed.",
-    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
         "--runs-root",
         type=Path,
         default=Path(r"G:\731\runs_timm"),
-        help="Directory for timm benchmark runs.",
+        help="Directory for timm runs.",
     )
     parser.add_argument(
         "--run-name",
         type=str,
-        default=None,
-        help="Optional run directory name. Defaults to the model key.",
+        default="eye_efficientnet_b0",
+        help="Run directory name under runs_root.",
     )
     parser.add_argument(
         "--overwrite",
@@ -186,7 +125,7 @@ def validate_class_names(class_names: list[str]) -> None:
     discovered = set(class_names)
     if discovered != EXPECTED_CLASSES:
         raise ValueError(
-            "Dataset classes do not match the expected 6-class set. "
+            "Dataset classes do not match the expected 2-class set. "
             f"Expected {sorted(EXPECTED_CLASSES)}, got {sorted(discovered)}."
         )
 
@@ -368,13 +307,11 @@ def save_history(history_path: Path, history_rows: list[dict[str, float | int]])
 
 def main() -> None:
     args = parse_args()
-    spec = MODEL_SPECS[args.model_key]
-    run_name = args.run_name or args.model_key
     device = resolve_device(args.device)
     amp_enabled = device.type == "cuda"
 
     set_seed(args.seed)
-    run_dir = create_run_dir(args.runs_root, run_name, args.overwrite)
+    run_dir = create_run_dir(args.runs_root, args.run_name, args.overwrite)
     datasets_map, dataloaders = build_dataloaders(
         args.data_root,
         args.img_size,
@@ -384,7 +321,7 @@ def main() -> None:
     )
 
     model = timm.create_model(
-        spec["timm_name"],
+        MODEL_SPEC["timm_name"],
         pretrained=not args.no_pretrained,
         num_classes=len(datasets_map["train"].classes),
     )
@@ -396,10 +333,10 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     metadata = {
-        "task": "emotion",
-        "model_key": args.model_key,
-        "display_name": spec["display_name"],
-        "timm_name": spec["timm_name"],
+        "task": "eye",
+        "model_key": MODEL_SPEC["model_key"],
+        "display_name": MODEL_SPEC["display_name"],
+        "timm_name": MODEL_SPEC["timm_name"],
         "pretrained": not args.no_pretrained,
         "epochs": args.epochs,
         "img_size": args.img_size,
@@ -425,7 +362,7 @@ def main() -> None:
     last_checkpoint_path = run_dir / "last_model.pth"
 
     print(f"Run directory: {run_dir}")
-    print(f"Model: {spec['display_name']} ({spec['timm_name']})")
+    print(f"Model: {MODEL_SPEC['display_name']} ({MODEL_SPEC['timm_name']})")
     print(f"Classes: {datasets_map['train'].classes}")
     print(f"Train images: {len(datasets_map['train'])}")
     print(f"Val images: {len(datasets_map['val'])}")
@@ -515,10 +452,10 @@ def main() -> None:
     )
 
     metrics = {
-        "task": "emotion",
-        "model_key": args.model_key,
-        "display_name": spec["display_name"],
-        "timm_name": spec["timm_name"],
+        "task": "eye",
+        "model_key": MODEL_SPEC["model_key"],
+        "display_name": MODEL_SPEC["display_name"],
+        "timm_name": MODEL_SPEC["timm_name"],
         "best_epoch": best_epoch,
         "best_val_accuracy": round(best_val_accuracy, 4),
         "final_val_accuracy": round(val_accuracy, 4),

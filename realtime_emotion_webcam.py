@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 import urllib.request
 from pathlib import Path
 
 import cv2
+import timm
+import torch
+from PIL import Image
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 from ultralytics import YOLO
 
 
@@ -13,23 +19,33 @@ FACE_MODEL_URL = (
     "https://github.com/lindevs/yolov8-face/releases/latest/download/"
     "yolov8n-face-lindevs.pt"
 )
+EMOTION_CLASSES = {"anger", "disgust", "fear", "happy", "sad", "surprise"}
+EYE_CLASSES = {"closed_eye", "open_eye"}
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run YOLO-based face detection, emotion recognition, and eye-state monitoring from a webcam."
+        description="Run face detection with timm-based emotion and eye-state recognition from a webcam."
     )
     parser.add_argument(
         "--emotion-model",
         type=Path,
         default=None,
-        help="Path to a trained YOLOv8 emotion classification checkpoint.",
+        help="Path to a timm emotion checkpoint file or run directory.",
     )
     parser.add_argument(
         "--eye-model",
         type=Path,
         default=None,
-        help="Path to a trained YOLOv8 eye-state classification checkpoint.",
+        help="Path to a timm eye-state checkpoint file or run directory.",
+    )
+    parser.add_argument(
+        "--runs-root",
+        type=Path,
+        default=Path(r"G:\731\runs_timm"),
+        help="Directory containing timm training runs.",
     )
     parser.add_argument(
         "--face-model",
@@ -66,19 +82,13 @@ def parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default="0",
-        help='Inference device, for example "0" or "cpu".',
+        help='Inference device, for example "0", "cuda:0", or "cpu".',
     )
     parser.add_argument(
         "--face-imgsz",
         type=int,
         default=640,
         help="YOLO face detector input size.",
-    )
-    parser.add_argument(
-        "--cls-imgsz",
-        type=int,
-        default=224,
-        help="Classification image size for emotion and eye-state models.",
     )
     parser.add_argument(
         "--face-confidence",
@@ -119,25 +129,66 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_latest_model(directory: Path, prefix: str) -> Path:
-    candidates = sorted(
-        directory.glob(f"{prefix}*/weights/best.pt"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+def build_eval_transform(img_size: int) -> transforms.Compose:
+    resize_size = int(img_size * 256 / 224)
+    return transforms.Compose(
+        [
+            transforms.Resize(resize_size, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
     )
+
+
+def normalize_checkpoint_path(model_path: Path | None) -> Path | None:
+    if model_path is None:
+        return None
+    if model_path.is_dir():
+        return model_path / "best_model.pth"
+    return model_path
+
+
+def infer_task_from_metadata(metadata: dict) -> str | None:
+    task = metadata.get("task")
+    if task in {"emotion", "eye"}:
+        return task
+
+    classes = set(metadata.get("classes", []))
+    if classes == EMOTION_CLASSES:
+        return "emotion"
+    if classes == EYE_CLASSES:
+        return "eye"
+    return None
+
+
+def resolve_latest_timm_model(runs_root: Path, task: str) -> Path:
+    candidates: list[Path] = []
+    for metadata_path in runs_root.glob("*/metadata.json"):
+        checkpoint_path = metadata_path.parent / "best_model.pth"
+        if not checkpoint_path.exists():
+            continue
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if infer_task_from_metadata(metadata) == task:
+            candidates.append(checkpoint_path)
+
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     if not candidates:
         raise FileNotFoundError(
-            f"No model matching {prefix}* was found under {directory}."
+            f"No {task} model matching runs under {runs_root}."
         )
     return candidates[0]
 
 
 def resolve_classifier_paths(
-    emotion_path: Path | None, eye_path: Path | None
+    emotion_path: Path | None, eye_path: Path | None, runs_root: Path
 ) -> tuple[Path, Path]:
-    runs_dir = Path(r"G:\731\runs")
-    resolved_emotion = emotion_path or resolve_latest_model(runs_dir, "emotion_")
-    resolved_eye = eye_path or resolve_latest_model(runs_dir, "eye_")
+    resolved_emotion = normalize_checkpoint_path(emotion_path) or resolve_latest_timm_model(
+        runs_root, "emotion"
+    )
+    resolved_eye = normalize_checkpoint_path(eye_path) or resolve_latest_timm_model(
+        runs_root, "eye"
+    )
 
     if not resolved_emotion.exists():
         raise FileNotFoundError(f"Emotion model not found: {resolved_emotion}")
@@ -154,6 +205,62 @@ def ensure_face_model(face_model_path: Path) -> Path:
     print(f"Downloading face detector to {face_model_path} ...")
     urllib.request.urlretrieve(FACE_MODEL_URL, face_model_path)
     return face_model_path
+
+
+def resolve_devices(device_arg: str) -> tuple[str, torch.device]:
+    normalized = device_arg.strip().lower()
+    if normalized.isdigit():
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA device index was requested but CUDA is not available.")
+        return normalized, torch.device(f"cuda:{normalized}")
+    if normalized.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but CUDA is not available.")
+        return normalized, torch.device(normalized)
+    if normalized == "cpu":
+        return "cpu", torch.device("cpu")
+    raise ValueError(
+        'Unsupported device. Use values like "0", "cuda:0", or "cpu".'
+    )
+
+
+def load_timm_classifier(
+    checkpoint_path: Path, device: torch.device
+) -> dict[str, object]:
+    metadata_path = checkpoint_path.parent / "metadata.json"
+    metadata = None
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if metadata is None:
+        metadata = checkpoint.get("metadata")
+    if metadata is None:
+        raise ValueError(f"Missing metadata for checkpoint: {checkpoint_path}")
+
+    class_names = metadata.get("classes")
+    timm_name = metadata.get("timm_name")
+    img_size = int(metadata.get("img_size", 224))
+    if not class_names or not timm_name:
+        raise ValueError(f"Invalid metadata in {metadata_path}")
+
+    model = timm.create_model(
+        timm_name,
+        pretrained=False,
+        num_classes=len(class_names),
+    )
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    return {
+        "checkpoint_path": checkpoint_path,
+        "class_names": class_names,
+        "metadata": metadata,
+        "model": model,
+        "transform": build_eval_transform(img_size),
+    }
 
 
 def expand_box(
@@ -212,19 +319,28 @@ def normalize_label(label: str) -> str:
     return label.replace("_", " ")
 
 
+@torch.inference_mode()
 def classify_crops(
-    model: YOLO, crops_rgb: list, imgsz: int, device: str
+    classifier: dict[str, object], crops_rgb: list, device: torch.device
 ) -> list[tuple[str, float]]:
-    results = model.predict(source=crops_rgb, imgsz=imgsz, device=device, verbose=False)
-    predictions = []
-    for result in results:
-        probs = result.probs
-        if probs is None:
-            predictions.append(("unknown", 0.0))
-            continue
-        top1 = int(probs.top1)
-        predictions.append((str(model.names[top1]), float(probs.top1conf)))
-    return predictions
+    if not crops_rgb:
+        return []
+
+    transform = classifier["transform"]
+    model = classifier["model"]
+    class_names = classifier["class_names"]
+
+    batch = torch.stack(
+        [transform(Image.fromarray(crop_rgb)) for crop_rgb in crops_rgb]
+    ).to(device)
+    logits = model(batch)
+    probabilities = torch.softmax(logits, dim=1)
+    confidences, indices = probabilities.max(dim=1)
+
+    return [
+        (str(class_names[int(index)]), float(confidence))
+        for index, confidence in zip(indices, confidences)
+    ]
 
 
 def estimate_eye_boxes(face_shape: tuple[int, int, int]) -> list[tuple[int, int, int, int]]:
@@ -249,14 +365,15 @@ def estimate_eye_boxes(face_shape: tuple[int, int, int]) -> list[tuple[int, int,
 
 def main() -> None:
     args = parse_args()
+    face_device, torch_device = resolve_devices(args.device)
     emotion_model_path, eye_model_path = resolve_classifier_paths(
-        args.emotion_model, args.eye_model
+        args.emotion_model, args.eye_model, args.runs_root
     )
     face_model_path = ensure_face_model(args.face_model)
 
     face_detector = YOLO(str(face_model_path))
-    emotion_model = YOLO(str(emotion_model_path))
-    eye_model = YOLO(str(eye_model_path))
+    emotion_classifier = load_timm_classifier(emotion_model_path, torch_device)
+    eye_classifier = load_timm_classifier(eye_model_path, torch_device)
 
     cap = cv2.VideoCapture(args.camera_index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.capture_width)
@@ -264,7 +381,7 @@ def main() -> None:
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open webcam index {args.camera_index}.")
 
-    window_name = "YOLO Focus Monitor"
+    window_name = "Focus Monitor"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, args.window_width, args.window_height)
 
@@ -298,7 +415,7 @@ def main() -> None:
                 face_result = face_detector.predict(
                     source=frame,
                     imgsz=args.face_imgsz,
-                    device=args.device,
+                    device=face_device,
                     conf=args.face_confidence,
                     verbose=False,
                     max_det=args.max_faces,
@@ -333,10 +450,10 @@ def main() -> None:
 
                 if crops_rgb:
                     emotion_predictions = classify_crops(
-                        emotion_model, crops_rgb, args.cls_imgsz, args.device
+                        emotion_classifier, crops_rgb, torch_device
                     )
                     eye_predictions = classify_crops(
-                        eye_model, crops_rgb, args.cls_imgsz, args.device
+                        eye_classifier, crops_rgb, torch_device
                     )
 
                     for box, face_rgb, emotion_pred, eye_pred in zip(
