@@ -19,7 +19,7 @@ DEFAULT_MODEL_ORDER = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Summarize timm benchmark runs into a comparison plot and table."
+        description="Summarize 7-class timm benchmark runs into a comparison plot and table."
     )
     parser.add_argument(
         "--runs-root",
@@ -126,7 +126,7 @@ def main() -> None:
             }
         )
 
-    plt.title("Validation Accuracy Comparison Across timm Models")
+    plt.title("Validation Accuracy Comparison Across 7-Class timm Models")
     plt.xlabel("Epoch")
     plt.ylabel("Validation Accuracy (%)")
     plt.xticks(range(1, max_epoch + 1))

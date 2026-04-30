@@ -11,6 +11,7 @@ EXPECTED_EMOTION_CLASSES = {
     "disgust",
     "fear",
     "happy",
+    "neutral",
     "sad",
     "surprise",
 }
@@ -18,7 +19,7 @@ EXPECTED_EMOTION_CLASSES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a YOLOv8 classification model for 6-class facial expression recognition."
+        description="Train a YOLOv8 classification model for 7-class facial expression recognition."
     )
     parser.add_argument(
         "--data-root",
@@ -76,7 +77,7 @@ def validate_dataset_root(data_root: Path) -> None:
     }
     if discovered_classes != EXPECTED_EMOTION_CLASSES:
         raise ValueError(
-            "Emotion dataset classes do not match the expected 6-class set. "
+            "Emotion dataset classes do not match the expected 7-class set. "
             f"Expected {sorted(EXPECTED_EMOTION_CLASSES)}, got {sorted(discovered_classes)}."
         )
 

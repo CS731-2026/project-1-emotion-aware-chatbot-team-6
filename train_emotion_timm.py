@@ -24,6 +24,7 @@ EXPECTED_CLASSES = {
     "disgust",
     "fear",
     "happy",
+    "neutral",
     "sad",
     "surprise",
 }
@@ -57,7 +58,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a timm emotion classifier under a fixed benchmark setting."
+        description="Train a timm emotion classifier under a fixed 7-class benchmark setting."
     )
     parser.add_argument(
         "--data-root",
@@ -186,7 +187,7 @@ def validate_class_names(class_names: list[str]) -> None:
     discovered = set(class_names)
     if discovered != EXPECTED_CLASSES:
         raise ValueError(
-            "Dataset classes do not match the expected 6-class set. "
+            "Dataset classes do not match the expected 7-class set. "
             f"Expected {sorted(EXPECTED_CLASSES)}, got {sorted(discovered)}."
         )
 
@@ -410,6 +411,7 @@ def main() -> None:
         "seed": args.seed,
         "device": str(device),
         "classes": datasets_map["train"].classes,
+        "num_classes": len(datasets_map["train"].classes),
         "num_parameters": count_parameters(model),
     }
     (run_dir / "metadata.json").write_text(

@@ -19,7 +19,7 @@ FACE_MODEL_URL = (
     "https://github.com/lindevs/yolov8-face/releases/latest/download/"
     "yolov8n-face-lindevs.pt"
 )
-EMOTION_CLASSES = {"anger", "disgust", "fear", "happy", "sad", "surprise"}
+EMOTION_CLASSES = {"anger", "disgust", "fear", "happy", "neutral", "sad", "surprise"}
 EYE_CLASSES = {"closed_eye", "open_eye"}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--emotion-model",
         type=Path,
-        default=None,
+        default=Path(r"G:\731\runs_timm\efficientnet_b0\best_model.pth"),
         help="Path to a timm emotion checkpoint file or run directory.",
     )
     parser.add_argument(
@@ -123,8 +123,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--focus-seconds",
         type=float,
-        default=3.0,
+        default=2.0,
         help="Closed-eye duration before the focus warning is shown.",
+    )
+    parser.add_argument(
+        "--driver-side",
+        type=str,
+        choices=["left", "center", "right", "largest"],
+        default="right",
+        help="Heuristic used to choose the driver's face when multiple faces are visible.",
     )
     return parser.parse_args()
 
@@ -319,6 +326,37 @@ def normalize_label(label: str) -> str:
     return label.replace("_", " ")
 
 
+def choose_driver_face(
+    faces: list[dict],
+    frame_width: int,
+    driver_side: str,
+    previous_center_x: float | None = None,
+) -> dict | None:
+    if not faces:
+        return None
+    if driver_side == "largest":
+        return max(faces, key=lambda item: item["area"])
+
+    preferred_x = {
+        "left": 0.25,
+        "center": 0.50,
+        "right": 0.75,
+    }.get(driver_side, 0.75)
+    max_area = max(face["area"] for face in faces) or 1
+
+    def score(face: dict) -> float:
+        x1, _, x2, _ = face["bbox"]
+        center_x = ((x1 + x2) / 2.0) / max(frame_width, 1)
+        area_score = face["area"] / max_area
+        position_score = 1.0 - min(abs(center_x - preferred_x), 1.0)
+        tracking_score = 0.0
+        if previous_center_x is not None:
+            tracking_score = 1.0 - min(abs(center_x - previous_center_x), 1.0)
+        return 0.50 * area_score + 0.35 * position_score + 0.15 * tracking_score
+
+    return max(faces, key=score)
+
+
 @torch.inference_mode()
 def classify_crops(
     classifier: dict[str, object], crops_rgb: list, device: torch.device
@@ -389,6 +427,7 @@ def main() -> None:
     fps = 0.0
     previous_time = time.perf_counter()
     closed_eye_start: float | None = None
+    previous_driver_center_x: float | None = None
     cached_faces: list[dict] = []
 
     print(f"Face detector: {face_model_path}")
@@ -477,7 +516,15 @@ def main() -> None:
                             }
                         )
 
-            primary_face = max(cached_faces, key=lambda item: item["area"], default=None)
+            primary_face = choose_driver_face(
+                cached_faces,
+                frame_w,
+                args.driver_side,
+                previous_driver_center_x,
+            )
+            if primary_face is not None:
+                x1, _, x2, _ = primary_face["bbox"]
+                previous_driver_center_x = ((x1 + x2) / 2.0) / max(frame_w, 1)
             current_time = time.perf_counter()
             if (
                 primary_face
@@ -498,8 +545,15 @@ def main() -> None:
                 x1, y1, x2, y2 = face_info["bbox"]
                 emotion_conf = face_info["emotion_confidence"]
                 eye_conf = face_info["eye_confidence"]
+                is_driver_face = face_info is primary_face
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 255, 0),
+                    3 if is_driver_face else 2,
+                )
                 if emotion_conf >= args.classification_confidence:
                     draw_tag(
                         frame,
@@ -526,6 +580,8 @@ def main() -> None:
                     (x1, min(frame_h - 5, y2 + 28)),
                     (255, 0, 0),
                 )
+                if is_driver_face:
+                    draw_tag(frame, "driver", (x1, y2 + 56), (255, 255, 255))
 
             delta = current_time - previous_time
             if delta > 0:

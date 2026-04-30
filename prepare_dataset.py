@@ -16,6 +16,7 @@ ALLOWED_EMOTION_CLASSES = {
     "disgust",
     "fear",
     "happy",
+    "neutral",
     "sad",
     "surprise",
 }
@@ -25,6 +26,7 @@ EMOTION_LABEL_MAP = {
     "disgust": "disgust",
     "fear": "fear",
     "happy": "happy",
+    "neutral": "neutral",
     "sad": "sad",
     "surprise": "surprise",
 }
