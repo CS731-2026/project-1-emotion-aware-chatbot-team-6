@@ -1,0 +1,20 @@
+{
+  "task": "eye",
+  "model_key": "efficientnet_b0",
+  "display_name": "EfficientNet-B0",
+  "timm_name": "efficientnet_b0",
+  "pretrained": true,
+  "epochs": 20,
+  "img_size": 224,
+  "batch_size": 32,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0001,
+  "label_smoothing": 0.0,
+  "seed": 42,
+  "device": "cuda",
+  "classes": [
+    "closed_eye",
+    "open_eye"
+  ],
+  "num_parameters": 4010110
+}

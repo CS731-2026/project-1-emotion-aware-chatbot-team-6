@@ -1,0 +1,15 @@
+{
+  "task": "eye",
+  "model_key": "efficientnet_b0",
+  "display_name": "EfficientNet-B0",
+  "timm_name": "efficientnet_b0",
+  "best_epoch": 16,
+  "best_val_accuracy": 98.7059,
+  "final_val_accuracy": 98.7059,
+  "final_val_loss": 0.06009,
+  "test_accuracy": 98.1439,
+  "test_loss": 0.092885,
+  "avg_inference_ms_per_image": 5.9355,
+  "images_per_second": 168.4788,
+  "num_parameters": 4010110
+}

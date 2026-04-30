@@ -1,0 +1,39 @@
+{
+  "dataset_root": "G:\\731\\dataset\\Affectnet-HQ",
+  "original_row_count": 25427,
+  "repaired_row_count": 25504,
+  "added_count": 77,
+  "dropped_count": 0,
+  "added_examples": [
+    "neutral/WIN_20260430_17_05_05_Pro.jpg",
+    "neutral/WIN_20260430_17_06_45_Pro.jpg",
+    "neutral/WIN_20260430_17_06_46_Pro (2).jpg",
+    "neutral/WIN_20260430_17_06_46_Pro.jpg",
+    "neutral/WIN_20260430_17_06_47_Pro.jpg",
+    "neutral/WIN_20260430_17_06_48_Pro (2).jpg",
+    "neutral/WIN_20260430_17_06_48_Pro.jpg",
+    "neutral/WIN_20260430_17_06_49_Pro (2).jpg",
+    "neutral/WIN_20260430_17_06_49_Pro.jpg",
+    "neutral/WIN_20260430_17_06_50_Pro (3).jpg",
+    "neutral/WIN_20260430_17_06_50_Pro.jpg",
+    "neutral/WIN_20260430_17_06_51_Pro (2).jpg",
+    "neutral/WIN_20260430_17_06_51_Pro (3).jpg",
+    "neutral/WIN_20260430_17_06_51_Pro (4).jpg",
+    "neutral/WIN_20260430_17_06_51_Pro.jpg",
+    "neutral/WIN_20260430_17_06_52_Pro (2).jpg",
+    "neutral/WIN_20260430_17_06_52_Pro (3).jpg",
+    "neutral/WIN_20260430_17_06_52_Pro.jpg",
+    "neutral/WIN_20260430_17_06_53_Pro (2).jpg",
+    "neutral/WIN_20260430_17_06_53_Pro (3).jpg"
+  ],
+  "dropped_examples": [],
+  "label_counts": {
+    "surprise": 4659,
+    "anger": 3744,
+    "disgust": 3419,
+    "sad": 3377,
+    "fear": 3169,
+    "happy": 4656,
+    "neutral": 2480
+  }
+}

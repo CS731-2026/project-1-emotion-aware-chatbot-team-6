@@ -1,0 +1,15 @@
+{
+  "task": "emotion",
+  "model_key": "efficientnet_b0",
+  "display_name": "EfficientNet-B0",
+  "timm_name": "efficientnet_b0",
+  "best_epoch": 18,
+  "best_val_accuracy": 67.0339,
+  "final_val_accuracy": 67.0339,
+  "final_val_loss": 1.341687,
+  "test_accuracy": 65.3608,
+  "test_loss": 1.375611,
+  "avg_inference_ms_per_image": 0.5696,
+  "images_per_second": 1755.6893,
+  "num_parameters": 4016515
+}
