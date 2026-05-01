@@ -8,6 +8,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 DEFAULT_MODEL_ORDER = [
     "resnet50",
     "efficientnet_b0",
@@ -24,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--runs-root",
         type=Path,
-        default=Path(r"G:\731\runs_timm"),
+        default=PROJECT_ROOT / "runs_timm",
         help="Root directory that stores timm benchmark run folders.",
     )
     parser.add_argument(
@@ -36,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(r"G:\731\runs_timm\comparison"),
+        default=PROJECT_ROOT / "runs_timm" / "comparison",
         help="Directory for the comparison outputs.",
     )
     return parser.parse_args()

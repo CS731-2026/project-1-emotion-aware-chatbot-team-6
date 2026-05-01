@@ -1,0 +1,21 @@
+﻿# Python venv
+.venv/
+venv/
+.venv311/
+
+# Environment variables
+.env
+
+# Bytecode
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Data and training outputs
+dataset/
+prepared_datasets/
+runs/
+runs_timm/

@@ -12,6 +12,7 @@ from chatbot import DriverAssistantChatbot
 from llm_benchmark import SCENARIOS, build_manual_scores, write_csv
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_TEMPERATURES = [0.5, 1.0, 1.5]
 
 
@@ -35,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(r"G:\731\benchmark_results\temperature_sweep"),
+        default=PROJECT_ROOT / "benchmark_results" / "temperature_sweep",
         help="Directory for sweep outputs.",
     )
     return parser.parse_args()

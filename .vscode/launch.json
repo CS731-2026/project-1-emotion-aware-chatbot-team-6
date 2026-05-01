@@ -27,14 +27,16 @@
       ]
     },
     {
-      "name": "Train timm Eye Model",
+      "name": "Train timm Emotion Benchmark Model",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}\\train_eye_timm.py",
+      "program": "${workspaceFolder}\\train_emotion_timm.py",
       "console": "integratedTerminal",
       "args": [
+        "--model-key",
+        "resnet50",
         "--device",
-        "cuda:0",
+        "cuda",
         "--overwrite"
       ]
     },
@@ -51,6 +53,46 @@
         "1280",
         "--window-height",
         "720"
+      ]
+    },
+    {
+      "name": "Run Driver Assistant GUI",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\driver_assistant_gui.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--device",
+        "cuda"
+      ]
+    },
+    {
+      "name": "Run LLM Benchmark",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\llm_benchmark.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Run Temperature Sweep",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\temperature_sweep.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--model",
+        "openai/gpt-4o-mini"
+      ]
+    },
+    {
+      "name": "Score LLM Results",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\score_llm_results.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--input-csv",
+        "${workspaceFolder}\\benchmark_results\\llm_benchmark\\manual_scores_template.csv"
       ]
     }
   ]

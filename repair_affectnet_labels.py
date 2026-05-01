@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
@@ -18,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-root",
         type=Path,
-        default=Path(r"G:\731\dataset\Affectnet-HQ"),
+        default=PROJECT_ROOT / "dataset" / "Affectnet-HQ",
         help="Affectnet-HQ dataset root.",
     )
     parser.add_argument(

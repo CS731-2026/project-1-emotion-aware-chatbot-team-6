@@ -15,6 +15,9 @@ from torchvision.transforms import InterpolationMode
 from ultralytics import YOLO
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_RUNS_ROOT = PROJECT_ROOT / "runs_timm"
+DEFAULT_WEIGHTS_ROOT = PROJECT_ROOT / "weights"
 FACE_MODEL_URL = (
     "https://github.com/lindevs/yolov8-face/releases/latest/download/"
     "yolov8n-face-lindevs.pt"
@@ -32,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--emotion-model",
         type=Path,
-        default=Path(r"G:\731\runs_timm\efficientnet_b0\best_model.pth"),
+        default=DEFAULT_RUNS_ROOT / "efficientnet_b0" / "best_model.pth",
         help="Path to a timm emotion checkpoint file or run directory.",
     )
     parser.add_argument(
@@ -44,13 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--runs-root",
         type=Path,
-        default=Path(r"G:\731\runs_timm"),
+        default=DEFAULT_RUNS_ROOT,
         help="Directory containing timm training runs.",
     )
     parser.add_argument(
         "--face-model",
         type=Path,
-        default=Path(r"G:\731\weights\yolov8n-face-lindevs.pt"),
+        default=DEFAULT_WEIGHTS_ROOT / "yolov8n-face-lindevs.pt",
         help="Path to the YOLO face detection model.",
     )
     parser.add_argument("--camera-index", type=int, default=0, help="Webcam index.")
@@ -132,6 +135,11 @@ def parse_args() -> argparse.Namespace:
         choices=["left", "center", "right", "largest"],
         default="right",
         help="Heuristic used to choose the driver's face when multiple faces are visible.",
+    )
+    parser.add_argument(
+        "--print-emotion-top3",
+        action="store_true",
+        help="Print the driver's emotion top-3 probabilities for each frame.",
     )
     return parser.parse_args()
 
@@ -361,24 +369,55 @@ def choose_driver_face(
 def classify_crops(
     classifier: dict[str, object], crops_rgb: list, device: torch.device
 ) -> list[tuple[str, float]]:
+    predictions = classify_crops_with_topk(
+        classifier=classifier,
+        crops_rgb=crops_rgb,
+        device=device,
+        top_k=1,
+    )
+    return [(item["label"], item["confidence"]) for item in predictions]
+
+
+@torch.inference_mode()
+def classify_crops_with_topk(
+    classifier: dict[str, object],
+    crops_rgb: list,
+    device: torch.device,
+    top_k: int = 3,
+) -> list[dict[str, object]]:
     if not crops_rgb:
         return []
 
     transform = classifier["transform"]
     model = classifier["model"]
     class_names = classifier["class_names"]
+    top_k = max(1, min(top_k, len(class_names)))
 
     batch = torch.stack(
         [transform(Image.fromarray(crop_rgb)) for crop_rgb in crops_rgb]
     ).to(device)
     logits = model(batch)
     probabilities = torch.softmax(logits, dim=1)
-    confidences, indices = probabilities.max(dim=1)
+    top_confidences, top_indices = probabilities.topk(k=top_k, dim=1)
 
-    return [
-        (str(class_names[int(index)]), float(confidence))
-        for index, confidence in zip(indices, confidences)
-    ]
+    results: list[dict[str, object]] = []
+    for confidence_row, index_row in zip(top_confidences, top_indices):
+        topk: list[tuple[str, float]] = []
+        for confidence, index in zip(confidence_row, index_row):
+            label = str(class_names[int(index)])
+            topk.append((label, float(confidence)))
+        results.append(
+            {
+                "label": topk[0][0],
+                "confidence": topk[0][1],
+                "topk": topk,
+            }
+        )
+    return results
+
+
+def format_topk_prediction(topk: list[tuple[str, float]]) -> str:
+    return ", ".join(f"{normalize_label(label)}={confidence:.3f}" for label, confidence in topk)
 
 
 def estimate_eye_boxes(face_shape: tuple[int, int, int]) -> list[tuple[int, int, int, int]]:
@@ -488,7 +527,7 @@ def main() -> None:
                         crops_rgb.append(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
 
                 if crops_rgb:
-                    emotion_predictions = classify_crops(
+                    emotion_predictions = classify_crops_with_topk(
                         emotion_classifier, crops_rgb, torch_device
                     )
                     eye_predictions = classify_crops(
@@ -508,8 +547,9 @@ def main() -> None:
                                 "bbox": (x1, y1, x2, y2),
                                 "area": (x2 - x1) * (y2 - y1),
                                 "detection_confidence": detection_conf,
-                                "emotion_label": emotion_pred[0],
-                                "emotion_confidence": emotion_pred[1],
+                                "emotion_label": emotion_pred["label"],
+                                "emotion_confidence": emotion_pred["confidence"],
+                                "emotion_topk": emotion_pred["topk"],
                                 "eye_label": eye_pred[0],
                                 "eye_confidence": eye_pred[1],
                                 "eye_boxes": eye_boxes,
@@ -624,6 +664,16 @@ def main() -> None:
                     thickness,
                     cv2.LINE_AA,
                 )
+
+            if args.print_emotion_top3:
+                if primary_face is None:
+                    print("Driver emotion top-3: no face", flush=True)
+                else:
+                    topk = primary_face.get("emotion_topk", [])
+                    print(
+                        f"Driver emotion top-3: {format_topk_prediction(topk)}",
+                        flush=True,
+                    )
 
             cv2.imshow(window_name, frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):

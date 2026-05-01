@@ -19,6 +19,8 @@ from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 EXPECTED_CLASSES = {
     "anger",
     "disgust",
@@ -63,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path(r"G:\731\prepared_datasets\emotion"),
+        default=PROJECT_ROOT / "prepared_datasets" / "emotion",
         help="Prepared dataset root with train/val/test folders.",
     )
     parser.add_argument(
@@ -130,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--runs-root",
         type=Path,
-        default=Path(r"G:\731\runs_timm"),
+        default=PROJECT_ROOT / "runs_timm",
         help="Directory for timm benchmark runs.",
     )
     parser.add_argument(
@@ -255,7 +257,7 @@ def train_one_epoch(
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     device: torch.device,
     amp_enabled: bool,
 ) -> tuple[float, float]:
@@ -394,7 +396,8 @@ def main() -> None:
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler_device = "cuda" if device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(scaler_device, enabled=amp_enabled)
 
     metadata = {
         "task": "emotion",
@@ -428,6 +431,18 @@ def main() -> None:
 
     print(f"Run directory: {run_dir}")
     print(f"Model: {spec['display_name']} ({spec['timm_name']})")
+    print(
+        "Training config: "
+        f"device={device}, amp_enabled={amp_enabled}, "
+        f"grad_scaler=torch.amp.GradScaler('{scaler_device}')"
+    )
+    print(
+        "Hyperparams: "
+        f"epochs={args.epochs}, batch_size={args.batch_size}, imgsz={args.img_size}, "
+        f"lr={args.lr}, weight_decay={args.weight_decay}, "
+        f"label_smoothing={args.label_smoothing}, pretrained={not args.no_pretrained}"
+    )
+    print(f"Data root: {args.data_root}")
     print(f"Classes: {datasets_map['train'].classes}")
     print(f"Train images: {len(datasets_map['train'])}")
     print(f"Val images: {len(datasets_map['val'])}")

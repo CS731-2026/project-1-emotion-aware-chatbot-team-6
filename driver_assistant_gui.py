@@ -6,11 +6,12 @@ import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any, cast
 
 import cv2
 import torch
 from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QCloseEvent, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -32,11 +33,13 @@ from ultralytics import YOLO
 from chatbot import DEFAULT_MODEL, DriverAssistantChatbot, SUPPORTED_LLM_MODELS
 from realtime_emotion_webcam import (
     classify_crops,
+    classify_crops_with_topk,
     choose_driver_face,
     draw_tag,
     ensure_face_model,
     estimate_eye_boxes,
     expand_box,
+    format_topk_prediction,
     load_timm_classifier,
     normalize_checkpoint_path,
     normalize_label,
@@ -44,6 +47,11 @@ from realtime_emotion_webcam import (
     resolve_latest_timm_model,
 )
 from speech_to_text import WhisperTranscriber, record_microphone_audio
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_RUNS_ROOT = PROJECT_ROOT / "runs_timm"
+DEFAULT_WEIGHTS_ROOT = PROJECT_ROOT / "weights"
 
 
 EMOTION_COLORS_BGR = {
@@ -82,25 +90,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--emotion-model",
         type=Path,
-        default=Path(r"G:\731\runs_timm\efficientnet_b0\best_model.pth"),
+        default=DEFAULT_RUNS_ROOT / "efficientnet_b0" / "best_model.pth",
         help="Path to a timm emotion checkpoint file or run directory.",
     )
     parser.add_argument(
         "--eye-model",
         type=Path,
-        default=Path(r"G:\731\runs_timm\eye_efficientnet_b0\best_model.pth"),
+        default=DEFAULT_RUNS_ROOT / "eye_efficientnet_b0" / "best_model.pth",
         help="Path to a timm eye-state checkpoint file or run directory.",
     )
     parser.add_argument(
         "--runs-root",
         type=Path,
-        default=Path(r"G:\731\runs_timm"),
+        default=DEFAULT_RUNS_ROOT,
         help="Directory containing timm training runs.",
     )
     parser.add_argument(
         "--face-model",
         type=Path,
-        default=Path(r"G:\731\weights\yolov8n-face-lindevs.pt"),
+        default=DEFAULT_WEIGHTS_ROOT / "yolov8n-face-lindevs.pt",
         help="YOLO face detector path.",
     )
     parser.add_argument("--camera-index", type=int, default=0, help="Webcam index.")
@@ -133,6 +141,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--default-llm-model", type=str, default=DEFAULT_MODEL, help="Default OpenRouter model.")
     parser.add_argument("--default-temperature", type=float, default=1.0, help="Default chatbot temperature.")
     parser.add_argument("--whisper-model-size", type=str, default="base", help="faster-whisper model size.")
+    parser.add_argument(
+        "--print-emotion-top3",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print the driver's emotion top-3 probabilities for each frame.",
+    )
     return parser.parse_args()
 
 
@@ -149,7 +163,7 @@ class ChatBubble(QFrame):
         super().__init__()
         bubble = QLabel(text)
         bubble.setWordWrap(True)
-        bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         bubble.setStyleSheet(
             (
                 "background-color: #c62828; color: white; border-radius: 14px; "
@@ -241,8 +255,16 @@ class VisionWorker(QObject):
                 detections = []
                 crops_rgb = []
                 if face_result.boxes is not None:
-                    raw_boxes = face_result.boxes.xyxy.cpu().numpy().astype(int)
-                    raw_confidences = face_result.boxes.conf.cpu().numpy().tolist()
+                    raw_boxes_data: Any = face_result.boxes.xyxy
+                    raw_conf_data: Any = face_result.boxes.conf
+                    if hasattr(raw_boxes_data, "cpu"):
+                        raw_boxes = raw_boxes_data.cpu().numpy().astype(int)
+                    else:
+                        raw_boxes = raw_boxes_data.astype(int)
+                    if hasattr(raw_conf_data, "cpu"):
+                        raw_confidences = raw_conf_data.cpu().numpy().tolist()
+                    else:
+                        raw_confidences = raw_conf_data.tolist()
                     for raw_box, detection_conf in zip(raw_boxes, raw_confidences):
                         x1, y1, x2, y2 = expand_box(
                             int(raw_box[0]),
@@ -259,7 +281,12 @@ class VisionWorker(QObject):
                         detections.append((x1, y1, x2, y2, float(detection_conf)))
                         crops_rgb.append(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
 
-                emotion_predictions = classify_crops(emotion_classifier, crops_rgb, torch_device)
+                emotion_predictions = classify_crops_with_topk(
+                    emotion_classifier,
+                    crops_rgb,
+                    torch_device,
+                    top_k=3,
+                )
                 eye_predictions = classify_crops(eye_classifier, crops_rgb, torch_device)
                 primary_face = None
                 if detections and emotion_predictions and eye_predictions:
@@ -271,7 +298,8 @@ class VisionWorker(QObject):
                         eye_predictions,
                     ):
                         x1, y1, x2, y2, detection_conf = detection
-                        emotion_label, emotion_confidence = emotion_prediction
+                        emotion_label = str(cast(str, emotion_prediction["label"]))
+                        emotion_confidence = float(cast(float, emotion_prediction["confidence"]))
                         eye_label, eye_confidence = eye_prediction
                         faces.append(
                             {
@@ -279,6 +307,7 @@ class VisionWorker(QObject):
                                 "area": (x2 - x1) * (y2 - y1),
                                 "emotion": emotion_label,
                                 "emotion_confidence": emotion_confidence,
+                                "emotion_topk": cast(list[tuple[str, float]], emotion_prediction["topk"]),
                                 "eye_label": eye_label,
                                 "eye_confidence": eye_confidence,
                                 "eye_boxes": estimate_eye_boxes(crop_rgb.shape),
@@ -341,6 +370,16 @@ class VisionWorker(QObject):
                     emotion_confidence = 0.0
                     current_eye_label = "open_eye"
                     eye_confidence = 0.0
+
+                if self.args.print_emotion_top3:
+                    if primary_face is None:
+                        print("Driver emotion top-3: no face", flush=True)
+                    else:
+                        topk = primary_face.get("emotion_topk", [])
+                        # print(
+                        #     f"Driver emotion top-3: {format_topk_prediction(topk)}",
+                        #     flush=True,
+                        # )
 
                 if (
                     primary_face is not None
@@ -571,7 +610,7 @@ class DriverAssistantWindow(QMainWindow):
         root_layout.addLayout(right_panel, 2)
 
         self.video_label = QLabel("Camera starting...")
-        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setMinimumSize(860, 560)
         self.video_label.setStyleSheet("background-color: #101418; color: white; border-radius: 12px;")
         left_panel.addWidget(self.video_label)
@@ -662,13 +701,14 @@ class DriverAssistantWindow(QMainWindow):
         bubble = ChatBubble(text, is_user=is_user)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
         scrollbar = self.chat_scroll.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        if scrollbar is not None:
+            scrollbar.setValue(scrollbar.maximum())
 
     def update_frame(self, image: QImage) -> None:
         pixmap = QPixmap.fromImage(image).scaled(
             self.video_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
         )
         self.video_label.setPixmap(pixmap)
 
@@ -796,7 +836,7 @@ class DriverAssistantWindow(QMainWindow):
         self.mic_button.setText("Hold to Talk")
         self.speech_worker = None
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, a0: QCloseEvent | None) -> None:
         if self.speech_worker is not None:
             self.speech_worker.stop_recording()
             self.speech_worker.wait(2000)
@@ -805,7 +845,8 @@ class DriverAssistantWindow(QMainWindow):
         self.vision_worker.stop()
         self.vision_thread.quit()
         self.vision_thread.wait(3000)
-        super().closeEvent(event)
+        if a0 is not None:
+            super().closeEvent(a0)
 
 
 def main() -> None:

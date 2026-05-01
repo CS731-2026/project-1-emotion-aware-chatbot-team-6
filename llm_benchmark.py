@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 from chatbot import DriverAssistantChatbot, SUPPORTED_LLM_MODELS
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 SCENARIOS = [
     {
         "scenario_id": 1,
@@ -64,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(r"G:\731\benchmark_results\llm_benchmark"),
+        default=PROJECT_ROOT / "benchmark_results" / "llm_benchmark",
         help="Directory for benchmark outputs.",
     )
     parser.add_argument(

@@ -19,6 +19,8 @@ from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 EXPECTED_CLASSES = {"closed_eye", "open_eye"}
 MODEL_SPEC = {
     "model_key": "efficientnet_b0",
@@ -36,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path(r"G:\731\prepared_datasets\eye"),
+        default=PROJECT_ROOT / "prepared_datasets" / "eye",
         help="Prepared dataset root with train/val/test folders.",
     )
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
@@ -68,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--runs-root",
         type=Path,
-        default=Path(r"G:\731\runs_timm"),
+        default=PROJECT_ROOT / "runs_timm",
         help="Directory for timm runs.",
     )
     parser.add_argument(
@@ -193,7 +195,7 @@ def train_one_epoch(
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.GradScaler,
     device: torch.device,
     amp_enabled: bool,
 ) -> tuple[float, float]:
@@ -330,7 +332,7 @@ def main() -> None:
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = torch.GradScaler(device=device.type, enabled=amp_enabled)
 
     metadata = {
         "task": "eye",

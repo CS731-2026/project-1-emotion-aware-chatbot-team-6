@@ -10,6 +10,8 @@ from collections import defaultdict
 from pathlib import Path
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 ALLOWED_EMOTION_CLASSES = {
     "anger",
@@ -30,6 +32,13 @@ EMOTION_LABEL_MAP = {
     "sad": "sad",
     "surprise": "surprise",
 }
+EYE_LABEL_MAP = {
+    "closed": "closed_eye",
+    "closed_eye": "closed_eye",
+    "open": "open_eye",
+    "opened": "open_eye",
+    "open_eye": "open_eye",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,13 +48,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-root",
         type=Path,
-        default=Path(r"G:\731\dataset"),
+        default=PROJECT_ROOT / "dataset",
         help="Source dataset root.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path(r"G:\731\prepared_datasets"),
+        default=PROJECT_ROOT / "prepared_datasets",
         help="Output dataset root in YOLOv8 classification format.",
     )
     parser.add_argument(
@@ -190,10 +199,12 @@ def append_affectnet_hq(
 def resolve_eye_label(row: dict[str, str], label_columns: list[str]) -> str:
     positive_columns = [column for column in label_columns if row[column].strip() == "1"]
     if positive_columns:
-        return normalize_class_name(positive_columns[0])
+        raw_label = normalize_class_name(positive_columns[0])
+        return EYE_LABEL_MAP.get(raw_label, raw_label)
 
     best_column = max(label_columns, key=lambda column: float(row[column] or 0.0))
-    return normalize_class_name(best_column)
+    raw_label = normalize_class_name(best_column)
+    return EYE_LABEL_MAP.get(raw_label, raw_label)
 
 
 def prepare_eye_dataset(
