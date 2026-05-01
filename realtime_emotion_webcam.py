@@ -5,14 +5,18 @@ import json
 import time
 import urllib.request
 from pathlib import Path
+from typing import cast
 
 import cv2
+import numpy as np
 import timm
 import torch
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from ultralytics import YOLO
+import torch.nn as nn
+from typing_extensions import TypedDict
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -238,10 +242,20 @@ def resolve_devices(device_arg: str) -> tuple[str, torch.device]:
         'Unsupported device. Use values like "0", "cuda:0", or "cpu".'
     )
 
+from torchvision.transforms import InterpolationMode
+from ultralytics import YOLO
+import torch.nn as nn
 
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+from torchvision.transforms import InterpolationMode
+from ultralytics import YOLO
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 def load_timm_classifier(
     checkpoint_path: Path, device: torch.device
-) -> dict[str, object]:
+) -> ClassifierDict:
     metadata_path = checkpoint_path.parent / "metadata.json"
     metadata = None
     if metadata_path.exists():
@@ -276,6 +290,17 @@ def load_timm_classifier(
         "model": model,
         "transform": build_eval_transform(img_size),
     }
+
+
+TransformType = transforms.Compose
+
+
+class ClassifierDict(TypedDict):
+    checkpoint_path: Path
+    class_names: list[str]
+    metadata: dict
+    model: nn.Module
+    transform: TransformType
 
 
 def expand_box(
@@ -367,7 +392,7 @@ def choose_driver_face(
 
 @torch.inference_mode()
 def classify_crops(
-    classifier: dict[str, object], crops_rgb: list, device: torch.device
+    classifier: ClassifierDict, crops_rgb: list, device: torch.device
 ) -> list[tuple[str, float]]:
     predictions = classify_crops_with_topk(
         classifier=classifier,
@@ -375,13 +400,13 @@ def classify_crops(
         device=device,
         top_k=1,
     )
-    return [(item["label"], item["confidence"]) for item in predictions]
+    return [(cast(str, item["label"]), cast(float, item["confidence"])) for item in predictions]
 
 
 @torch.inference_mode()
 def classify_crops_with_topk(
-    classifier: dict[str, object],
-    crops_rgb: list,
+    classifier: ClassifierDict,
+    crops_rgb: list[np.ndarray],
     device: torch.device,
     top_k: int = 3,
 ) -> list[dict[str, object]]:
@@ -393,9 +418,10 @@ def classify_crops_with_topk(
     class_names = classifier["class_names"]
     top_k = max(1, min(top_k, len(class_names)))
 
-    batch = torch.stack(
-        [transform(Image.fromarray(crop_rgb)) for crop_rgb in crops_rgb]
-    ).to(device)
+    tensors: list[torch.Tensor] = [
+        transform(Image.fromarray(crop_rgb)) for crop_rgb in crops_rgb  # type: ignore[arg-type]
+    ]
+    batch = torch.stack(tensors).to(device)
     logits = model(batch)
     probabilities = torch.softmax(logits, dim=1)
     top_confidences, top_indices = probabilities.topk(k=top_k, dim=1)
@@ -502,8 +528,8 @@ def main() -> None:
                 boxes = []
                 crops_rgb = []
                 if face_result.boxes is not None:
-                    raw_boxes = face_result.boxes.xyxy.cpu().numpy().astype(int)
-                    raw_confidences = face_result.boxes.conf.cpu().numpy().tolist()
+                    raw_boxes = face_result.boxes.xyxy.cpu().numpy().astype(int)  # type: ignore[union-attr]
+                    raw_confidences = face_result.boxes.conf.cpu().numpy().tolist()  # type: ignore[union-attr]
                     detections = sorted(
                         zip(raw_boxes, raw_confidences),
                         key=lambda item: (item[0][2] - item[0][0]) * (item[0][3] - item[0][1]),
