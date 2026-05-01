@@ -1,41 +1,137 @@
-# Face Detection + timm Classification Focus Monitor
+# DriveSense
 
-This project now uses:
+[English](./README.md) | [Chinese](./README.zh-CN.md)
 
-- YOLO face detection for face boxes
-- `timm` image classification for emotion recognition
-- `timm` image classification for open-eye / closed-eye recognition
-- geometry-based eye boxes drawn inside each detected face
+**DriveSense - Real-time Emotion Detection Chatbot for Drivers**  
+**COMPSYS 731, Group 6**
 
-## Python version note
+DriveSense is a research-driven driver assistance prototype that combines real-time computer vision, local speech transcription, and LLM-based dialogue support. The system monitors a webcam feed, detects the driver's face, classifies facial emotion and eye state, estimates distraction risk, and responds through a concise in-car chatbot designed to avoid overloading the driver.
 
-PyTorch on Windows currently supports Python `3.9-3.12` for the CUDA path. On this machine,
-the recommended choice is Python `3.11`, otherwise training will fall back to CPU only.
+## Team
 
-## Project files
+- **Peirou Zhang**: emotion classification benchmarking, speech input/output
+- **Xiangteng Mao**: LLM benchmarking and model selection, test case design
+- **Daniel Shaw**: UI development and system integration
 
-- `prepare_dataset.py`: prepares `emotion` and `eye` datasets into folder-based classification format.
-- `train_emotion_yolov8.py`: older YOLOv8 emotion training script kept for comparison.
-- `train_emotion_timm.py`: trains the timm emotion classifier benchmark.
-- `train_eye_timm.py`: trains the timm eye-state classifier.
-- `realtime_emotion_webcam.py`: runs real-time face detection with timm emotion and eye-state recognition.
-- `summarize_timm_benchmark.py`: summarizes multiple emotion timm runs.
-- `.vscode/`: VS Code interpreter and launch configs.
+## Project Goals
 
-## Dataset layout
+- Detect the driver's face in real time.
+- Classify facial emotion into 7 classes: `anger`, `disgust`, `fear`, `happy`, `neutral`, `sad`, `surprise`.
+- Detect eye state as `open_eye` or `closed_eye`.
+- Trigger a focus warning when the driver keeps their eyes closed beyond a threshold.
+- Provide short, emotion-aware chatbot responses through OpenRouter.
+- Benchmark both vision models and LLMs under controlled settings.
 
-The source dataset is expected under `<repo-root>/dataset`:
+## Technology Stack
 
-- `emotion/`: folder-based classification dataset with `train`, `valid`, `test`
-- `eye/`: classification dataset exported with `_classes.csv`
-- `Affectnet-HQ/`: optional extra emotion dataset in `labels.csv + folders` format
+### Vision pipeline
 
-`prepare_dataset.py` converts them into:
+- **YOLOv8 face detector**: real-time face localization from webcam frames
+- **timm**: image classification backbone library for emotion and eye-state classifiers
+- **PyTorch / torchvision**: training, evaluation, augmentation, inference
+- **OpenCV**: webcam capture, frame processing, overlays
 
-- `<repo-root>/prepared_datasets/emotion`
-- `<repo-root>/prepared_datasets/eye`
+### Language and speech pipeline
 
-The emotion task is standardized to 7 classes:
+- **OpenRouter**: unified gateway for comparing multiple LLMs
+- **openai Python package**: client SDK, configured with OpenRouter `base_url`
+- **faster-whisper**: local speech-to-text inference without an external speech API
+
+### Application layer
+
+- **PyQt5**: desktop GUI for webcam monitoring and chat interaction
+- **VS Code**: recommended development environment
+- **Python 3.11**: recommended interpreter on Windows for PyTorch CUDA support
+
+## Why YOLO + timm
+
+The project uses a split design on purpose:
+
+- **YOLO** is used for **where the face is**.
+- **timm models** are used for **what the face/eyes mean**.
+
+This is a cleaner engineering choice than forcing a single detector to do everything. Face detection and emotion classification are different tasks with different optimization targets:
+
+- detection needs fast and stable bounding boxes
+- classification needs strong feature extraction and fair backbone comparison
+
+This design also makes benchmarking easier because the same dataset and training settings can be reused across multiple `timm` backbones.
+
+## System Architecture
+
+```mermaid
+flowchart LR
+    A["Webcam"] --> B["YOLOv8 Face Detection"]
+    B --> C["Driver Face Selection"]
+    C --> D["Face Crop"]
+    D --> E["timm Emotion Classifier"]
+    C --> F["Estimated Eye Regions"]
+    F --> G["timm Eye-State Classifier"]
+    G --> H["Focus Warning Logic"]
+    E --> I["GUI State Panel"]
+    H --> I
+    A --> I
+    J["Microphone"] --> K["faster-whisper"]
+    K --> L["Emotion-aware Chatbot"]
+    E --> L
+    L --> M["OpenRouter"]
+    M --> N["Selected LLM"]
+    N --> I
+```
+
+## Repository Structure
+
+```text
+G:\731
+|-- chatbot.py
+|-- driver_assistant_gui.py
+|-- llm_benchmark.py
+|-- prepare_dataset.py
+|-- realtime_emotion_webcam.py
+|-- repair_affectnet_labels.py
+|-- requirements.txt
+|-- score_llm_results.py
+|-- speech_to_text.py
+|-- summarize_timm_benchmark.py
+|-- temperature_sweep.py
+|-- train_emotion_timm.py
+|-- train_eye_timm.py
+|-- dataset/                 # raw datasets, ignored by Git
+|-- prepared_datasets/       # generated training sets, ignored by Git
+|-- runs_timm/               # training outputs, ignored by Git
+|-- runs/                    # legacy outputs, ignored by Git
+|-- weights/                 # detector weights
+```
+
+## Core Scripts
+
+- `prepare_dataset.py`: prepares unified folder-based datasets for emotion and eye-state training
+- `train_emotion_timm.py`: benchmarks five `timm` backbones on the emotion dataset
+- `train_eye_timm.py`: trains the eye-state classifier
+- `summarize_timm_benchmark.py`: aggregates emotion model comparison results
+- `realtime_emotion_webcam.py`: command-line real-time emotion and eye-state monitoring
+- `driver_assistant_gui.py`: PyQt5 desktop app integrating vision, chat, and speech
+- `chatbot.py`: OpenRouter-based chatbot logic
+- `llm_benchmark.py`: benchmark script for comparing LLM latency and response quality
+- `temperature_sweep.py`: controlled temperature comparison for the chosen LLM
+- `speech_to_text.py`: local microphone recording and Whisper transcription
+
+## Datasets
+
+The project expects raw data under `dataset/`. Current data sources include:
+
+- `dataset/emotion`
+- `dataset/eye`
+- `dataset/Affectnet-HQ`
+
+After preparation, the processed datasets are written to:
+
+- `prepared_datasets/emotion`
+- `prepared_datasets/eye`
+
+### Standardized labels
+
+Emotion classes:
 
 - `anger`
 - `disgust`
@@ -45,50 +141,14 @@ The emotion task is standardized to 7 classes:
 - `sad`
 - `surprise`
 
-The eye task uses 2 classes:
+Eye-state classes:
 
 - `closed_eye`
 - `open_eye`
 
-If `Affectnet-HQ` exists, it is merged into the emotion training split automatically.
-Rows with labels outside those 7 classes are skipped.
+## Model Benchmark Design
 
-## Environment setup
-
-```powershell
-cd <repo-root>
-py -3.11 -m venv .venv311
-.\.venv311\Scripts\python.exe -m pip install --upgrade pip
-.\.venv311\Scripts\python.exe -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu130
-.\.venv311\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-## Data preparation
-
-```powershell
-.\.venv311\Scripts\python.exe prepare_dataset.py --overwrite
-```
-
-## Training
-
-Emotion benchmark model example:
-
-```powershell
-.\.venv311\Scripts\python.exe train_emotion_timm.py --model-key resnet50 --epochs 20 --batch-size 32 --img-size 224 --device cuda --overwrite
-```
-
-Eye model:
-
-```powershell
-.\.venv311\Scripts\python.exe train_eye_timm.py --device cuda:0 --overwrite
-```
-
-The eye training script is fixed to `EfficientNet-B0` and writes to:
-
-- `<repo-root>/runs_timm/eye_efficientnet_b0/best_model.pth`
-- `<repo-root>/runs_timm/eye_efficientnet_b0/metadata.json`
-
-If you want to compare all five emotion models, run:
+The emotion benchmark compares five backbones under the same training conditions:
 
 - `resnet50`
 - `efficientnet_b0`
@@ -96,83 +156,258 @@ If you want to compare all five emotion models, run:
 - `swin_tiny`
 - `mobilenet_v2`
 
-Then summarize them with:
+Fair comparison rules:
 
-```powershell
-.\.venv311\Scripts\python.exe summarize_timm_benchmark.py --run-names resnet50 efficientnet_b0 efficientnet_b3 swin_tiny mobilenet_v2
-```
+- same dataset split
+- same image size
+- same epoch count
+- same training script
+- same evaluation logic
+- only the model backbone changes
 
-## Real-time inference
+Outputs include:
 
-```powershell
-.\.venv311\Scripts\python.exe realtime_emotion_webcam.py --device 0 --window-width 1280 --window-height 720
-```
+- validation accuracy history
+- best validation accuracy
+- test accuracy
+- average inference speed
+- summary plots and comparison tables
 
-`realtime_emotion_webcam.py` now resolves classifiers from `<repo-root>/runs_timm`, not from `<repo-root>/runs`.
-It reads each run's `metadata.json` and `best_model.pth`.
+## LLM Benchmark Design
 
-You can also pass explicit checkpoints or run directories:
-
-```powershell
-.\.venv311\Scripts\python.exe realtime_emotion_webcam.py `
-  --emotion-model .\runs_timm\resnet50 `
-  --eye-model .\runs_timm\eye_efficientnet_b0 `
-  --device 0
-```
-
-## Runtime behavior
-
-- Green boxes show faces and emotion labels.
-- Blue boxes show eyes and eye-state labels.
-- When the primary face stays closed-eyed for 3 seconds or more, the overlay shows `Please stay focused`.
-- Window size is adjustable with `--window-width` and `--window-height`.
-- Capture resolution is adjustable with `--capture-width` and `--capture-height`.
-
-## OpenRouter chatbot
-
-The chatbot uses the `openai` Python package with `base_url` redirected to OpenRouter.
-Set `OPENROUTER_API_KEY` in your environment or `.env` file first.
-
-Run the CLI chatbot:
-
-```powershell
-.\.venv311\Scripts\python.exe chatbot.py --model openai/gpt-4o-mini --emotion anger --temperature 1.0
-```
-
-## LLM benchmark
-
-`llm_benchmark.py` runs the fixed 5 scenarios across:
+The chatbot comparison currently targets:
 
 - `openai/gpt-4o-mini`
 - `anthropic/claude-haiku-4-5`
 - `deepseek/deepseek-chat`
 
-Outputs include response logs, a manual scoring template for 3 raters, and a latency plot.
+Evaluation dimensions:
+
+- response latency
+- manual safety/tone quality score
+- usage cost
+
+Fixed scenarios are used so all models are tested under the same prompts and emotional context.
+
+## Environment Setup
+
+### 1. Clone the repository
 
 ```powershell
-.\.venv311\Scripts\python.exe llm_benchmark.py
-.\.venv311\Scripts\python.exe score_llm_results.py --input-csv benchmark_results\llm_benchmark\manual_scores_template.csv
+git clone https://github.com/CS731-2026/project-1-emotion-aware-chatbot-team-6.git
+cd project-1-emotion-aware-chatbot-team-6
 ```
 
-For the follow-up temperature experiment on the best model:
+If you are working directly in `G:\731`, use that directory as the repository root.
+
+### 2. Create a virtual environment
 
 ```powershell
-.\.venv311\Scripts\python.exe temperature_sweep.py --model openai/gpt-4o-mini
-.\.venv311\Scripts\python.exe score_llm_results.py --input-csv benchmark_results\temperature_sweep\manual_scores_template.csv --group-by temperature
+py -3.11 -m venv .venv311
+.\.venv311\Scripts\activate
+python -m pip install --upgrade pip
 ```
 
-## Speech input
+### 3. Install dependencies
 
-`speech_to_text.py` records local microphone audio and transcribes it with `faster-whisper`.
+For CUDA-enabled PyTorch on Windows:
 
 ```powershell
-.\.venv311\Scripts\python.exe speech_to_text.py --duration 5 --model-size base
+python -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu130
+python -m pip install -r requirements.txt
 ```
 
-## PyQt5 GUI
+If CUDA is unavailable, install the CPU version of PyTorch and run training with `--device cpu`.
 
-`driver_assistant_gui.py` combines webcam emotion monitoring, OpenRouter chat, and local speech transcription.
+### 4. Configure environment variables
+
+Create a local `.env` file in the repository root:
+
+```env
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+OPENROUTER_HTTP_REFERER=https://openrouter.ai
+```
+
+The `.env` file is ignored by Git and should never be committed.
+
+## Preparing the Datasets
+
+Before training, prepare the datasets into the unified folder structure:
 
 ```powershell
-.\.venv311\Scripts\python.exe driver_assistant_gui.py --device cuda --default-llm-model openai/gpt-4o-mini
+python prepare_dataset.py --overwrite
 ```
+
+This step is required whenever the raw dataset is changed or relabeled.
+
+## Training
+
+### Emotion classification
+
+Example:
+
+```powershell
+python train_emotion_timm.py --model-key efficientnet_b0 --epochs 20 --batch-size 32 --img-size 224 --device cuda --overwrite
+```
+
+Available `--model-key` values:
+
+- `resnet50`
+- `efficientnet_b0`
+- `efficientnet_b3`
+- `swin_tiny`
+- `mobilenet_v2`
+
+### Eye-state classification
+
+```powershell
+python train_eye_timm.py --device cuda --overwrite
+```
+
+Training outputs are stored under `runs_timm/`, for example:
+
+- `runs_timm/efficientnet_b0/`
+- `runs_timm/eye_efficientnet_b0/`
+
+Each run typically includes:
+
+- `best_model.pth`
+- `last_model.pth`
+- `metadata.json`
+- logs and plots
+
+## Benchmark Summary
+
+After finishing the five emotion runs:
+
+```powershell
+python summarize_timm_benchmark.py --run-names resnet50 efficientnet_b0 efficientnet_b3 swin_tiny mobilenet_v2
+```
+
+## Real-Time Webcam Monitoring
+
+### CLI mode
+
+```powershell
+python realtime_emotion_webcam.py --device cuda --window-width 1280 --window-height 720
+```
+
+Behavior:
+
+- green box: face and emotion
+- blue box: eye regions and eye state
+- warning text appears when the selected driver keeps eyes closed for too long
+- optional per-frame emotion top-3 probabilities can be printed for debugging
+
+### GUI mode
+
+```powershell
+python driver_assistant_gui.py --device cuda --default-llm-model openai/gpt-4o-mini
+```
+
+GUI features:
+
+- live webcam display
+- current emotion and risk level
+- OpenRouter LLM selection
+- text chat interface
+- press-and-hold microphone recording
+- background-thread execution to avoid UI freezes
+
+## Chatbot Usage
+
+### CLI chatbot
+
+```powershell
+python chatbot.py --model openai/gpt-4o-mini --emotion anger --temperature 1.0
+```
+
+Design principles:
+
+- reply in at most 2 to 3 short sentences
+- stay calm and non-alarmist
+- adapt tone to the detected emotion
+- minimize distraction while driving
+
+## Speech-to-Text
+
+```powershell
+python speech_to_text.py --duration 5 --model-size base
+```
+
+This runs `faster-whisper` locally and does not require an external speech API.
+
+## LLM Benchmark Commands
+
+```powershell
+python llm_benchmark.py
+python score_llm_results.py --input-csv benchmark_results\llm_benchmark\manual_scores_template.csv
+```
+
+Temperature follow-up experiment:
+
+```powershell
+python temperature_sweep.py --model openai/gpt-4o-mini
+python score_llm_results.py --input-csv benchmark_results\temperature_sweep\manual_scores_template.csv --group-by temperature
+```
+
+## Version Control and Collaboration
+
+This project is intended for team collaboration. Follow a basic Git workflow instead of pushing directly from unreviewed local experiments.
+
+### Recommended workflow
+
+1. Pull the latest changes.
+2. Create a feature branch.
+3. Make focused commits.
+4. Push the branch to GitHub.
+5. Open a Pull Request.
+6. Review and merge after confirmation.
+
+Example:
+
+```powershell
+git pull origin main
+git checkout -b feature/update-gui-warning
+git add .
+git commit -m "Improve driver warning overlay placement"
+git push -u origin feature/update-gui-warning
+```
+
+### What should not be committed
+
+Do **not** commit:
+
+- virtual environments such as `.venv311/`
+- `.env`
+- raw datasets under `dataset/`
+- processed datasets under `prepared_datasets/`
+- training outputs under `runs/` and `runs_timm/`
+- large checkpoint files such as `*.pth`
+
+These paths are already covered in `.gitignore`, but contributors should still check `git status` before committing.
+
+### Commit style guidance
+
+- Keep one logical change per commit.
+- Use clear commit messages.
+- Avoid mixing dataset edits, model outputs, and source code changes in one commit.
+- Re-run the relevant script before pushing if your change affects training or inference behavior.
+
+## Reproducibility Notes
+
+- Run `prepare_dataset.py` after changing raw data.
+- Use the same benchmark settings when comparing models.
+- Keep model checkpoints out of Git history.
+- Prefer storing final trained weights externally if they exceed GitHub size limits.
+
+## Known Constraints
+
+- Real driving deployment is out of scope; this is a prototype and research project.
+- Webcam-based face selection is heuristic when multiple people appear.
+- Eye regions are estimated geometrically from face boxes rather than detected by a dedicated landmark model.
+- LLM quality scoring still includes manual evaluation.
+
+## License and Academic Use
+
+This repository is for COMPSYS 731 coursework and research prototyping. If a formal license is needed for external reuse, add a dedicated `LICENSE` file and align it with course or team requirements.
