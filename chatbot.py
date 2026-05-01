@@ -6,6 +6,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -150,13 +151,16 @@ class DriverAssistantChatbot:
             )
         )
 
-        messages = [{"role": "system", "content": system_prompt}, *trimmed_history]
-        messages.append({"role": "user", "content": current_user_message})
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            *trimmed_history,
+            {"role": "user", "content": current_user_message},
+        ]
 
         start = time.perf_counter()
         completion = self.client.chat.completions.create(
             model=model,
-            messages=messages,
+            messages=messages,  # type: ignore[arg-type]
             temperature=temperature,
             max_tokens=max_output_tokens,
         )
