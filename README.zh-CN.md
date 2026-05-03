@@ -83,19 +83,28 @@ flowchart LR
 
 ```text
 G:\731
-|-- chatbot.py
-|-- driver_assistant_gui.py
-|-- llm_benchmark.py
-|-- prepare_dataset.py
-|-- realtime_emotion_webcam.py
-|-- repair_affectnet_labels.py
+|-- chatbot.py                  # 兼容启动脚本
+|-- driver_assistant_gui.py     # 兼容启动脚本
+|-- llm_benchmark.py            # 兼容启动脚本
+|-- prepare_dataset.py          # 兼容启动脚本
+|-- realtime_emotion_webcam.py  # 兼容启动脚本
+|-- repair_affectnet_labels.py  # 兼容启动脚本
 |-- requirements.txt
-|-- score_llm_results.py
-|-- speech_to_text.py
-|-- summarize_timm_benchmark.py
-|-- temperature_sweep.py
-|-- train_emotion_timm.py
-|-- train_eye_timm.py
+|-- score_llm_results.py        # 兼容启动脚本
+|-- speech_to_text.py           # 兼容启动脚本
+|-- summarize_timm_benchmark.py # 兼容启动脚本
+|-- temperature_sweep.py        # 兼容启动脚本
+|-- train_emotion_timm.py       # 兼容启动脚本
+|-- train_eye_timm.py           # 兼容启动脚本
+|-- drivesense/
+|   |-- frontend/
+|   |-- backend/
+|   |-- data/
+|   |-- training/
+|   |-- benchmarks/
+|   |-- database/
+|   |-- utils/
+|-- tests/
 |-- dataset/                 # 原始数据集，Git 忽略
 |-- prepared_datasets/       # 处理后的数据集，Git 忽略
 |-- runs_timm/               # 训练输出，Git 忽略
@@ -103,18 +112,18 @@ G:\731
 |-- weights/                 # 检测模型权重
 ```
 
-## 关键脚本说明
+## 代码结构说明
 
-- `prepare_dataset.py`：将原始数据准备成统一的分类数据集格式
-- `train_emotion_timm.py`：对 5 个 `timm` 情绪分类 backbone 做统一 benchmark
-- `train_eye_timm.py`：训练眼睛开闭分类器
-- `summarize_timm_benchmark.py`：汇总情绪模型对比结果
-- `realtime_emotion_webcam.py`：命令行实时识别程序
-- `driver_assistant_gui.py`：集成视觉、聊天和语音的 PyQt5 图形界面
-- `chatbot.py`：基于 OpenRouter 的聊天逻辑
-- `llm_benchmark.py`：LLM 对比实验脚本
-- `temperature_sweep.py`：对最佳 LLM 做温度实验
-- `speech_to_text.py`：本地录音与 Whisper 转写
+- `drivesense/frontend`：前端 GUI 层
+- `drivesense/backend`：视觉、聊天、语音等后端运行逻辑
+- `drivesense/data`：数据准备与标签修复脚本
+- `drivesense/training`：模型训练入口
+- `drivesense/benchmarks`：视觉与 LLM 的实验评估脚本
+- `drivesense/database`：预留的数据存储层，目前项目仍是无持久化、文件式结构
+- `drivesense/utils`：通用小工具
+- `tests`：最小化 smoke test，用于检查包结构和导入是否正常
+
+根目录下同名 Python 文件仍然保留为薄启动器，这样你原来的命令不会失效。
 
 ## 数据集说明
 
