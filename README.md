@@ -83,19 +83,28 @@ flowchart LR
 
 ```text
 G:\731
-|-- chatbot.py
-|-- driver_assistant_gui.py
-|-- llm_benchmark.py
-|-- prepare_dataset.py
-|-- realtime_emotion_webcam.py
-|-- repair_affectnet_labels.py
+|-- chatbot.py                  # compatibility launcher
+|-- driver_assistant_gui.py     # compatibility launcher
+|-- llm_benchmark.py            # compatibility launcher
+|-- prepare_dataset.py          # compatibility launcher
+|-- realtime_emotion_webcam.py  # compatibility launcher
+|-- repair_affectnet_labels.py  # compatibility launcher
 |-- requirements.txt
-|-- score_llm_results.py
-|-- speech_to_text.py
-|-- summarize_timm_benchmark.py
-|-- temperature_sweep.py
-|-- train_emotion_timm.py
-|-- train_eye_timm.py
+|-- score_llm_results.py        # compatibility launcher
+|-- speech_to_text.py           # compatibility launcher
+|-- summarize_timm_benchmark.py # compatibility launcher
+|-- temperature_sweep.py        # compatibility launcher
+|-- train_emotion_timm.py       # compatibility launcher
+|-- train_eye_timm.py           # compatibility launcher
+|-- drivesense/
+|   |-- frontend/
+|   |-- backend/
+|   |-- data/
+|   |-- training/
+|   |-- benchmarks/
+|   |-- database/
+|   |-- utils/
+|-- tests/
 |-- dataset/                 # raw datasets, ignored by Git
 |-- prepared_datasets/       # generated training sets, ignored by Git
 |-- runs_timm/               # training outputs, ignored by Git
@@ -103,18 +112,18 @@ G:\731
 |-- weights/                 # detector weights
 ```
 
-## Core Scripts
+## Code Organization
 
-- `prepare_dataset.py`: prepares unified folder-based datasets for emotion and eye-state training
-- `train_emotion_timm.py`: benchmarks five `timm` backbones on the emotion dataset
-- `train_eye_timm.py`: trains the eye-state classifier
-- `summarize_timm_benchmark.py`: aggregates emotion model comparison results
-- `realtime_emotion_webcam.py`: command-line real-time emotion and eye-state monitoring
-- `driver_assistant_gui.py`: PyQt5 desktop app integrating vision, chat, and speech
-- `chatbot.py`: OpenRouter-based chatbot logic
-- `llm_benchmark.py`: benchmark script for comparing LLM latency and response quality
-- `temperature_sweep.py`: controlled temperature comparison for the chosen LLM
-- `speech_to_text.py`: local microphone recording and Whisper transcription
+- `drivesense/frontend`: GUI layer and user-facing desktop interaction
+- `drivesense/backend`: vision, chatbot, and speech runtime logic
+- `drivesense/data`: dataset preparation and label repair utilities
+- `drivesense/training`: model training entry points
+- `drivesense/benchmarks`: vision and LLM evaluation scripts
+- `drivesense/database`: reserved storage layer; currently file-based and stateless
+- `drivesense/utils`: small utility helpers
+- `tests`: smoke tests for package layout and import stability
+
+The root-level Python files are still kept as thin launchers so existing commands continue to work.
 
 ## Datasets
 
