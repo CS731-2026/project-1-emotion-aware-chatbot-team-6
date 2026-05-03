@@ -257,7 +257,8 @@ class VisionWorker(QObject):
                 )[0]
 
                 detections = []
-                crops_rgb = []
+                face_crops_bgr = []
+                eye_crops_bgr = []
                 if face_result.boxes is not None:
                     raw_boxes_data: Any = face_result.boxes.xyxy
                     raw_conf_data: Any = face_result.boxes.conf
@@ -283,38 +284,62 @@ class VisionWorker(QObject):
                         if face_crop.size == 0:
                             continue
                         detections.append((x1, y1, x2, y2, float(detection_conf)))
-                        crops_rgb.append(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
+                        face_crops_bgr.append(face_crop.copy())
+
+                        left_eye_box, right_eye_box = estimate_eye_boxes((x1, y1, x2, y2))
+                        for ex1, ey1, ex2, ey2 in (left_eye_box, right_eye_box):
+                            eye_crop = frame[ey1:ey2, ex1:ex2]
+                            if eye_crop.size == 0:
+                                eye_crop = face_crop.copy()
+                            eye_crops_bgr.append(eye_crop.copy())
 
                 emotion_predictions = classify_crops_with_topk(
                     emotion_classifier,
-                    crops_rgb,
+                    face_crops_bgr,
                     torch_device,
-                    top_k=3,
+                    topk=3,
                 )
-                eye_predictions = classify_crops(eye_classifier, crops_rgb, torch_device)
+                eye_predictions = classify_crops(eye_classifier, eye_crops_bgr, torch_device)
                 primary_face = None
                 if detections and emotion_predictions and eye_predictions:
                     faces = []
-                    for detection, crop_rgb, emotion_prediction, eye_prediction in zip(
-                        detections,
-                        crops_rgb,
-                        emotion_predictions,
-                        eye_predictions,
+                    for index, (detection, emotion_prediction) in enumerate(
+                        zip(detections, emotion_predictions)
                     ):
                         x1, y1, x2, y2, detection_conf = detection
-                        emotion_label = str(cast(str, emotion_prediction["label"]))
-                        emotion_confidence = float(cast(float, emotion_prediction["confidence"]))
-                        eye_label, eye_confidence = eye_prediction
+                        emotion_topk = cast(list[tuple[str, float]], emotion_prediction)
+                        emotion_label = emotion_topk[0][0]
+                        emotion_confidence = float(emotion_topk[0][1])
+
+                        per_face_eye_predictions = eye_predictions[index * 2 : index * 2 + 2]
+                        closed_scores = [
+                            confidence
+                            for label, confidence in per_face_eye_predictions
+                            if label == "closed_eye"
+                        ]
+                        open_scores = [
+                            confidence
+                            for label, confidence in per_face_eye_predictions
+                            if label == "open_eye"
+                        ]
+                        if len(closed_scores) == 2:
+                            eye_label = "closed_eye"
+                            eye_confidence = float(sum(closed_scores) / len(closed_scores))
+                        else:
+                            source_scores = open_scores or [score for _, score in per_face_eye_predictions] or [0.0]
+                            eye_label = "open_eye"
+                            eye_confidence = float(sum(source_scores) / len(source_scores))
+
                         faces.append(
                             {
                                 "bbox": (x1, y1, x2, y2),
                                 "area": (x2 - x1) * (y2 - y1),
                                 "emotion": emotion_label,
                                 "emotion_confidence": emotion_confidence,
-                                "emotion_topk": cast(list[tuple[str, float]], emotion_prediction["topk"]),
+                                "emotion_topk": emotion_topk,
                                 "eye_label": eye_label,
                                 "eye_confidence": eye_confidence,
-                                "eye_boxes": estimate_eye_boxes(crop_rgb.shape),
+                                "eye_boxes": estimate_eye_boxes((x1, y1, x2, y2)),
                                 "detection_confidence": detection_conf,
                             }
                         )
@@ -350,8 +375,8 @@ class VisionWorker(QObject):
                             ex1, ey1, ex2, ey2 = eye_box
                             cv2.rectangle(
                                 frame,
-                                (x1 + ex1, y1 + ey1),
-                                (x1 + ex2, y1 + ey2),
+                                (ex1, ey1),
+                                (ex2, ey2),
                                 (255, 0, 0),
                                 2,
                             )

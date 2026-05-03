@@ -289,7 +289,13 @@ def classify_crops(
     classifier: ClassifierDict, crops_bgr: list[np.ndarray], device: torch.device
 ) -> list[tuple[str, float]]:
     topk_predictions = classify_crops_with_topk(classifier, crops_bgr, device, topk=1)
-    return [(predictions[0][0], predictions[0][1]) for predictions in topk_predictions]
+    outputs: list[tuple[str, float]] = []
+    for predictions in topk_predictions:
+        if isinstance(predictions, dict):
+            outputs.append((str(predictions["label"]), float(predictions["confidence"])))
+        else:
+            outputs.append((predictions[0][0], predictions[0][1]))
+    return outputs
 
 
 def classify_crops_with_topk(
@@ -297,14 +303,20 @@ def classify_crops_with_topk(
     crops_bgr: list[np.ndarray],
     device: torch.device,
     topk: int = 3,
-) -> list[list[tuple[str, float]]]:
+    top_k: int | None = None,
+) -> list[list[tuple[str, float]]] | list[dict[str, object]]:
     if not crops_bgr:
         return []
 
-    pil_images = [
-        Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-        for crop in crops_bgr
-    ]
+    legacy_gui_mode = top_k is not None
+    requested_topk = top_k if top_k is not None else topk
+
+    pil_images = []
+    for crop in crops_bgr:
+        if legacy_gui_mode:
+            pil_images.append(Image.fromarray(crop))
+        else:
+            pil_images.append(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
     batch = torch.stack(
         [classifier["transform"](image) for image in pil_images]
     ).to(device)
@@ -313,7 +325,7 @@ def classify_crops_with_topk(
         logits = cast(torch.Tensor, classifier["model"](batch))
         probabilities = torch.softmax(logits, dim=1)
 
-    k = min(topk, probabilities.shape[1])
+    k = min(requested_topk, probabilities.shape[1])
     top_probabilities, top_indices = torch.topk(probabilities, k=k, dim=1)
 
     outputs: list[list[tuple[str, float]]] = []
@@ -322,6 +334,16 @@ def classify_crops_with_topk(
         for score, class_index in zip(probs_row.cpu().tolist(), indices_row.cpu().tolist()):
             row_predictions.append((classifier["class_names"][class_index], float(score)))
         outputs.append(row_predictions)
+
+    if legacy_gui_mode:
+        return [
+            {
+                "label": predictions[0][0],
+                "confidence": predictions[0][1],
+                "topk": predictions,
+            }
+            for predictions in outputs
+        ]
     return outputs
 
 
@@ -329,13 +351,22 @@ def format_topk_prediction(predictions: list[tuple[str, float]]) -> str:
     return ", ".join(f"{label}={score:.2f}" for label, score in predictions)
 
 
-def expand_box(
-    box: tuple[int, int, int, int],
-    frame_width: int,
-    frame_height: int,
-    padding_ratio: float,
-) -> tuple[int, int, int, int]:
-    x1, y1, x2, y2 = box
+def expand_box(*args: object) -> tuple[int, int, int, int]:
+    if len(args) == 4:
+        box, frame_width, frame_height, padding_ratio = args
+        x1, y1, x2, y2 = cast(tuple[int, int, int, int], box)
+    elif len(args) == 7:
+        x1, y1, x2, y2, frame_width, frame_height, padding_ratio = args
+        x1 = int(cast(int, x1))
+        y1 = int(cast(int, y1))
+        x2 = int(cast(int, x2))
+        y2 = int(cast(int, y2))
+    else:
+        raise TypeError("expand_box() expects 4 or 7 positional arguments.")
+
+    frame_width = int(cast(int, frame_width))
+    frame_height = int(cast(int, frame_height))
+    padding_ratio = float(cast(float, padding_ratio))
     width = x2 - x1
     height = y2 - y1
     pad_x = int(width * padding_ratio)
@@ -349,9 +380,16 @@ def expand_box(
 
 
 def estimate_eye_boxes(
-    face_box: tuple[int, int, int, int]
+    face_box: tuple[int, int, int, int] | tuple[int, ...]
 ) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
-    x1, y1, x2, y2 = face_box
+    if len(face_box) == 4:
+        x1, y1, x2, y2 = face_box
+    elif len(face_box) >= 2:
+        height = int(face_box[0])
+        width = int(face_box[1])
+        x1, y1, x2, y2 = 0, 0, width, height
+    else:
+        raise ValueError("estimate_eye_boxes() expected a face box or image shape.")
     face_w = x2 - x1
     face_h = y2 - y1
 
@@ -380,7 +418,7 @@ def draw_tag(
     text: str,
     origin: tuple[int, int],
     text_color: tuple[int, int, int],
-    bg_color: tuple[int, int, int],
+    bg_color: tuple[int, int, int] = (0, 0, 0),
     scale: float = 0.8,
     thickness: int = 2,
 ) -> None:
@@ -408,12 +446,21 @@ def draw_tag(
 
 
 def choose_driver_face(
-    face_boxes: list[tuple[int, int, int, int]],
+    face_boxes: list[tuple[int, int, int, int]] | list[dict[str, object]],
     frame_width: int,
     strategy: str,
-) -> int | None:
+    previous_driver_center_x: float | None = None,
+) -> int | dict[str, object] | None:
     if not face_boxes:
         return None
+
+    if isinstance(face_boxes[0], dict):
+        faces = cast(list[dict[str, object]], face_boxes)
+        box_list = [cast(tuple[int, int, int, int], face["bbox"]) for face in faces]
+        selected = choose_driver_face(box_list, frame_width, strategy, previous_driver_center_x)
+        if selected is None:
+            return None
+        return faces[cast(int, selected)]
 
     if strategy == "largest":
         return max(

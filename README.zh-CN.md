@@ -83,20 +83,9 @@ flowchart LR
 
 ```text
 G:\731
-|-- chatbot.py                  # 兼容启动脚本
-|-- driver_assistant_gui.py     # 兼容启动脚本
-|-- llm_benchmark.py            # 兼容启动脚本
-|-- prepare_dataset.py          # 兼容启动脚本
-|-- realtime_emotion_webcam.py  # 兼容启动脚本
-|-- repair_affectnet_labels.py  # 兼容启动脚本
 |-- requirements.txt
-|-- score_llm_results.py        # 兼容启动脚本
-|-- speech_to_text.py           # 兼容启动脚本
-|-- summarize_timm_benchmark.py # 兼容启动脚本
-|-- temperature_sweep.py        # 兼容启动脚本
-|-- train_emotion_timm.py       # 兼容启动脚本
-|-- train_eye_timm.py           # 兼容启动脚本
 |-- drivesense/
+|   |-- __main__.py
 |   |-- frontend/
 |   |-- backend/
 |   |-- data/
@@ -122,8 +111,7 @@ G:\731
 - `drivesense/database`：预留的数据存储层，目前项目仍是无持久化、文件式结构
 - `drivesense/utils`：通用小工具
 - `tests`：最小化 smoke test，用于检查包结构和导入是否正常
-
-根目录下同名 Python 文件仍然保留为薄启动器，这样你原来的命令不会失效。
+- `python -m drivesense.<module>`：项目唯一推荐的运行方式
 
 ## 数据集说明
 
@@ -244,7 +232,7 @@ OPENROUTER_HTTP_REFERER=https://openrouter.ai
 在训练前，需要先将原始数据处理成统一格式：
 
 ```powershell
-python prepare_dataset.py --overwrite
+python -m drivesense.data.prepare_dataset --overwrite
 ```
 
 只要原始数据发生变化或标签有调整，就应重新运行这一步。
@@ -256,7 +244,7 @@ python prepare_dataset.py --overwrite
 示例：
 
 ```powershell
-python train_emotion_timm.py --model-key efficientnet_b0 --epochs 20 --batch-size 32 --img-size 224 --device cuda --overwrite
+python -m drivesense.training.train_emotion_timm --model-key efficientnet_b0 --epochs 20 --batch-size 32 --img-size 224 --device cuda --overwrite
 ```
 
 可选 `--model-key`：
@@ -270,7 +258,7 @@ python train_emotion_timm.py --model-key efficientnet_b0 --epochs 20 --batch-siz
 ### 眼睛状态训练
 
 ```powershell
-python train_eye_timm.py --device cuda --overwrite
+python -m drivesense.training.train_eye_timm --device cuda --overwrite
 ```
 
 训练输出默认保存在 `runs_timm/`，例如：
@@ -290,7 +278,7 @@ python train_eye_timm.py --device cuda --overwrite
 当 5 个情绪模型都训练完后：
 
 ```powershell
-python summarize_timm_benchmark.py --run-names resnet50 efficientnet_b0 efficientnet_b3 swin_tiny mobilenet_v2
+python -m drivesense.benchmarks.summarize_timm_benchmark --run-names resnet50 efficientnet_b0 efficientnet_b3 swin_tiny mobilenet_v2
 ```
 
 ## 实时摄像头识别
@@ -298,7 +286,7 @@ python summarize_timm_benchmark.py --run-names resnet50 efficientnet_b0 efficien
 ### 命令行模式
 
 ```powershell
-python realtime_emotion_webcam.py --device cuda --window-width 1280 --window-height 720
+python -m drivesense.backend.vision --device cuda --window-width 1280 --window-height 720
 ```
 
 运行效果：
@@ -311,7 +299,7 @@ python realtime_emotion_webcam.py --device cuda --window-width 1280 --window-hei
 ### GUI 模式
 
 ```powershell
-python driver_assistant_gui.py --device cuda --default-llm-model openai/gpt-4o-mini
+python -m drivesense.frontend.gui --device cuda --default-llm-model openai/gpt-4o-mini
 ```
 
 GUI 包含：
@@ -328,7 +316,7 @@ GUI 包含：
 ### 命令行聊天
 
 ```powershell
-python chatbot.py --model openai/gpt-4o-mini --emotion anger --temperature 1.0
+python -m drivesense.backend.chatbot --model openai/gpt-4o-mini --emotion anger --temperature 1.0
 ```
 
 设计原则：
@@ -341,7 +329,7 @@ python chatbot.py --model openai/gpt-4o-mini --emotion anger --temperature 1.0
 ## 语音转文字
 
 ```powershell
-python speech_to_text.py --duration 5 --model-size base
+python -m drivesense.backend.speech --duration 5 --model-size base
 ```
 
 该脚本本地运行 `faster-whisper`，不依赖外部语音 API。
@@ -349,15 +337,15 @@ python speech_to_text.py --duration 5 --model-size base
 ## LLM Benchmark 命令
 
 ```powershell
-python llm_benchmark.py
-python score_llm_results.py --input-csv benchmark_results\llm_benchmark\manual_scores_template.csv
+python -m drivesense.benchmarks.llm_benchmark
+python -m drivesense.benchmarks.score_llm_results --input-csv benchmark_results\llm_benchmark\manual_scores_template.csv
 ```
 
 温度实验：
 
 ```powershell
-python temperature_sweep.py --model openai/gpt-4o-mini
-python score_llm_results.py --input-csv benchmark_results\temperature_sweep\manual_scores_template.csv --group-by temperature
+python -m drivesense.benchmarks.temperature_sweep --model openai/gpt-4o-mini
+python -m drivesense.benchmarks.score_llm_results --input-csv benchmark_results\temperature_sweep\manual_scores_template.csv --group-by temperature
 ```
 
 ## 版本控制与协作

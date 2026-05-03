@@ -83,20 +83,9 @@ flowchart LR
 
 ```text
 G:\731
-|-- chatbot.py                  # compatibility launcher
-|-- driver_assistant_gui.py     # compatibility launcher
-|-- llm_benchmark.py            # compatibility launcher
-|-- prepare_dataset.py          # compatibility launcher
-|-- realtime_emotion_webcam.py  # compatibility launcher
-|-- repair_affectnet_labels.py  # compatibility launcher
 |-- requirements.txt
-|-- score_llm_results.py        # compatibility launcher
-|-- speech_to_text.py           # compatibility launcher
-|-- summarize_timm_benchmark.py # compatibility launcher
-|-- temperature_sweep.py        # compatibility launcher
-|-- train_emotion_timm.py       # compatibility launcher
-|-- train_eye_timm.py           # compatibility launcher
 |-- drivesense/
+|   |-- __main__.py
 |   |-- frontend/
 |   |-- backend/
 |   |-- data/
@@ -122,8 +111,7 @@ G:\731
 - `drivesense/database`: reserved storage layer; currently file-based and stateless
 - `drivesense/utils`: small utility helpers
 - `tests`: smoke tests for package layout and import stability
-
-The root-level Python files are still kept as thin launchers so existing commands continue to work.
+- `python -m drivesense.<module>`: the only supported way to run project modules
 
 ## Datasets
 
@@ -244,7 +232,7 @@ The `.env` file is ignored by Git and should never be committed.
 Before training, prepare the datasets into the unified folder structure:
 
 ```powershell
-python prepare_dataset.py --overwrite
+python -m drivesense.data.prepare_dataset --overwrite
 ```
 
 This step is required whenever the raw dataset is changed or relabeled.
@@ -256,7 +244,7 @@ This step is required whenever the raw dataset is changed or relabeled.
 Example:
 
 ```powershell
-python train_emotion_timm.py --model-key efficientnet_b0 --epochs 20 --batch-size 32 --img-size 224 --device cuda --overwrite
+python -m drivesense.training.train_emotion_timm --model-key efficientnet_b0 --epochs 20 --batch-size 32 --img-size 224 --device cuda --overwrite
 ```
 
 Available `--model-key` values:
@@ -270,7 +258,7 @@ Available `--model-key` values:
 ### Eye-state classification
 
 ```powershell
-python train_eye_timm.py --device cuda --overwrite
+python -m drivesense.training.train_eye_timm --device cuda --overwrite
 ```
 
 Training outputs are stored under `runs_timm/`, for example:
@@ -290,7 +278,7 @@ Each run typically includes:
 After finishing the five emotion runs:
 
 ```powershell
-python summarize_timm_benchmark.py --run-names resnet50 efficientnet_b0 efficientnet_b3 swin_tiny mobilenet_v2
+python -m drivesense.benchmarks.summarize_timm_benchmark --run-names resnet50 efficientnet_b0 efficientnet_b3 swin_tiny mobilenet_v2
 ```
 
 ## Real-Time Webcam Monitoring
@@ -298,7 +286,7 @@ python summarize_timm_benchmark.py --run-names resnet50 efficientnet_b0 efficien
 ### CLI mode
 
 ```powershell
-python realtime_emotion_webcam.py --device cuda --window-width 1280 --window-height 720
+python -m drivesense.backend.vision --device cuda --window-width 1280 --window-height 720
 ```
 
 Behavior:
@@ -311,7 +299,7 @@ Behavior:
 ### GUI mode
 
 ```powershell
-python driver_assistant_gui.py --device cuda --default-llm-model openai/gpt-4o-mini
+python -m drivesense.frontend.gui --device cuda --default-llm-model openai/gpt-4o-mini
 ```
 
 GUI features:
@@ -328,7 +316,7 @@ GUI features:
 ### CLI chatbot
 
 ```powershell
-python chatbot.py --model openai/gpt-4o-mini --emotion anger --temperature 1.0
+python -m drivesense.backend.chatbot --model openai/gpt-4o-mini --emotion anger --temperature 1.0
 ```
 
 Design principles:
@@ -341,7 +329,7 @@ Design principles:
 ## Speech-to-Text
 
 ```powershell
-python speech_to_text.py --duration 5 --model-size base
+python -m drivesense.backend.speech --duration 5 --model-size base
 ```
 
 This runs `faster-whisper` locally and does not require an external speech API.
@@ -349,15 +337,15 @@ This runs `faster-whisper` locally and does not require an external speech API.
 ## LLM Benchmark Commands
 
 ```powershell
-python llm_benchmark.py
-python score_llm_results.py --input-csv benchmark_results\llm_benchmark\manual_scores_template.csv
+python -m drivesense.benchmarks.llm_benchmark
+python -m drivesense.benchmarks.score_llm_results --input-csv benchmark_results\llm_benchmark\manual_scores_template.csv
 ```
 
 Temperature follow-up experiment:
 
 ```powershell
-python temperature_sweep.py --model openai/gpt-4o-mini
-python score_llm_results.py --input-csv benchmark_results\temperature_sweep\manual_scores_template.csv --group-by temperature
+python -m drivesense.benchmarks.temperature_sweep --model openai/gpt-4o-mini
+python -m drivesense.benchmarks.score_llm_results --input-csv benchmark_results\temperature_sweep\manual_scores_template.csv --group-by temperature
 ```
 
 ## Version Control and Collaboration
