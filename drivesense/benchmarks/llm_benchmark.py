@@ -17,32 +17,32 @@ SCENARIOS = [
     {
         "scenario_id": 1,
         "emotion": "anger",
-        "user_message": "这个交通让我抓狂",
+        "user_message": "This traffic jam is infuriating! Why is everyone driving so slowly?",
         "auto_trigger": False,
     },
     {
         "scenario_id": 2,
-        "emotion": "sad",
-        "user_message": "今天过得很糟糕",
+        "emotion": "fear",
+        "user_message": "I'm exhausted and the road conditions are getting worse. I'm worried about safety.",
         "auto_trigger": False,
     },
     {
         "scenario_id": 3,
-        "emotion": "fear",
-        "user_message": "路况很差我很害怕",
+        "emotion": "neutral",
+        "user_message": "How much longer until we reach the destination?",
         "auto_trigger": False,
     },
     {
         "scenario_id": 4,
-        "emotion": "neutral",
-        "user_message": "还有多久到目的地",
+        "emotion": "sad",
+        "user_message": "I had a terrible day at work. I just want to get home and relax.",
         "auto_trigger": False,
     },
     {
         "scenario_id": 5,
-        "emotion": "anger",
-        "user_message": None,
-        "auto_trigger": True,
+        "emotion": "anxiety",
+        "user_message": "I'm running late for an important meeting. Can you help me find a faster route?",
+        "auto_trigger": False,
     },
 ]
 
