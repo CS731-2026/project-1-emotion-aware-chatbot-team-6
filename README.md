@@ -36,6 +36,7 @@ DriveSense is a research-driven driver assistance prototype that combines real-t
 - **OpenRouter**: unified gateway for comparing multiple LLMs
 - **openai Python package**: client SDK, configured with OpenRouter `base_url`
 - **faster-whisper**: local speech-to-text inference without an external speech API
+- **pyttsx3**: local text-to-speech with emotion-aware speech rate adjustment
 
 ### Application layer
 

@@ -53,7 +53,7 @@ class VoiceChatPipeline:
             VoiceChatResult with transcribed user input, bot reply, and metrics.
         """
         # Step 1: Record and transcribe
-        print(f"🎤 Recording for {duration_seconds} seconds...")
+        print(f"Recording for {duration_seconds} seconds...")
         audio = record_microphone_audio(duration_seconds=duration_seconds)
         
         if audio.size == 0:
@@ -61,10 +61,10 @@ class VoiceChatPipeline:
         
         result = self.transcriber.transcribe_audio(audio)
         user_input = result.text
-        print(f"📝 Transcribed: {user_input}")
+        print(f"Transcribed: {user_input}")
         
         # Step 2: Get LLM reply
-        print("🤖 Generating response...")
+        print("Generating response...")
         bot_response: ChatbotResponse = self.chatbot.generate_reply(
             emotion=emotion,
             user_message=user_input,
@@ -75,7 +75,7 @@ class VoiceChatPipeline:
         )
         
         # Step 3: Speak the reply
-        print("🔊 Speaking reply...")
+        print("Speaking reply...")
         self.tts.speak(bot_response.text, emotion=emotion)
         
         return VoiceChatResult(
