@@ -108,6 +108,100 @@ class WhisperTranscriber:
         )
 
 
+class TextToSpeech:
+    """Convert text to speech using the local pyttsx3 engine."""
+
+    EMOTION_RATE_OFFSETS = {
+        "anger": -6,
+        "fear": -10,
+        "sad": -12,
+        "happy": 8,
+        "surprise": 6,
+        "disgust": -4,
+        "neutral": 0,
+    }
+
+    EMOTION_VOLUME = {
+        "anger": 0.9,
+        "fear": 0.88,
+        "sad": 0.85,
+        "happy": 1.0,
+        "surprise": 0.98,
+        "disgust": 0.9,
+        "neutral": 0.95,
+    }
+
+    def __init__(
+        self,
+        rate: int = 150,
+        volume: float = 1.0,
+    ) -> None:
+        self.rate = rate
+        self.volume = volume
+        try:
+            import pyttsx3
+        except ImportError as exc:  # pragma: no cover - environment specific
+            raise RuntimeError(
+                "pyttsx3 is required for voice output. Install it with pip."
+            ) from exc
+
+        self._pyttsx3 = pyttsx3
+
+    @staticmethod
+    def prepare_spoken_text(text: str) -> str:
+        """Keep the LLM reply unchanged except for normalizing whitespace."""
+        return " ".join((text or "").split())
+
+    def select_voice(self, emotion: str | None = None) -> str | None:
+        """Prefer a softer or livelier voice depending on the driver emotion."""
+        try:
+            voices = self._pyttsx3.init().getProperty("voices")
+        except Exception:
+            return None
+
+        if not voices:
+            return None
+
+        emotion_key = (emotion or "neutral").lower()
+        preference_keywords = {
+            "anger": ["female", "zira", "susan", "eva", "hazel"],
+            "fear": ["female", "zira", "susan", "eva", "hazel"],
+            "sad": ["female", "zira", "susan", "eva", "hazel"],
+            "happy": ["male", "david", "mark", "alex", "richard"],
+            "surprise": ["male", "david", "mark", "alex", "richard"],
+            "disgust": ["female", "zira", "susan", "eva", "hazel"],
+            "neutral": ["female", "male"],
+        }
+
+        keywords = preference_keywords.get(emotion_key, ["female", "male"])
+        fallback_voice = voices[0]
+        for keyword in keywords:
+            for voice in voices:
+                voice_text = f"{getattr(voice, 'name', '')} {getattr(voice, 'id', '')}".lower()
+                if keyword in voice_text:
+                    return getattr(voice, "id", None)
+
+        return getattr(fallback_voice, "id", None)
+
+    def speak(self, text: str, emotion: str | None = None) -> None:
+        """Speak the given text."""
+        spoken_text = self.prepare_spoken_text(text)
+        if not spoken_text:
+            return
+
+        engine = self._pyttsx3.init()
+        emotion_key = (emotion or "neutral").lower()
+        emotion_rate = self.EMOTION_RATE_OFFSETS.get(emotion_key, 0)
+        emotion_volume = self.EMOTION_VOLUME.get(emotion_key, self.volume)
+        voice_id = self.select_voice(emotion)
+        if voice_id:
+            engine.setProperty("voice", voice_id)
+        engine.setProperty("rate", self.rate + emotion_rate)
+        engine.setProperty("volume", emotion_volume)
+        engine.say(spoken_text)
+        engine.runAndWait()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record microphone audio locally and transcribe it with faster-whisper."
