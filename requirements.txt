@@ -7,3 +7,4 @@ python-dotenv>=1.0.1
 PyQt5>=5.15.10
 faster-whisper>=1.1.0
 sounddevice>=0.5.1
+pyttsx3>=2.90

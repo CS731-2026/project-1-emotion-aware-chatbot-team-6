@@ -170,19 +170,19 @@ class ChatBubble(QFrame):
         bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         bubble.setStyleSheet(
             (
-                "background-color: #c62828; color: white; border-radius: 14px; "
-                "padding: 10px 12px; font-size: 14px;"
+                "background-color: #10b981; color: white; border-radius: 16px; "
+                "padding: 12px 16px; font-size: 14px; font-weight: 500;"
             )
             if is_user
             else (
-                "background-color: #0d47a1; color: white; border-radius: 14px; "
-                "padding: 10px 12px; font-size: 14px;"
+                "background-color: #3b82f6; color: white; border-radius: 16px; "
+                "padding: 12px 16px; font-size: 14px; font-weight: 500;"
             )
         )
-        bubble.setMaximumWidth(340)
+        bubble.setMaximumWidth(360)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setContentsMargins(0, 6, 0, 6)
         if is_user:
             layout.addStretch()
             layout.addWidget(bubble)
@@ -628,6 +628,7 @@ class DriverAssistantWindow(QMainWindow):
             QMessageBox.warning(self, "OpenRouter", str(exc))
 
         central = QWidget()
+        central.setStyleSheet("background-color: #0f1419;")
         self.setCentralWidget(central)
         root_layout = QHBoxLayout(central)
         root_layout.setContentsMargins(16, 16, 16, 16)
@@ -641,11 +642,11 @@ class DriverAssistantWindow(QMainWindow):
         self.video_label = QLabel("Camera starting...")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setMinimumSize(860, 560)
-        self.video_label.setStyleSheet("background-color: #101418; color: white; border-radius: 12px;")
+        self.video_label.setStyleSheet("background-color: #1f2937; color: #9ca3af; border-radius: 16px; border: 1px solid #374151;")
         left_panel.addWidget(self.video_label)
 
         info_card = QFrame()
-        info_card.setStyleSheet("background-color: #111827; color: white; border-radius: 12px;")
+        info_card.setStyleSheet("background-color: #111827; color: white; border-radius: 16px; border: 1px solid #1f2937;")
         info_layout = QVBoxLayout(info_card)
         self.emotion_label = QLabel("Emotion: neutral")
         self.eye_label = QLabel("Eyes: open eye")
@@ -676,19 +677,34 @@ class DriverAssistantWindow(QMainWindow):
         if default_index >= 0:
             self.model_combo.setCurrentIndex(default_index)
         self.model_combo.currentTextChanged.connect(self.handle_model_selection_change)
+        self.model_combo.setStyleSheet(
+            "QComboBox { background-color: #374151; color: white; border: 1px solid #4b5563; border-radius: 8px; padding: 6px 8px; font-weight: 500; }"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox::down-arrow { image: none; }"
+            "QComboBox QAbstractItemView { background-color: #374151; color: white; border: 1px solid #4b5563; selection-background-color: #3b82f6; }"
+        )
         self.temperature_spin = QDoubleSpinBox()
         self.temperature_spin.setRange(0.0, 2.0)
         self.temperature_spin.setSingleStep(0.1)
         self.temperature_spin.setValue(self.args.default_temperature)
-        controls_row.addWidget(QLabel("LLM Model"))
+        self.temperature_spin.setStyleSheet("QDoubleSpinBox { background-color: #374151; color: white; border: 1px solid #4b5563; border-radius: 8px; padding: 6px 8px; }")
+        label_model = QLabel("LLM Model")
+        label_model.setStyleSheet("color: white; font-weight: 600; font-size: 13px;")
+        label_temp = QLabel("Temperature")
+        label_temp.setStyleSheet("color: white; font-weight: 600; font-size: 13px;")
+        controls_row.addWidget(label_model)
         controls_row.addWidget(self.model_combo, 1)
-        controls_row.addWidget(QLabel("Temperature"))
+        controls_row.addWidget(label_temp)
         controls_row.addWidget(self.temperature_spin)
         right_panel.addLayout(controls_row)
 
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setWidgetResizable(True)
-        self.chat_scroll.setStyleSheet("background-color: #f3f4f6; border: none;")
+        self.chat_scroll.setStyleSheet(
+            "QScrollArea { background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; }"
+            "QScrollBar:vertical { background-color: #f3f4f6; width: 8px; }"
+            "QScrollBar::handle:vertical { background-color: #d1d5db; border-radius: 4px; }"
+        )
         self.chat_container = QWidget()
         self.chat_layout = QVBoxLayout(self.chat_container)
         self.chat_layout.setContentsMargins(8, 8, 8, 8)
@@ -699,12 +715,29 @@ class DriverAssistantWindow(QMainWindow):
 
         input_row = QHBoxLayout()
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Type a short message to the assistant...")
+        self.input_edit.setPlaceholderText("Type a short message...")
+        self.input_edit.setStyleSheet(
+            "QLineEdit { background-color: white; color: #1f2937; border: 2px solid #e5e7eb; border-radius: 8px; "
+            "padding: 8px 12px; font-size: 14px; }"
+            "QLineEdit:focus { border: 2px solid #3b82f6; }"
+        )
         self.input_edit.returnPressed.connect(self.send_text_message)
-        self.mic_button = QPushButton("Hold to Talk")
+        self.mic_button = QPushButton("🎤 Talk")
         self.mic_button.pressed.connect(self.start_recording)
         self.mic_button.released.connect(self.stop_recording)
+        self.mic_button.setStyleSheet(
+            "QPushButton { background-color: #f59e0b; color: white; border: none; border-radius: 8px; "
+            "padding: 8px 16px; font-weight: 600; font-size: 13px; }"
+            "QPushButton:hover { background-color: #d97706; }"
+            "QPushButton:pressed { background-color: #b45309; }"
+        )
         self.send_button = QPushButton("Send")
+        self.send_button.setStyleSheet(
+            "QPushButton { background-color: #3b82f6; color: white; border: none; border-radius: 8px; "
+            "padding: 8px 20px; font-weight: 600; font-size: 13px; }"
+            "QPushButton:hover { background-color: #2563eb; }"
+            "QPushButton:pressed { background-color: #1d4ed8; }"
+        )
         self.send_button.clicked.connect(self.send_text_message)
         input_row.addWidget(self.input_edit, 1)
         input_row.addWidget(self.mic_button)
