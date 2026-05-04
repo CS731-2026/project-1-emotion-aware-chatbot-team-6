@@ -50,7 +50,7 @@ from drivesense.backend.vision import (
     resolve_devices,
     resolve_latest_timm_model,
 )
-from drivesense.backend.speech import WhisperTranscriber, record_microphone_audio
+from drivesense.backend.speech import TextToSpeech, WhisperTranscriber, record_microphone_audio
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -404,11 +404,11 @@ class VisionWorker(QObject):
                     if primary_face is None:
                         print("Driver emotion top-3: no face", flush=True)
                     else:
-                        topk = primary_face.get("emotion_topk", [])
-                        # print(
-                        #     f"Driver emotion top-3: {format_topk_prediction(topk)}",
-                        #     flush=True,
-                        # )
+                        print(
+                            "Driver emotion top-3: "
+                            f"{format_topk_prediction(primary_face.get('emotion_topk', []))}",
+                            flush=True,
+                        )
 
                 if (
                     primary_face is not None
@@ -821,6 +821,7 @@ class DriverAssistantWindow(QMainWindow):
     def handle_chat_response(self, payload: dict) -> None:
         self.add_message(payload["text"], is_user=False)
         self.conversation_history.append({"role": "assistant", "content": payload["text"]})
+        self.speak_reply_async(payload["text"], payload.get("emotion", self.current_emotion))
         print(
             f"OpenRouter reply received from {payload['model']} "
             f"in {payload['latency_ms']:.0f} ms"
@@ -836,6 +837,19 @@ class DriverAssistantWindow(QMainWindow):
         self.send_button.setEnabled(True)
         self.mic_button.setEnabled(True)
         self.chat_worker = None
+
+    def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
+        if not text.strip():
+            return
+
+        def worker() -> None:
+            try:
+                tts = TextToSpeech(rate=150, volume=1.0)
+                tts.speak(text, emotion=emotion)
+            except Exception as exc:
+                print(f"TTS error: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def start_recording(self) -> None:
         if self.speech_worker is not None:
