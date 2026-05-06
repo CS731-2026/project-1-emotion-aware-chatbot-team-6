@@ -18,6 +18,9 @@ from torchvision.transforms import InterpolationMode
 from typing_extensions import TypedDict
 from ultralytics import YOLO
 
+from drivesense.backend.focus_monitor import FocusMonitor, FocusMonitorConfig
+from drivesense.backend.speech import TextToSpeech
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "runs_timm"
@@ -140,6 +143,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="Closed-eye duration before the focus warning is shown.",
+    )
+    parser.add_argument(
+        "--cooldown-seconds",
+        type=float,
+        default=30.0,
+        help="Minimum seconds between two voice interventions.",
+    )
+    parser.add_argument(
+        "--enable-voice-dialogue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the full record/transcribe/LLM/speak loop after the beep.",
     )
     parser.add_argument(
         "--driver-side",
@@ -481,6 +496,28 @@ def choose_driver_face(
     )
 
 
+def build_voice_pipeline(enable: bool):
+    """Try to build the full voice dialogue pipeline.
+
+    Returns None when the pipeline cannot be built (e.g. no API key) so the
+    rest of the system keeps working with just beep + TTS feedback.
+    """
+    if not enable:
+        return None
+    try:
+        from drivesense.backend.chatbot import DriverAssistantChatbot
+        from drivesense.backend.voice_chat import VoiceChatPipeline
+
+        chatbot = DriverAssistantChatbot()
+        pipeline = VoiceChatPipeline(chatbot=chatbot)
+        print("Voice dialogue pipeline ready (record + transcribe + LLM + speak).")
+        return pipeline
+    except Exception as exc:
+        print(f"Voice dialogue pipeline disabled: {exc}")
+        print("Beep and TTS check-in will still play; the LLM reply step is skipped.")
+        return None
+
+
 def main() -> None:
     args = parse_args()
     face_device, torch_device = resolve_devices(args.device)
@@ -499,6 +536,21 @@ def main() -> None:
     print(f"Eye model: {eye_model_path}")
     print(f"Face model: {face_model_path}")
 
+    tts = TextToSpeech()
+    voice_pipeline = build_voice_pipeline(args.enable_voice_dialogue)
+    focus_monitor = FocusMonitor(
+        config=FocusMonitorConfig(
+            closed_eye_seconds=args.focus_seconds,
+            cooldown_seconds=args.cooldown_seconds,
+        ),
+        tts=tts,
+        voice_pipeline=voice_pipeline,
+    )
+    print(
+        f"Focus monitor armed: trigger after {args.focus_seconds:.1f}s, "
+        f"cooldown {args.cooldown_seconds:.1f}s."
+    )
+
     cap = cv2.VideoCapture(args.camera_index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.capture_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.capture_height)
@@ -513,7 +565,6 @@ def main() -> None:
     cached_face_labels: list[tuple[str, float]] = []
     cached_face_top3: list[list[tuple[str, float]]] = []
     cached_eye_labels: list[tuple[str, float]] = []
-    closed_eye_started_at: float | None = None
     last_frame_time = time.perf_counter()
 
     try:
@@ -570,6 +621,7 @@ def main() -> None:
             driver_idx = choose_driver_face(cached_face_boxes, frame_w, args.driver_side)
 
             current_closed = False
+            driver_emotion = "neutral"
             for idx, face_box in enumerate(cached_face_boxes):
                 x1, y1, x2, y2 = face_box
                 label, confidence = cached_face_labels[idx]
@@ -590,6 +642,7 @@ def main() -> None:
                 )
                 if idx == driver_idx:
                     current_closed = both_closed
+                    driver_emotion = label
                     if args.print_emotion_top3 and idx < len(cached_face_top3):
                         print(
                             "Driver emotion top-3:",
@@ -611,17 +664,11 @@ def main() -> None:
                         scale=0.7,
                     )
 
-            now = time.perf_counter()
-            if current_closed:
-                if closed_eye_started_at is None:
-                    closed_eye_started_at = now
-            else:
-                closed_eye_started_at = None
-
-            warning_active = (
-                closed_eye_started_at is not None
-                and (now - closed_eye_started_at) >= args.focus_seconds
+            warning_active = focus_monitor.update(
+                eyes_closed=current_closed,
+                emotion=driver_emotion,
             )
+
             if warning_active:
                 draw_tag(
                     frame,
@@ -633,6 +680,7 @@ def main() -> None:
                     thickness=4,
                 )
 
+            now = time.perf_counter()
             fps = 1.0 / max(now - last_frame_time, 1e-6)
             last_frame_time = now
             cv2.putText(
