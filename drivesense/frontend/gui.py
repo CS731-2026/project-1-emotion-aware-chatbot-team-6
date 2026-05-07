@@ -35,7 +35,9 @@ from drivesense.backend.chatbot import (
     DriverAssistantChatbot,
     SUPPORTED_LLM_MODELS,
 )
+from drivesense.backend.focus_monitor import FocusMonitor, FocusMonitorConfig
 from drivesense.backend.vision import (
+    build_voice_pipeline,
     classify_crops,
     classify_crops_with_topk,
     choose_driver_face,
@@ -43,6 +45,7 @@ from drivesense.backend.vision import (
     ensure_face_model,
     estimate_eye_boxes,
     expand_box,
+    filter_primary_face_candidates,
     format_topk_prediction,
     load_timm_classifier,
     normalize_checkpoint_path,
@@ -130,16 +133,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--padding", type=float, default=0.15, help="Face padding ratio.")
     parser.add_argument("--max-faces", type=int, default=5, help="Maximum number of faces to process.")
     parser.add_argument(
+        "--min-face-area-ratio",
+        type=float,
+        default=0.015,
+        help="Reject faces smaller than this fraction of the full frame area.",
+    )
+    parser.add_argument(
+        "--relative-min-face-scale",
+        type=float,
+        default=0.35,
+        help="Reject faces much smaller than the largest visible face.",
+    )
+    parser.add_argument(
         "--focus-seconds",
         type=float,
         default=2.0,
         help="Closed-eye duration before the focus warning appears.",
     )
     parser.add_argument(
+        "--cooldown-seconds",
+        type=float,
+        default=30.0,
+        help="Minimum seconds between two voice interventions.",
+    )
+    parser.add_argument(
+        "--enable-voice-dialogue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the full record/transcribe/LLM/speak loop after the beep.",
+    )
+    parser.add_argument(
         "--driver-side",
         type=str,
         choices=["left", "center", "right", "largest"],
-        default="right",
+        default="left",
         help="Heuristic used to choose the driver's face when multiple faces are visible.",
     )
     parser.add_argument("--default-llm-model", type=str, default=DEFAULT_MODEL, help="Default OpenRouter model.")
@@ -148,7 +175,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--print-emotion-top3",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Print the driver's emotion top-3 probabilities for each frame.",
     )
     return parser.parse_args()
@@ -201,6 +228,12 @@ class VisionWorker(QObject):
         super().__init__()
         self.args = args
         self._running = True
+        self.current_chat_model = args.default_llm_model
+        self.current_temperature = float(args.default_temperature)
+
+    def update_chat_settings(self, model: str, temperature: float) -> None:
+        self.current_chat_model = model
+        self.current_temperature = float(temperature)
 
     def stop(self) -> None:
         self._running = False
@@ -220,6 +253,16 @@ class VisionWorker(QObject):
             face_detector = YOLO(str(face_model_path))
             emotion_classifier = load_timm_classifier(emotion_model_path, torch_device)
             eye_classifier = load_timm_classifier(eye_model_path, torch_device)
+            tts = TextToSpeech()
+            voice_pipeline = build_voice_pipeline(self.args.enable_voice_dialogue)
+            focus_monitor = FocusMonitor(
+                config=FocusMonitorConfig(
+                    closed_eye_seconds=self.args.focus_seconds,
+                    cooldown_seconds=self.args.cooldown_seconds,
+                ),
+                tts=tts,
+                voice_pipeline=voice_pipeline,
+            )
 
             cap = cv2.VideoCapture(self.args.camera_index)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.args.capture_width)
@@ -238,7 +281,6 @@ class VisionWorker(QObject):
                 "eye_model_path": str(eye_model_path),
             }
             previous_time = time.perf_counter()
-            closed_eye_start: float | None = None
             previous_driver_center_x: float | None = None
 
             while self._running:
@@ -302,6 +344,13 @@ class VisionWorker(QObject):
                 eye_predictions = classify_crops(eye_classifier, eye_crops_bgr, torch_device)
                 primary_face = None
                 if detections and emotion_predictions and eye_predictions:
+                    candidate_indices = filter_primary_face_candidates(
+                        [cast(tuple[int, int, int, int], det[:4]) for det in detections],
+                        frame_w,
+                        frame_h,
+                        min_face_area_ratio=self.args.min_face_area_ratio,
+                        relative_min_face_scale=self.args.relative_min_face_scale,
+                    )
                     faces = []
                     for index, (detection, emotion_prediction) in enumerate(
                         zip(detections, emotion_predictions)
@@ -334,11 +383,13 @@ class VisionWorker(QObject):
                                 "eye_confidence": eye_confidence,
                                 "eye_boxes": estimate_eye_boxes((x1, y1, x2, y2)),
                                 "detection_confidence": detection_conf,
+                                "is_candidate": index in candidate_indices,
                             }
                         )
 
+                    candidate_faces = [faces[idx] for idx in candidate_indices]
                     primary_face = choose_driver_face(
-                        faces,
+                        candidate_faces,
                         frame_w,
                         self.args.driver_side,
                         previous_driver_center_x,
@@ -364,15 +415,16 @@ class VisionWorker(QObject):
                             (x1, y1),
                             color,
                         )
-                        for eye_box in face["eye_boxes"]:
-                            ex1, ey1, ex2, ey2 = eye_box
-                            cv2.rectangle(
-                                frame,
-                                (ex1, ey1),
-                                (ex2, ey2),
-                                (255, 0, 0),
-                                2,
-                            )
+                        if face.get("is_candidate", False):
+                            for eye_box in face["eye_boxes"]:
+                                ex1, ey1, ex2, ey2 = eye_box
+                                cv2.rectangle(
+                                    frame,
+                                    (ex1, ey1),
+                                    (ex2, ey2),
+                                    (255, 0, 0),
+                                    2,
+                                )
                         draw_tag(
                             frame,
                             f"{normalize_label(face['eye_label'])} {face['eye_confidence']:.2f}",
@@ -407,26 +459,36 @@ class VisionWorker(QObject):
                     primary_face is not None
                     and current_eye_label == "closed_eye"
                 ):
-                    if closed_eye_start is None:
-                        closed_eye_start = time.perf_counter()
+                    current_closed = True
                 else:
-                    closed_eye_start = None
+                    current_closed = False
 
                 risk = EMOTION_TO_RISK.get(current_emotion, "OK")
-                focus_alert = (
-                    closed_eye_start is not None
-                    and time.perf_counter() - closed_eye_start >= self.args.focus_seconds
-                )
-                if focus_alert:
-                    risk = "HIGH"
-                last_state = {
+                current_driver_state = {
                     "emotion": current_emotion,
                     "emotion_confidence": emotion_confidence,
                     "eye_label": current_eye_label,
                     "eye_confidence": eye_confidence,
                     "risk": risk,
-                    "focus_alert": focus_alert,
+                    "focus_alert": False,
                     "driver_side": self.args.driver_side,
+                }
+                focus_monitor.set_runtime_context(
+                    chat_model=self.current_chat_model,
+                    temperature=self.current_temperature,
+                    driver_state=current_driver_state,
+                )
+                focus_alert = focus_monitor.update(
+                    eyes_closed=current_closed,
+                    emotion=current_emotion,
+                )
+                if focus_alert:
+                    risk = "HIGH"
+                current_driver_state["risk"] = risk
+                current_driver_state["focus_alert"] = focus_alert
+                focus_monitor.set_runtime_context(driver_state=current_driver_state)
+                last_state = {
+                    **current_driver_state,
                     "emotion_model_path": str(emotion_model_path),
                     "eye_model_path": str(eye_model_path),
                 }
@@ -530,6 +592,7 @@ class ChatWorker(QThread):
         model: str,
         temperature: float,
         auto_trigger: bool = False,
+        driver_state: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.chatbot = chatbot
@@ -539,9 +602,17 @@ class ChatWorker(QThread):
         self.model = model
         self.temperature = temperature
         self.auto_trigger = auto_trigger
+        self.driver_state = dict(driver_state) if driver_state else None
 
     def run(self) -> None:
         try:
+            print(
+                "ChatWorker start | "
+                f"model={self.model} temperature={self.temperature:.2f} "
+                f"emotion={self.emotion} auto_trigger={self.auto_trigger} "
+                f"driver_state={self.driver_state}",
+                flush=True,
+            )
             response = self.chatbot.generate_reply(
                 emotion=self.emotion,
                 user_message=self.user_message,
@@ -549,10 +620,13 @@ class ChatWorker(QThread):
                 temperature=self.temperature,
                 conversation_history=self.conversation_history,
                 auto_trigger=self.auto_trigger,
+                driver_state=self.driver_state,
             )
             self.result_ready.emit(asdict(response))
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(
+                f"model={self.model}, temperature={self.temperature:.2f}, error={exc}"
+            )
 
 
 class SpeechWorker(QThread):
@@ -609,6 +683,14 @@ class DriverAssistantWindow(QMainWindow):
 
         self.current_emotion = "neutral"
         self.current_risk = "OK"
+        self.current_driver_state: dict[str, Any] = {
+            "emotion": "neutral",
+            "emotion_confidence": 0.0,
+            "eye_label": "open_eye",
+            "eye_confidence": 0.0,
+            "risk": "OK",
+            "focus_alert": False,
+        }
         self.conversation_history: list[dict[str, str]] = []
         self.chat_worker: ChatWorker | None = None
         self.speech_worker: SpeechWorker | None = None
@@ -749,7 +831,10 @@ class DriverAssistantWindow(QMainWindow):
         self.vision_worker.state_ready.connect(self.update_emotion_state)
         self.vision_worker.error.connect(self.handle_worker_error)
         self.vision_worker.finished.connect(self.vision_thread.quit)
+        self.model_combo.currentTextChanged.connect(self.push_chat_settings_to_worker)
+        self.temperature_spin.valueChanged.connect(self.push_chat_settings_to_worker)
         self.vision_thread.start()
+        self.push_chat_settings_to_worker()
 
     def add_message(self, text: str, is_user: bool) -> None:
         bubble = ChatBubble(text, is_user=is_user)
@@ -767,6 +852,7 @@ class DriverAssistantWindow(QMainWindow):
         self.video_label.setPixmap(pixmap)
 
     def update_emotion_state(self, state: dict) -> None:
+        self.current_driver_state = dict(state)
         self.current_emotion = state["emotion"]
         self.current_risk = state["risk"]
         color = emotion_color_hex(self.current_emotion)
@@ -801,6 +887,12 @@ class DriverAssistantWindow(QMainWindow):
         message = f"Selected chat model: {model_name}"
         self.status_label.setText(f"Status: {message}")
         print(message)
+
+    def push_chat_settings_to_worker(self, *args: object) -> None:
+        self.vision_worker.update_chat_settings(
+            self.model_combo.currentText(),
+            float(self.temperature_spin.value()),
+        )
 
     def send_text_message(self) -> None:
         text = self.input_edit.text().strip()
@@ -837,6 +929,7 @@ class DriverAssistantWindow(QMainWindow):
             model=selected_model,
             temperature=self.temperature_spin.value(),
             auto_trigger=auto_trigger,
+            driver_state=self.current_driver_state,
         )
         self.chat_worker.result_ready.connect(self.handle_chat_response)
         self.chat_worker.error.connect(self.handle_chat_error)
@@ -857,6 +950,7 @@ class DriverAssistantWindow(QMainWindow):
 
     def handle_chat_error(self, message: str) -> None:
         self.status_label.setText(f"Status: chatbot error - {message}")
+        print(f"Chat error: {message}", flush=True)
 
     def clear_chat_worker(self) -> None:
         self.send_button.setEnabled(True)

@@ -20,7 +20,7 @@ import platform
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,9 @@ class _State:
     last_trigger_at: Optional[float] = None
     is_handling_event: bool = False
     last_warning_active: bool = False
+    chat_model: str = "openai/gpt-4o-mini"
+    temperature: float = 1.0
+    driver_state: dict[str, Any] | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -117,6 +120,21 @@ class FocusMonitor:
         self._tts = tts
         self._voice_pipeline = voice_pipeline
         self._state = _State()
+        self._state.chat_model = self.config.chat_model
+
+    def set_runtime_context(
+        self,
+        chat_model: str | None = None,
+        temperature: float | None = None,
+        driver_state: dict[str, Any] | None = None,
+    ) -> None:
+        with self._state.lock:
+            if chat_model:
+                self._state.chat_model = chat_model
+            if temperature is not None:
+                self._state.temperature = temperature
+            if driver_state is not None:
+                self._state.driver_state = dict(driver_state)
 
     def update(
         self,
@@ -176,15 +194,30 @@ class FocusMonitor:
 
     def _launch_intervention(self, emotion: str) -> None:
         """Run the beep -> TTS -> dialogue loop on a background thread."""
+        with self._state.lock:
+            chat_model = self._state.chat_model
+            temperature = self._state.temperature
+            driver_state = dict(self._state.driver_state) if self._state.driver_state else None
         thread = threading.Thread(
             target=self._run_intervention,
-            kwargs={"emotion": emotion},
+            kwargs={
+                "emotion": emotion,
+                "chat_model": chat_model,
+                "temperature": temperature,
+                "driver_state": driver_state,
+            },
             daemon=True,
             name="FocusMonitor-Intervention",
         )
         thread.start()
 
-    def _run_intervention(self, emotion: str) -> None:
+    def _run_intervention(
+        self,
+        emotion: str,
+        chat_model: str,
+        temperature: float,
+        driver_state: dict[str, Any] | None,
+    ) -> None:
         try:
             _play_beep(
                 self.config.beep_frequency_hz,
@@ -206,7 +239,9 @@ class FocusMonitor:
                         duration_seconds=self.config.record_seconds,
                         emotion=emotion,
                         auto_trigger=False,
-                        model=self.config.chat_model,
+                        model=chat_model,
+                        temperature=temperature,
+                        driver_state=driver_state,
                     )
                     logger.info(
                         "Driver said: %r | Assistant: %r",

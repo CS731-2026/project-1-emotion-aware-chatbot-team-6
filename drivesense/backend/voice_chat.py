@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from drivesense.backend.chatbot import ChatbotResponse, DriverAssistantChatbot
 from drivesense.backend.speech import TextToSpeech, WhisperTranscriber, record_microphone_audio
@@ -45,6 +45,7 @@ class VoiceChatPipeline:
         conversation_history: list[dict[str, str]] | None = None,
         auto_trigger: bool = False,
         model: str | None = None,
+        driver_state: dict[str, Any] | None = None,
     ) -> VoiceChatResult:
         """
         Record voice, transcribe, get LLM reply, and speak it aloud.
@@ -62,6 +63,8 @@ class VoiceChatPipeline:
         result = self.transcriber.transcribe_audio(audio)
         user_input = result.text
         print(f"Transcribed: {user_input}")
+        if not user_input.strip():
+            raise ValueError("Speech transcription was empty. Skipping LLM reply.")
         
         # Step 2: Get LLM reply
         print("Generating response...")
@@ -72,6 +75,7 @@ class VoiceChatPipeline:
             temperature=temperature,
             conversation_history=conversation_history,
             auto_trigger=auto_trigger,
+            driver_state=driver_state,
         )
         
         # Step 3: Speak the reply

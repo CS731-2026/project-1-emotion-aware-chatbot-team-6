@@ -133,6 +133,18 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of detected faces to process.",
     )
     parser.add_argument(
+        "--min-face-area-ratio",
+        type=float,
+        default=0.015,
+        help="Reject faces smaller than this fraction of the full frame area.",
+    )
+    parser.add_argument(
+        "--relative-min-face-scale",
+        type=float,
+        default=0.35,
+        help="Reject faces much smaller than the largest visible face.",
+    )
+    parser.add_argument(
         "--skip-frames",
         type=int,
         default=0,
@@ -160,13 +172,13 @@ def parse_args() -> argparse.Namespace:
         "--driver-side",
         type=str,
         choices=["left", "center", "right", "largest"],
-        default="right",
+        default="left",
         help="Heuristic used to choose the driver's face when multiple faces are visible.",
     )
     parser.add_argument(
         "--print-emotion-top3",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Print the driver's emotion top-3 probabilities for each frame.",
     )
     return parser.parse_args()
@@ -408,14 +420,14 @@ def estimate_eye_boxes(
     face_w = x2 - x1
     face_h = y2 - y1
 
-    eye_w = int(face_w * 0.28)
-    eye_h = int(face_h * 0.14)
-    eye_y1 = y1 + int(face_h * 0.32)
+    eye_w = int(face_w * 0.27)
+    eye_h = int(face_h * 0.13)
+    eye_y1 = y1 + int(face_h * 0.40)
     eye_y2 = eye_y1 + eye_h
 
-    left_eye_x1 = x1 + int(face_w * 0.12)
+    left_eye_x1 = x1 + int(face_w * 0.13)
     left_eye_x2 = left_eye_x1 + eye_w
-    right_eye_x2 = x2 - int(face_w * 0.12)
+    right_eye_x2 = x2 - int(face_w * 0.13)
     right_eye_x1 = right_eye_x2 - eye_w
 
     return (
@@ -484,16 +496,58 @@ def choose_driver_face(
             * (face_boxes[idx][3] - face_boxes[idx][1]),
         )
 
+    if strategy == "left":
+        return min(
+            range(len(face_boxes)),
+            key=lambda idx: (
+                face_boxes[idx][0],
+                ((face_boxes[idx][0] + face_boxes[idx][2]) / 2),
+            ),
+        )
+
+    if strategy == "right":
+        return max(
+            range(len(face_boxes)),
+            key=lambda idx: (
+                face_boxes[idx][2],
+                ((face_boxes[idx][0] + face_boxes[idx][2]) / 2),
+            ),
+        )
+
     targets = {
-        "left": frame_width * 0.25,
         "center": frame_width * 0.5,
-        "right": frame_width * 0.75,
     }
     target_x = targets[strategy]
     return min(
         range(len(face_boxes)),
         key=lambda idx: abs(((face_boxes[idx][0] + face_boxes[idx][2]) / 2) - target_x),
     )
+
+
+def filter_primary_face_candidates(
+    face_boxes: list[tuple[int, int, int, int]],
+    frame_width: int,
+    frame_height: int,
+    min_face_area_ratio: float = 0.015,
+    relative_min_face_scale: float = 0.35,
+) -> list[int]:
+    if not face_boxes:
+        return []
+
+    frame_area = max(frame_width * frame_height, 1)
+    face_areas = [
+        max((x2 - x1) * (y2 - y1), 0)
+        for x1, y1, x2, y2 in face_boxes
+    ]
+    largest_face_area = max(face_areas, default=0)
+    absolute_min_area = frame_area * min_face_area_ratio
+    relative_min_area = largest_face_area * relative_min_face_scale
+    threshold_area = max(absolute_min_area, relative_min_area)
+
+    kept_indices = [
+        idx for idx, area in enumerate(face_areas) if area >= threshold_area
+    ]
+    return kept_indices or [int(np.argmax(np.asarray(face_areas)))]
 
 
 def build_voice_pipeline(enable: bool):
@@ -565,6 +619,7 @@ def main() -> None:
     cached_face_labels: list[tuple[str, float]] = []
     cached_face_top3: list[list[tuple[str, float]]] = []
     cached_eye_labels: list[tuple[str, float]] = []
+    cached_candidate_indices: list[int] = []
     last_frame_time = time.perf_counter()
 
     try:
@@ -609,22 +664,41 @@ def main() -> None:
                     emotion_classifier, face_crops, torch_device, topk=3
                 )
                 eye_labels = classify_crops(eye_classifier, eye_crops, torch_device)
+                candidate_indices = filter_primary_face_candidates(
+                    face_boxes,
+                    frame_w,
+                    frame_h,
+                    min_face_area_ratio=args.min_face_area_ratio,
+                    relative_min_face_scale=args.relative_min_face_scale,
+                )
 
                 cached_face_boxes = face_boxes
                 cached_face_labels = face_labels
                 cached_face_top3 = face_top3
                 cached_eye_labels = eye_labels
+                cached_candidate_indices = candidate_indices
                 frames_since_inference = args.skip_frames
             else:
                 frames_since_inference -= 1
 
-            driver_idx = choose_driver_face(cached_face_boxes, frame_w, args.driver_side)
+            candidate_boxes = [cached_face_boxes[idx] for idx in cached_candidate_indices]
+            selected_candidate_idx = choose_driver_face(
+                candidate_boxes,
+                frame_w,
+                args.driver_side,
+            )
+            driver_idx = (
+                cached_candidate_indices[selected_candidate_idx]
+                if selected_candidate_idx is not None and cached_candidate_indices
+                else None
+            )
 
             current_closed = False
             driver_emotion = "neutral"
             for idx, face_box in enumerate(cached_face_boxes):
                 x1, y1, x2, y2 = face_box
                 label, confidence = cached_face_labels[idx]
+                is_candidate = idx in cached_candidate_indices
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 draw_tag(
                     frame,
@@ -661,7 +735,8 @@ def main() -> None:
                 ):
                     ex1, ey1, ex2, ey2 = eye_box
                     eye_label, eye_confidence = eye_prediction
-                    cv2.rectangle(frame, (ex1, ey1), (ex2, ey2), (255, 0, 0), 2)
+                    if is_candidate:
+                        cv2.rectangle(frame, (ex1, ey1), (ex2, ey2), (255, 0, 0), 2)
                     draw_tag(
                         frame,
                         f"{normalize_label(eye_label)} {eye_confidence:.2f}",
