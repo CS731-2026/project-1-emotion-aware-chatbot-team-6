@@ -20,7 +20,7 @@ import platform
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -115,10 +115,14 @@ class FocusMonitor:
         config: Optional[FocusMonitorConfig] = None,
         tts: Optional[object] = None,
         voice_pipeline: Optional[object] = None,
+        on_voice_result: Optional[Callable[[Any], None]] = None,
+        on_voice_error: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.config = config or FocusMonitorConfig()
         self._tts = tts
         self._voice_pipeline = voice_pipeline
+        self._on_voice_result = on_voice_result
+        self._on_voice_error = on_voice_error
         self._state = _State()
         self._state.chat_model = self.config.chat_model
 
@@ -229,6 +233,7 @@ class FocusMonitor:
                     self._tts.speak(
                         self.config.check_in_question,
                         emotion=emotion,
+                        wait=True,
                     )
                 except Exception as exc:
                     logger.exception("TTS speak failed: %s", exc)
@@ -248,8 +253,12 @@ class FocusMonitor:
                         result.user_input,
                         result.bot_reply,
                     )
+                    if self._on_voice_result is not None:
+                        self._on_voice_result(result)
                 except Exception as exc:
                     logger.exception("Voice pipeline failed: %s", exc)
+                    if self._on_voice_error is not None:
+                        self._on_voice_error(str(exc))
 
         finally:
             with self._state.lock:

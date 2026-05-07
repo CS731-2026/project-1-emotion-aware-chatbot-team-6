@@ -80,7 +80,7 @@ class VoiceChatPipeline:
         
         # Step 3: Speak the reply
         print("Speaking reply...")
-        self.tts.speak(bot_response.text, emotion=emotion)
+        self.tts.speak(bot_response.text, emotion=emotion, wait=True)
         
         return VoiceChatResult(
             user_input=user_input,

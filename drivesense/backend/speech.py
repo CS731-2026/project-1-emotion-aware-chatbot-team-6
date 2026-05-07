@@ -13,6 +13,8 @@ import sounddevice as sd
 import torch
 from faster_whisper import WhisperModel
 
+from drivesense.backend.tts_queue import TTSQueue
+
 
 @dataclass
 class TranscriptionResult:
@@ -183,8 +185,7 @@ class TextToSpeech:
 
         return getattr(fallback_voice, "id", None)
 
-    def speak(self, text: str, emotion: str | None = None) -> None:
-        """Speak the given text."""
+    def _speak_now(self, text: str, emotion: str | None = None) -> None:
         spoken_text = self.prepare_spoken_text(text)
         if not spoken_text:
             return
@@ -200,6 +201,17 @@ class TextToSpeech:
         engine.setProperty("volume", emotion_volume)
         engine.say(spoken_text)
         engine.runAndWait()
+
+    def speak(self, text: str, emotion: str | None = None, wait: bool = False) -> None:
+        """Queue speech on the shared TTS worker thread."""
+        spoken_text = self.prepare_spoken_text(text)
+        if not spoken_text:
+            return
+
+        TTSQueue.instance().submit(
+            lambda: self._speak_now(spoken_text, emotion=emotion),
+            wait=wait,
+        )
 
 
 def parse_args() -> argparse.Namespace:

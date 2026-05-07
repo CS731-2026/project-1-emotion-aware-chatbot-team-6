@@ -221,6 +221,8 @@ class ChatBubble(QFrame):
 class VisionWorker(QObject):
     frame_ready = pyqtSignal(QImage)
     state_ready = pyqtSignal(object)
+    voice_dialogue_ready = pyqtSignal(object)
+    voice_dialogue_error = pyqtSignal(str)
     error = pyqtSignal(str)
     finished = pyqtSignal()
 
@@ -262,6 +264,8 @@ class VisionWorker(QObject):
                 ),
                 tts=tts,
                 voice_pipeline=voice_pipeline,
+                on_voice_result=lambda result: self.voice_dialogue_ready.emit(asdict(result)),
+                on_voice_error=self.voice_dialogue_error.emit,
             )
 
             cap = cv2.VideoCapture(self.args.camera_index)
@@ -829,6 +833,8 @@ class DriverAssistantWindow(QMainWindow):
         self.vision_thread.started.connect(self.vision_worker.run)
         self.vision_worker.frame_ready.connect(self.update_frame)
         self.vision_worker.state_ready.connect(self.update_emotion_state)
+        self.vision_worker.voice_dialogue_ready.connect(self.handle_voice_dialogue_result)
+        self.vision_worker.voice_dialogue_error.connect(self.handle_voice_dialogue_error)
         self.vision_worker.error.connect(self.handle_worker_error)
         self.vision_worker.finished.connect(self.vision_thread.quit)
         self.model_combo.currentTextChanged.connect(self.push_chat_settings_to_worker)
@@ -952,6 +958,28 @@ class DriverAssistantWindow(QMainWindow):
         self.status_label.setText(f"Status: chatbot error - {message}")
         print(f"Chat error: {message}", flush=True)
 
+    def handle_voice_dialogue_result(self, payload: dict[str, Any]) -> None:
+        user_input = str(payload.get("user_input", "")).strip()
+        bot_reply = str(payload.get("bot_reply", "")).strip()
+        if user_input:
+            self.add_message(user_input, is_user=True)
+            self.conversation_history.append({"role": "user", "content": user_input})
+        if bot_reply:
+            self.add_message(bot_reply, is_user=False)
+            self.conversation_history.append({"role": "assistant", "content": bot_reply})
+        model = payload.get("model", self.model_combo.currentText())
+        latency_ms = payload.get("latency_ms")
+        if isinstance(latency_ms, (int, float)):
+            self.status_label.setText(
+                f"Status: voice dialogue reply in {float(latency_ms):.0f} ms via {model}"
+            )
+        else:
+            self.status_label.setText(f"Status: voice dialogue completed via {model}")
+
+    def handle_voice_dialogue_error(self, message: str) -> None:
+        self.status_label.setText(f"Status: voice dialogue error - {message}")
+        print(f"Voice dialogue error: {message}", flush=True)
+
     def clear_chat_worker(self) -> None:
         self.send_button.setEnabled(True)
         self.mic_button.setEnabled(True)
@@ -960,15 +988,11 @@ class DriverAssistantWindow(QMainWindow):
     def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
         if not text.strip():
             return
-
-        def worker() -> None:
-            try:
-                tts = TextToSpeech(rate=150, volume=1.0)
-                tts.speak(text, emotion=emotion)
-            except Exception as exc:
-                print(f"TTS error: {exc}")
-
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            tts = TextToSpeech(rate=150, volume=1.0)
+            tts.speak(text, emotion=emotion, wait=False)
+        except Exception as exc:
+            print(f"TTS error: {exc}")
 
     def start_recording(self) -> None:
         if self.speech_worker is not None:
