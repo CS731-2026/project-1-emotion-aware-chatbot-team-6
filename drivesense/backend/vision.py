@@ -33,6 +33,15 @@ EMOTION_CLASSES = {"anger", "disgust", "fear", "happy", "neutral", "sad", "surpr
 EYE_CLASSES = {"closed_eye", "open_eye"}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+EMOTION_TO_RISK = {
+    "anger": "HIGH",
+    "fear": "HIGH",
+    "sad": "MED",
+    "disgust": "LOW",
+    "surprise": "MED",
+    "happy": "OK",
+    "neutral": "OK",
+}
 
 
 class ClassifierDict(TypedDict):
@@ -489,6 +498,16 @@ def choose_driver_face(
             return None
         return faces[cast(int, selected)]
 
+    if previous_driver_center_x is not None:
+        previous_center_px = previous_driver_center_x * max(frame_width, 1)
+        distance_pairs = [
+            (idx, abs((((box[0] + box[2]) / 2) - previous_center_px)))
+            for idx, box in enumerate(face_boxes)
+        ]
+        best_idx, best_distance = min(distance_pairs, key=lambda item: item[1])
+        if best_distance <= frame_width * 0.18:
+            return best_idx
+
     if strategy == "largest":
         return max(
             range(len(face_boxes)),
@@ -718,12 +737,6 @@ def main() -> None:
                 if idx == driver_idx:
                     current_closed = both_closed
                     driver_emotion = label
-                    print(
-                        f"[DEBUG] Driver eye preds: {eye_predictions}, "
-                        f"avg_closed_conf={avg_closed_conf:.3f}, "
-                        f"both_closed={both_closed}",
-                        flush=True,
-                    )
                     if args.print_emotion_top3 and idx < len(cached_face_top3):
                         print(
                             "Driver emotion top-3:",

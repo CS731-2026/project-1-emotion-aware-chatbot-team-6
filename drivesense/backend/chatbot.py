@@ -24,6 +24,8 @@ SUPPORTED_LLM_MODELS = [
     "deepseek/deepseek-chat",
 ]
 ALLOWED_DRIVER_STATE_KEYS = (
+    "driver_detected",
+    "driver_confident",
     "emotion",
     "emotion_confidence",
     "eye_label",
@@ -31,6 +33,9 @@ ALLOWED_DRIVER_STATE_KEYS = (
     "risk",
     "focus_alert",
     "driver_side",
+    "closed_eye_duration",
+    "focus_level",
+    "trigger_reason",
 )
 
 EMOTION_PROMPT_RULES = {
@@ -66,12 +71,14 @@ EMOTION_PROMPT_RULES = {
 class ChatbotResponse:
     text: str
     model: str
+    selected_model: str
     emotion: str
     temperature: float
     latency_ms: float
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
+    fallback_used: bool
 
 
 def format_driver_state(driver_state: dict[str, Any] | None) -> str:
@@ -85,11 +92,17 @@ def format_driver_state(driver_state: dict[str, Any] | None) -> str:
     eye_conf = float(sanitized_state.get("eye_confidence", 0.0))
     risk = str(sanitized_state.get("risk", "OK"))
     focus_alert = bool(sanitized_state.get("focus_alert", False))
+    driver_detected = bool(sanitized_state.get("driver_detected", False))
+    closed_eye_duration = float(sanitized_state.get("closed_eye_duration", 0.0))
+    trigger_reason = str(sanitized_state.get("trigger_reason", "")).strip()
     return (
+        f"DriverDetected={'yes' if driver_detected else 'no'}, "
         f"Emotion={emotion} ({emotion_conf:.2f}), "
         f"Eyes={eye_label} ({eye_conf:.2f}), "
         f"Risk={risk}, "
-        f"FocusAlert={'yes' if focus_alert else 'no'}."
+        f"FocusAlert={'yes' if focus_alert else 'no'}, "
+        f"ClosedEyeDuration={closed_eye_duration:.1f}s"
+        + (f", TriggerReason={trigger_reason}." if trigger_reason else ".")
     )
 
 
@@ -341,12 +354,14 @@ class DriverAssistantChatbot:
         return ChatbotResponse(
             text=content.strip(),
             model=used_model,
+            selected_model=model,
             emotion=emotion,
             temperature=temperature,
             latency_ms=latency_ms,
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
             total_tokens=getattr(usage, "total_tokens", None),
+            fallback_used=used_model != model,
         )
 
 

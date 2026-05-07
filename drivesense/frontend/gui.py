@@ -190,6 +190,24 @@ def emotion_color_hex(emotion: str) -> str:
     return EMOTION_COLORS_HEX.get(emotion, EMOTION_COLORS_HEX["neutral"])
 
 
+def risk_color_hex(risk: str) -> str:
+    normalized = risk.strip().upper()
+    if normalized == "HIGH":
+        return "#ef4444"
+    if normalized in {"MED", "LOW"}:
+        return "#f59e0b"
+    return "#34d399"
+
+
+def build_context_summary(driver_state: dict[str, Any]) -> str:
+    if not driver_state.get("driver_detected", False):
+        return "Current context: no confident driver detected"
+    emotion = normalize_label(str(driver_state.get("emotion", "neutral")))
+    eyes = normalize_label(str(driver_state.get("eye_label", "open_eye")))
+    risk = str(driver_state.get("risk", "OK")).upper()
+    return f"Current context: {emotion}, {eyes}, {risk}"
+
+
 class ChatBubble(QFrame):
     def __init__(self, text: str, is_user: bool) -> None:
         super().__init__()
@@ -276,12 +294,18 @@ class VisionWorker(QObject):
                 raise RuntimeError(f"Unable to open webcam index {self.args.camera_index}.")
 
             last_state = {
+                "driver_detected": False,
+                "driver_confident": False,
                 "emotion": "neutral",
                 "emotion_confidence": 0.0,
                 "eye_label": "open_eye",
                 "eye_confidence": 0.0,
                 "risk": "OK",
                 "focus_alert": False,
+                "focus_level": 0,
+                "closed_eye_duration": 0.0,
+                "trigger_reason": "",
+                "driver_side": self.args.driver_side,
                 "emotion_model_path": str(emotion_model_path),
                 "eye_model_path": str(eye_model_path),
             }
@@ -405,22 +429,22 @@ class VisionWorker(QObject):
                     for face in faces:
                         x1, y1, x2, y2 = face["bbox"]
                         emotion = face["emotion"]
-                        color = emotion_color_bgr(emotion)
                         is_driver_face = face is primary_face
+                        color = emotion_color_bgr(emotion) if is_driver_face else (120, 120, 120)
                         cv2.rectangle(
                             frame,
                             (x1, y1),
                             (x2, y2),
                             color,
-                            4 if is_driver_face else 3,
+                            4 if is_driver_face else 1,
                         )
-                        draw_tag(
-                            frame,
-                            f"{normalize_label(emotion)} {face['emotion_confidence']:.2f}",
-                            (x1, y1),
-                            color,
-                        )
-                        if face.get("is_candidate", False):
+                        if is_driver_face:
+                            draw_tag(
+                                frame,
+                                f"{normalize_label(emotion)} {face['emotion_confidence']:.2f}",
+                                (x1, y1),
+                                color,
+                            )
                             for eye_box in face["eye_boxes"]:
                                 ex1, ey1, ex2, ey2 = eye_box
                                 cv2.rectangle(
@@ -430,15 +454,17 @@ class VisionWorker(QObject):
                                     (255, 0, 0),
                                     2,
                                 )
-                        draw_tag(
-                            frame,
-                            f"{normalize_label(face['eye_label'])} {face['eye_confidence']:.2f}",
-                            (x1, min(frame_h - 5, y2 + 28)),
-                            (255, 0, 0),
-                        )
-                        if is_driver_face:
+                            draw_tag(
+                                frame,
+                                f"{normalize_label(face['eye_label'])} {face['eye_confidence']:.2f}",
+                                (x1, min(frame_h - 5, y2 + 28)),
+                                (255, 0, 0),
+                            )
                             draw_tag(frame, "driver", (x1, y2 + 56), (255, 255, 255))
+                        elif face.get("is_candidate", False):
+                            draw_tag(frame, "other face", (x1, y1), (220, 220, 220), (40, 40, 40), scale=0.6)
 
+                driver_detected = primary_face is not None
                 if primary_face is not None:
                     current_emotion = primary_face["emotion"]
                     emotion_confidence = float(primary_face["emotion_confidence"])
@@ -449,6 +475,7 @@ class VisionWorker(QObject):
                     emotion_confidence = 0.0
                     current_eye_label = "open_eye"
                     eye_confidence = 0.0
+                    driver_detected = False
 
                 if self.args.print_emotion_top3:
                     if primary_face is None:
@@ -470,6 +497,8 @@ class VisionWorker(QObject):
 
                 risk = EMOTION_TO_RISK.get(current_emotion, "OK")
                 current_driver_state = {
+                    "driver_detected": driver_detected,
+                    "driver_confident": driver_detected,
                     "emotion": current_emotion,
                     "emotion_confidence": emotion_confidence,
                     "eye_label": current_eye_label,
@@ -491,6 +520,7 @@ class VisionWorker(QObject):
                     risk = "HIGH"
                 current_driver_state["risk"] = risk
                 current_driver_state["focus_alert"] = focus_alert
+                current_driver_state.update(focus_monitor.get_state_snapshot())
                 last_state = {
                     **current_driver_state,
                     "emotion_model_path": str(emotion_model_path),
@@ -540,10 +570,14 @@ class VisionWorker(QObject):
                     2,
                     cv2.LINE_AA,
                 )
-                if focus_alert:
-                    alert_text = "Please stay focused"
+                if last_state.get("focus_level", 0) >= 1:
+                    alert_text = (
+                        "Please stay focused"
+                        if last_state.get("focus_level", 0) >= 2
+                        else "Stay attentive"
+                    )
                     font = cv2.FONT_HERSHEY_SIMPLEX
-                    scale = 1.0
+                    scale = 1.0 if last_state.get("focus_level", 0) >= 2 else 0.8
                     thickness = 3
                     (text_w, text_h), baseline = cv2.getTextSize(
                         alert_text, font, scale, thickness
@@ -688,16 +722,25 @@ class DriverAssistantWindow(QMainWindow):
         self.current_emotion = "neutral"
         self.current_risk = "OK"
         self.current_driver_state: dict[str, Any] = {
+            "driver_detected": False,
+            "driver_confident": False,
             "emotion": "neutral",
             "emotion_confidence": 0.0,
             "eye_label": "open_eye",
             "eye_confidence": 0.0,
             "risk": "OK",
             "focus_alert": False,
+            "focus_level": 0,
+            "closed_eye_duration": 0.0,
+            "trigger_reason": "",
+            "driver_side": self.args.driver_side,
         }
         self.conversation_history: list[dict[str, str]] = []
         self.chat_worker: ChatWorker | None = None
         self.speech_worker: SpeechWorker | None = None
+        self.last_used_model = self.args.default_llm_model
+        self.last_selected_model = self.args.default_llm_model
+        self.last_fallback_used = False
 
         try:
             self.chatbot = DriverAssistantChatbot(app_title="Driver Assistant GUI")
@@ -726,20 +769,28 @@ class DriverAssistantWindow(QMainWindow):
         info_card = QFrame()
         info_card.setStyleSheet("background-color: #111827; color: white; border-radius: 16px; border: 1px solid #1f2937;")
         info_layout = QVBoxLayout(info_card)
+        self.driver_detected_label = QLabel("Driver detected: No")
         self.emotion_label = QLabel("Emotion: neutral")
         self.eye_label = QLabel("Eyes: open eye")
         self.risk_label = QLabel("Risk: OK")
         self.focus_label = QLabel("Focus: OK")
-        self.driver_label = QLabel("Driver heuristic: right")
+        self.reason_label = QLabel("Reason: none")
+        self.driver_label = QLabel("Driver heuristic: left")
+        self.model_label = QLabel(f"Selected model: {self.args.default_llm_model}")
+        self.last_model_label = QLabel(f"Last reply model: {self.args.default_llm_model}")
         self.model_path_label = QLabel("Emotion model: loading...")
         self.eye_model_path_label = QLabel("Eye model: loading...")
         self.status_label = QLabel("Status: ready")
         for label in [
+            self.driver_detected_label,
             self.emotion_label,
             self.eye_label,
             self.risk_label,
             self.focus_label,
+            self.reason_label,
             self.driver_label,
+            self.model_label,
+            self.last_model_label,
             self.model_path_label,
             self.eye_model_path_label,
             self.status_label,
@@ -775,6 +826,14 @@ class DriverAssistantWindow(QMainWindow):
         controls_row.addWidget(label_temp)
         controls_row.addWidget(self.temperature_spin)
         right_panel.addLayout(controls_row)
+
+        self.context_label = QLabel("Current context: neutral, open eye, OK")
+        self.context_label.setWordWrap(True)
+        self.context_label.setStyleSheet(
+            "background-color: #111827; color: #e5e7eb; border: 1px solid #1f2937; "
+            "border-radius: 12px; padding: 10px 12px; font-size: 13px; font-weight: 500;"
+        )
+        right_panel.addWidget(self.context_label)
 
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setWidgetResizable(True)
@@ -862,6 +921,18 @@ class DriverAssistantWindow(QMainWindow):
         self.current_emotion = state["emotion"]
         self.current_risk = state["risk"]
         color = emotion_color_hex(self.current_emotion)
+        driver_detected = bool(state.get("driver_detected", False))
+        trigger_reason = str(state.get("trigger_reason", "")).strip()
+        focus_level = int(state.get("focus_level", 0))
+        closed_eye_duration = float(state.get("closed_eye_duration", 0.0))
+        self.driver_detected_label.setText(
+            f"Driver detected: {'Yes' if driver_detected else 'No'}"
+        )
+        self.driver_detected_label.setStyleSheet(
+            "color: #34d399; font-size: 18px; font-weight: 600;"
+            if driver_detected
+            else "color: #f59e0b; font-size: 18px; font-weight: 600;"
+        )
         self.emotion_label.setText(
             f"Emotion: {normalize_label(self.current_emotion)} ({state['emotion_confidence']:.2f})"
         )
@@ -872,24 +943,42 @@ class DriverAssistantWindow(QMainWindow):
         self.eye_label.setStyleSheet("color: #60a5fa; font-size: 18px; font-weight: 600;")
         self.risk_label.setText(f"Risk: {self.current_risk}")
         self.risk_label.setStyleSheet(
-            f"color: {color}; font-size: 18px; font-weight: 600;"
+            f"color: {risk_color_hex(self.current_risk)}; font-size: 18px; font-weight: 600;"
         )
         self.focus_label.setText(
-            "Focus: Please stay focused" if state["focus_alert"] else "Focus: OK"
+            "Focus: Please stay focused"
+            if state["focus_alert"]
+            else ("Focus: Stay attentive" if focus_level == 1 else "Focus: OK")
         )
         self.focus_label.setStyleSheet(
             "color: #ef4444; font-size: 18px; font-weight: 600;"
             if state["focus_alert"]
-            else "color: #34d399; font-size: 18px; font-weight: 600;"
+            else (
+                "color: #f59e0b; font-size: 18px; font-weight: 600;"
+                if focus_level == 1
+                else "color: #34d399; font-size: 18px; font-weight: 600;"
+            )
         )
+        if trigger_reason:
+            self.reason_label.setText(
+                f"Reason: {trigger_reason} (current {closed_eye_duration:.1f}s)"
+            )
+        else:
+            self.reason_label.setText("Reason: none")
         self.driver_label.setText(f"Driver heuristic: {state['driver_side']}")
+        self.model_label.setText(f"Selected model: {self.model_combo.currentText()}")
+        fallback_suffix = " (fallback)" if self.last_fallback_used else ""
+        self.last_model_label.setText(f"Last reply model: {self.last_used_model}{fallback_suffix}")
         self.model_path_label.setText(f"Emotion model: {state['emotion_model_path']}")
         self.eye_model_path_label.setText(f"Eye model: {state['eye_model_path']}")
+        self.context_label.setText(build_context_summary(state))
 
     def handle_worker_error(self, message: str) -> None:
         self.status_label.setText(f"Status: error - {message}")
 
     def handle_model_selection_change(self, model_name: str) -> None:
+        self.last_selected_model = model_name
+        self.model_label.setText(f"Selected model: {model_name}")
         message = f"Selected chat model: {model_name}"
         self.status_label.setText(f"Status: {message}")
         print(message)
@@ -946,12 +1035,19 @@ class DriverAssistantWindow(QMainWindow):
         self.add_message(payload["text"], is_user=False)
         self.conversation_history.append({"role": "assistant", "content": payload["text"]})
         self.speak_reply_async(payload["text"], payload.get("emotion", self.current_emotion))
+        self.last_used_model = str(payload.get("model", self.model_combo.currentText()))
+        self.last_fallback_used = bool(payload.get("fallback_used", False))
+        self.last_model_label.setText(
+            f"Last reply model: {self.last_used_model}"
+            + (" (fallback)" if self.last_fallback_used else "")
+        )
         print(
             f"OpenRouter reply received from {payload['model']} "
             f"in {payload['latency_ms']:.0f} ms"
         )
         self.status_label.setText(
             f"Status: OpenRouter reply in {payload['latency_ms']:.0f} ms via {payload['model']}"
+            + (" (fallback)" if self.last_fallback_used else "")
         )
 
     def handle_chat_error(self, message: str) -> None:
@@ -968,15 +1064,26 @@ class DriverAssistantWindow(QMainWindow):
             self.add_message(bot_reply, is_user=False)
             self.conversation_history.append({"role": "assistant", "content": bot_reply})
         model = payload.get("model", self.model_combo.currentText())
+        self.last_used_model = str(model)
+        self.last_fallback_used = bool(payload.get("fallback_used", False))
+        self.last_model_label.setText(
+            f"Last reply model: {self.last_used_model}"
+            + (" (fallback)" if self.last_fallback_used else "")
+        )
         latency_ms = payload.get("latency_ms")
         if isinstance(latency_ms, (int, float)):
             self.status_label.setText(
                 f"Status: voice dialogue reply in {float(latency_ms):.0f} ms via {model}"
+                + (" (fallback)" if self.last_fallback_used else "")
             )
         else:
             self.status_label.setText(f"Status: voice dialogue completed via {model}")
 
     def handle_voice_dialogue_error(self, message: str) -> None:
+        if message.strip() == "No speech detected.":
+            self.status_label.setText("Status: no speech detected")
+            print("Voice dialogue: no speech detected", flush=True)
+            return
         self.status_label.setText(f"Status: voice dialogue error - {message}")
         print(f"Voice dialogue error: {message}", flush=True)
 
@@ -1011,9 +1118,11 @@ class DriverAssistantWindow(QMainWindow):
 
     def handle_transcription(self, text: str) -> None:
         self.input_edit.setText(text)
-        self.status_label.setText("Status: transcription ready")
         if text.strip():
+            self.status_label.setText("Status: transcription ready")
             self.send_text_message()
+        else:
+            self.status_label.setText("Status: no speech detected")
 
     def handle_speech_error(self, message: str) -> None:
         self.status_label.setText(f"Status: speech error - {message}")

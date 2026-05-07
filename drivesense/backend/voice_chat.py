@@ -10,6 +10,10 @@ from drivesense.backend.chatbot import ChatbotResponse, DriverAssistantChatbot
 from drivesense.backend.speech import TextToSpeech, WhisperTranscriber, record_microphone_audio
 
 
+class NoSpeechDetectedError(ValueError):
+    """Raised when speech recording completes but no useful text is transcribed."""
+
+
 @dataclass
 class VoiceChatResult:
     """Result of a voice chat interaction."""
@@ -17,10 +21,12 @@ class VoiceChatResult:
     bot_reply: str
     emotion: str
     model: str
+    selected_model: str
     latency_ms: float
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
+    fallback_used: bool
 
 
 class VoiceChatPipeline:
@@ -64,7 +70,7 @@ class VoiceChatPipeline:
         user_input = result.text
         print(f"Transcribed: {user_input}")
         if not user_input.strip():
-            raise ValueError("Speech transcription was empty. Skipping LLM reply.")
+            raise NoSpeechDetectedError("No speech detected.")
         
         # Step 2: Get LLM reply
         print("Generating response...")
@@ -87,10 +93,12 @@ class VoiceChatPipeline:
             bot_reply=bot_response.text,
             emotion=bot_response.emotion,
             model=bot_response.model,
+            selected_model=bot_response.selected_model,
             latency_ms=bot_response.latency_ms,
             prompt_tokens=bot_response.prompt_tokens,
             completion_tokens=bot_response.completion_tokens,
             total_tokens=bot_response.total_tokens,
+            fallback_used=bot_response.fallback_used,
         )
     
     def process_voice_input_async(

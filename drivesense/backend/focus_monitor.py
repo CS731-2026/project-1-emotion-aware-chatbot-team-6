@@ -22,6 +22,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from drivesense.backend.voice_chat import NoSpeechDetectedError
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +67,10 @@ class _State:
     chat_model: str = "openai/gpt-4o-mini"
     temperature: float = 1.0
     driver_state: dict[str, Any] | None = None
+    closed_eye_duration: float = 0.0
+    current_level: int = 0
+    trigger_reason: str = ""
+    repeat_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -149,6 +155,16 @@ class FocusMonitor:
         self._state = _State()
         self._state.chat_model = self.config.chat_model
 
+    def get_state_snapshot(self) -> dict[str, Any]:
+        with self._state.lock:
+            return {
+                "closed_eye_duration": self._state.closed_eye_duration,
+                "focus_level": self._state.current_level,
+                "trigger_reason": self._state.trigger_reason,
+                "repeat_count": self._state.repeat_count,
+                "focus_alert": self._state.last_warning_active,
+            }
+
     def set_runtime_context(
         self,
         chat_model: str | None = None,
@@ -187,6 +203,8 @@ class FocusMonitor:
         if now is None:
             now = time.perf_counter()
 
+        preview_threshold = max(self.config.closed_eye_seconds * 0.6, 0.5)
+
         with self._state.lock:
             if eyes_closed:
                 if self._state.closed_eye_started_at is None:
@@ -197,6 +215,7 @@ class FocusMonitor:
                 duration = 0.0
 
             warning_active = duration >= self.config.closed_eye_seconds
+            preview_active = duration >= preview_threshold and not warning_active
             should_trigger = (
                 warning_active
                 and not self._state.is_handling_event
@@ -206,11 +225,25 @@ class FocusMonitor:
             if should_trigger:
                 self._state.is_handling_event = True
                 self._state.last_trigger_at = now
+                self._state.repeat_count += 1
 
+            self._state.closed_eye_duration = duration
             self._state.last_warning_active = warning_active
+            if warning_active:
+                self._state.current_level = 3 if self._state.repeat_count >= 2 else 2
+                self._state.trigger_reason = f"Eyes closed for {duration:.1f}s"
+            elif preview_active:
+                self._state.current_level = 1
+                self._state.trigger_reason = f"Eyes closed for {duration:.1f}s"
+            else:
+                self._state.current_level = 0
+                self._state.trigger_reason = ""
             if driver_state is not None:
                 synced_driver_state = dict(driver_state)
                 synced_driver_state["focus_alert"] = warning_active
+                synced_driver_state["closed_eye_duration"] = duration
+                synced_driver_state["focus_level"] = self._state.current_level
+                synced_driver_state["trigger_reason"] = self._state.trigger_reason
                 if warning_active:
                     synced_driver_state["risk"] = "HIGH"
                 self._state.driver_state = synced_driver_state
@@ -293,6 +326,10 @@ class FocusMonitor:
                     )
                     if self._on_voice_result is not None:
                         self._on_voice_result(result)
+                except NoSpeechDetectedError as exc:
+                    logger.info("Voice pipeline skipped: %s", exc)
+                    if self._on_voice_error is not None:
+                        self._on_voice_error(str(exc))
                 except Exception as exc:
                     logger.exception("Voice pipeline failed: %s", exc)
                     if self._on_voice_error is not None:
@@ -309,3 +346,7 @@ class FocusMonitor:
             self._state.last_trigger_at = None
             self._state.is_handling_event = False
             self._state.last_warning_active = False
+            self._state.closed_eye_duration = 0.0
+            self._state.current_level = 0
+            self._state.trigger_reason = ""
+            self._state.repeat_count = 0
