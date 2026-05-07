@@ -636,13 +636,20 @@ def main() -> None:
 
                 left_eye_box, right_eye_box = estimate_eye_boxes(face_box)
                 eye_predictions = cached_eye_labels[idx * 2 : idx * 2 + 2]
-                both_closed = (
-                    len(eye_predictions) == 2
-                    and all(pred[0] == "closed_eye" for pred in eye_predictions)
+                avg_closed_conf = (
+                    sum(pred[1] for pred in eye_predictions[:2] if pred[0] == "closed_eye")
+                    / max(len(eye_predictions), 1)
                 )
+                both_closed = avg_closed_conf > 0.80
                 if idx == driver_idx:
                     current_closed = both_closed
                     driver_emotion = label
+                    print(
+                        f"[DEBUG] Driver eye preds: {eye_predictions}, "
+                        f"avg_closed_conf={avg_closed_conf:.3f}, "
+                        f"both_closed={both_closed}",
+                        flush=True,
+                    )
                     if args.print_emotion_top3 and idx < len(cached_face_top3):
                         print(
                             "Driver emotion top-3:",

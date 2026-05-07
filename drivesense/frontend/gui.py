@@ -312,23 +312,16 @@ class VisionWorker(QObject):
                         emotion_confidence = float(emotion_topk[0][1])
 
                         per_face_eye_predictions = eye_predictions[index * 2 : index * 2 + 2]
-                        closed_scores = [
-                            confidence
-                            for label, confidence in per_face_eye_predictions
-                            if label == "closed_eye"
-                        ]
-                        open_scores = [
-                            confidence
-                            for label, confidence in per_face_eye_predictions
-                            if label == "open_eye"
-                        ]
-                        if len(closed_scores) == 2:
+                        avg_closed_conf = (
+                            sum(score for label, score in per_face_eye_predictions if label == "closed_eye")
+                            / max(len(per_face_eye_predictions), 1)
+                        )
+                        if avg_closed_conf > 0.80:
                             eye_label = "closed_eye"
-                            eye_confidence = float(sum(closed_scores) / len(closed_scores))
+                            eye_confidence = avg_closed_conf
                         else:
-                            source_scores = open_scores or [score for _, score in per_face_eye_predictions] or [0.0]
                             eye_label = "open_eye"
-                            eye_confidence = float(sum(source_scores) / len(source_scores))
+                            eye_confidence = 1.0 - avg_closed_conf
 
                         faces.append(
                             {
@@ -413,7 +406,6 @@ class VisionWorker(QObject):
                 if (
                     primary_face is not None
                     and current_eye_label == "closed_eye"
-                    and eye_confidence >= self.args.classification_confidence
                 ):
                     if closed_eye_start is None:
                         closed_eye_start = time.perf_counter()
