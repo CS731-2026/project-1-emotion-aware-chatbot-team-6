@@ -85,6 +85,29 @@ def _play_beep(frequency_hz: int, duration_ms: int) -> None:
     print("\a", end="", flush=True)
 
 
+def _build_check_in_question(
+    default_question: str,
+    emotion: str,
+    driver_state: dict[str, Any] | None,
+) -> str:
+    risk = str((driver_state or {}).get("risk", "OK")).upper()
+    normalized_emotion = (emotion or "neutral").strip().lower()
+
+    if risk == "HIGH":
+        return "Please stay focused. Take a breath."
+    if normalized_emotion in {"anger", "disgust"}:
+        return "Please stay focused. Take a slow breath."
+    if normalized_emotion in {"fear", "surprise"}:
+        return "Please stay focused. Stay calm."
+    if normalized_emotion == "sad":
+        return "Please stay focused. Are you okay?"
+    if normalized_emotion == "happy":
+        return "Please stay focused for a moment."
+    if normalized_emotion == "neutral":
+        return "Please stay focused. Eyes on the road."
+    return default_question
+
+
 class FocusMonitor:
     """Watch the driver's eye state and run a voice intervention when drowsy.
 
@@ -144,6 +167,7 @@ class FocusMonitor:
         self,
         eyes_closed: bool,
         emotion: str = "neutral",
+        driver_state: dict[str, Any] | None = None,
         now: Optional[float] = None,
     ) -> bool:
         """Feed one frame's eye state into the monitor.
@@ -152,6 +176,9 @@ class FocusMonitor:
             eyes_closed: True when both eyes are currently classified closed.
             emotion: The driver's current detected emotion. Passed through to
                 the TTS engine and the LLM prompt.
+            driver_state: Per-frame driver state snapshot. When provided, the
+                monitor stores a synchronized copy with the computed
+                focus-alert/risk values before any intervention is launched.
             now: Override the current timestamp (mostly for unit tests).
 
         Returns:
@@ -181,6 +208,12 @@ class FocusMonitor:
                 self._state.last_trigger_at = now
 
             self._state.last_warning_active = warning_active
+            if driver_state is not None:
+                synced_driver_state = dict(driver_state)
+                synced_driver_state["focus_alert"] = warning_active
+                if warning_active:
+                    synced_driver_state["risk"] = "HIGH"
+                self._state.driver_state = synced_driver_state
 
         if should_trigger:
             logger.info(
@@ -230,8 +263,13 @@ class FocusMonitor:
 
             if self._tts is not None:
                 try:
-                    self._tts.speak(
+                    check_in_question = _build_check_in_question(
                         self.config.check_in_question,
+                        emotion,
+                        driver_state,
+                    )
+                    self._tts.speak(
+                        check_in_question,
                         emotion=emotion,
                         wait=True,
                     )

@@ -23,6 +23,15 @@ SUPPORTED_LLM_MODELS = [
     "anthropic/claude-haiku-4-5",
     "deepseek/deepseek-chat",
 ]
+ALLOWED_DRIVER_STATE_KEYS = (
+    "emotion",
+    "emotion_confidence",
+    "eye_label",
+    "eye_confidence",
+    "risk",
+    "focus_alert",
+    "driver_side",
+)
 
 EMOTION_PROMPT_RULES = {
     "anger": (
@@ -66,21 +75,32 @@ class ChatbotResponse:
 
 
 def format_driver_state(driver_state: dict[str, Any] | None) -> str:
-    if not driver_state:
+    sanitized_state = sanitize_driver_state(driver_state)
+    if not sanitized_state:
         return "No structured driver state is available."
 
-    emotion = str(driver_state.get("emotion", "neutral"))
-    emotion_conf = float(driver_state.get("emotion_confidence", 0.0))
-    eye_label = str(driver_state.get("eye_label", "open_eye"))
-    eye_conf = float(driver_state.get("eye_confidence", 0.0))
-    risk = str(driver_state.get("risk", "OK"))
-    focus_alert = bool(driver_state.get("focus_alert", False))
+    emotion = str(sanitized_state.get("emotion", "neutral"))
+    emotion_conf = float(sanitized_state.get("emotion_confidence", 0.0))
+    eye_label = str(sanitized_state.get("eye_label", "open_eye"))
+    eye_conf = float(sanitized_state.get("eye_confidence", 0.0))
+    risk = str(sanitized_state.get("risk", "OK"))
+    focus_alert = bool(sanitized_state.get("focus_alert", False))
     return (
         f"Emotion={emotion} ({emotion_conf:.2f}), "
         f"Eyes={eye_label} ({eye_conf:.2f}), "
         f"Risk={risk}, "
         f"FocusAlert={'yes' if focus_alert else 'no'}."
     )
+
+
+def sanitize_driver_state(driver_state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not driver_state:
+        return None
+    return {
+        key: driver_state[key]
+        for key in ALLOWED_DRIVER_STATE_KEYS
+        if key in driver_state
+    }
 
 
 def trim_history(
@@ -182,10 +202,11 @@ class DriverAssistantChatbot:
         auto_trigger: bool = False,
         driver_state: dict[str, Any] | None = None,
     ) -> ChatbotResponse:
+        sanitized_driver_state = sanitize_driver_state(driver_state)
         system_prompt = build_system_prompt(
             emotion,
             auto_trigger=auto_trigger,
-            driver_state=driver_state,
+            driver_state=sanitized_driver_state,
         )
         trimmed_history = trim_history(conversation_history)
         current_user_message = (
@@ -221,7 +242,7 @@ class DriverAssistantChatbot:
                 emotion,
                 auto_trigger,
                 provider_safe,
-                format_driver_state(driver_state),
+                format_driver_state(sanitized_driver_state),
             )
             start = time.perf_counter()
             try:
@@ -264,7 +285,7 @@ class DriverAssistantChatbot:
             safe_prompt = build_system_prompt(
                 emotion,
                 auto_trigger=auto_trigger,
-                driver_state=driver_state,
+                driver_state=sanitized_driver_state,
                 provider_safe=True,
             )
             logger.warning(
@@ -293,7 +314,7 @@ class DriverAssistantChatbot:
                 fallback_prompt = build_system_prompt(
                     emotion,
                     auto_trigger=auto_trigger,
-                    driver_state=driver_state,
+                    driver_state=sanitized_driver_state,
                     provider_safe=True,
                 )
                 completion, latency_ms = attempt_completion(

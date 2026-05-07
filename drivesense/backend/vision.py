@@ -749,6 +749,13 @@ def main() -> None:
             warning_active = focus_monitor.update(
                 eyes_closed=current_closed,
                 emotion=driver_emotion,
+                driver_state={
+                    "emotion": driver_emotion,
+                    "eye_label": "closed_eye" if current_closed else "open_eye",
+                    "risk": "HIGH" if current_closed else EMOTION_TO_RISK.get(driver_emotion, "OK"),
+                    "focus_alert": False,
+                    "driver_side": args.driver_side,
+                },
             )
 
             if warning_active:

@@ -34,6 +34,7 @@ from drivesense.backend.chatbot import (
     DEFAULT_MODEL,
     DriverAssistantChatbot,
     SUPPORTED_LLM_MODELS,
+    sanitize_driver_state,
 )
 from drivesense.backend.focus_monitor import FocusMonitor, FocusMonitorConfig
 from drivesense.backend.vision import (
@@ -480,17 +481,16 @@ class VisionWorker(QObject):
                 focus_monitor.set_runtime_context(
                     chat_model=self.current_chat_model,
                     temperature=self.current_temperature,
-                    driver_state=current_driver_state,
                 )
                 focus_alert = focus_monitor.update(
                     eyes_closed=current_closed,
                     emotion=current_emotion,
+                    driver_state=current_driver_state,
                 )
                 if focus_alert:
                     risk = "HIGH"
                 current_driver_state["risk"] = risk
                 current_driver_state["focus_alert"] = focus_alert
-                focus_monitor.set_runtime_context(driver_state=current_driver_state)
                 last_state = {
                     **current_driver_state,
                     "emotion_model_path": str(emotion_model_path),
@@ -614,7 +614,7 @@ class ChatWorker(QThread):
                 "ChatWorker start | "
                 f"model={self.model} temperature={self.temperature:.2f} "
                 f"emotion={self.emotion} auto_trigger={self.auto_trigger} "
-                f"driver_state={self.driver_state}",
+                f"driver_state={sanitize_driver_state(self.driver_state)}",
                 flush=True,
             )
             response = self.chatbot.generate_reply(
@@ -858,7 +858,7 @@ class DriverAssistantWindow(QMainWindow):
         self.video_label.setPixmap(pixmap)
 
     def update_emotion_state(self, state: dict) -> None:
-        self.current_driver_state = dict(state)
+        self.current_driver_state = sanitize_driver_state(state) or {}
         self.current_emotion = state["emotion"]
         self.current_risk = state["risk"]
         color = emotion_color_hex(self.current_emotion)
