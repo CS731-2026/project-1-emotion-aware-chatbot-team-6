@@ -316,7 +316,7 @@ python -m drivesense.benchmarks.score_llm_results --input-csv benchmark_results\
 ### GUI
 
 ```powershell
-python -m drivesense.frontend.gui --device cuda --default-llm-model openai/gpt-4o-mini
+python -m drivesense.frontend.gui --device cuda
 ```
 
 ### 命令行视觉模式

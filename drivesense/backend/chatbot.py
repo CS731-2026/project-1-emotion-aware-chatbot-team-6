@@ -28,6 +28,8 @@ ALLOWED_DRIVER_STATE_KEYS = (
     "driver_confident",
     "emotion",
     "emotion_confidence",
+    "emotion_secondary",
+    "emotion_secondary_confidence",
     "eye_label",
     "eye_confidence",
     "risk",
@@ -88,6 +90,8 @@ def format_driver_state(driver_state: dict[str, Any] | None) -> str:
 
     emotion = str(sanitized_state.get("emotion", "neutral"))
     emotion_conf = float(sanitized_state.get("emotion_confidence", 0.0))
+    emotion_secondary = str(sanitized_state.get("emotion_secondary", ""))
+    emotion_secondary_conf = float(sanitized_state.get("emotion_secondary_confidence", 0.0))
     eye_label = str(sanitized_state.get("eye_label", "open_eye"))
     eye_conf = float(sanitized_state.get("eye_confidence", 0.0))
     risk = str(sanitized_state.get("risk", "OK"))
@@ -97,7 +101,13 @@ def format_driver_state(driver_state: dict[str, Any] | None) -> str:
     trigger_reason = str(sanitized_state.get("trigger_reason", "")).strip()
     return (
         f"DriverDetected={'yes' if driver_detected else 'no'}, "
-        f"Emotion={emotion} ({emotion_conf:.2f}), "
+        f"TopEmotions={emotion} ({emotion_conf:.2f})"
+        + (
+            f", {emotion_secondary} ({emotion_secondary_conf:.2f})"
+            if emotion_secondary
+            else ""
+        )
+        + ", "
         f"Eyes={eye_label} ({eye_conf:.2f}), "
         f"Risk={risk}, "
         f"FocusAlert={'yes' if focus_alert else 'no'}, "

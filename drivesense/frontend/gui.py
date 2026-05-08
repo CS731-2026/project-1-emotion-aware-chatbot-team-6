@@ -51,8 +51,10 @@ from drivesense.backend.vision import (
     load_timm_classifier,
     normalize_checkpoint_path,
     normalize_label,
+    prepare_eye_debug_dir,
     resolve_devices,
     resolve_latest_timm_model,
+    save_eye_debug_crop,
 )
 from drivesense.backend.speech import TextToSpeech, WhisperTranscriber, record_microphone_audio
 
@@ -179,6 +181,24 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Print the driver's emotion top-3 probabilities for each frame.",
     )
+    parser.add_argument(
+        "--save-eye-crops",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save the driver eye crops that are sent to the eye-state model.",
+    )
+    parser.add_argument(
+        "--save-eye-crops-dir",
+        type=Path,
+        default=PROJECT_ROOT / "debug_exports" / "eye_crops",
+        help="Directory for exported eye crops.",
+    )
+    parser.add_argument(
+        "--save-eye-crops-limit",
+        type=int,
+        default=200,
+        help="Maximum number of eye crops to save per run.",
+    )
     return parser.parse_args()
 
 
@@ -298,6 +318,8 @@ class VisionWorker(QObject):
                 "driver_confident": False,
                 "emotion": "neutral",
                 "emotion_confidence": 0.0,
+                "emotion_secondary": "",
+                "emotion_secondary_confidence": 0.0,
                 "eye_label": "open_eye",
                 "eye_confidence": 0.0,
                 "risk": "OK",
@@ -311,11 +333,17 @@ class VisionWorker(QObject):
             }
             previous_time = time.perf_counter()
             previous_driver_center_x: float | None = None
+            saved_eye_crop_count = 0
+            frame_index = 0
+            run_prefix = time.strftime("%Y%m%d_%H%M%S")
+            if self.args.save_eye_crops:
+                prepare_eye_debug_dir(self.args.save_eye_crops_dir)
 
             while self._running:
                 ok, frame = cap.read()
                 if not ok:
                     raise RuntimeError("Failed to read a frame from the webcam.")
+                frame_index += 1
 
                 frame_h, frame_w = frame.shape[:2]
                 face_result = face_detector.predict(
@@ -411,6 +439,7 @@ class VisionWorker(QObject):
                                 "eye_label": eye_label,
                                 "eye_confidence": eye_confidence,
                                 "eye_boxes": estimate_eye_boxes((x1, y1, x2, y2)),
+                                "eye_predictions": per_face_eye_predictions,
                                 "detection_confidence": detection_conf,
                                 "is_candidate": index in candidate_indices,
                             }
@@ -445,15 +474,6 @@ class VisionWorker(QObject):
                                 (x1, y1),
                                 color,
                             )
-                            for eye_box in face["eye_boxes"]:
-                                ex1, ey1, ex2, ey2 = eye_box
-                                cv2.rectangle(
-                                    frame,
-                                    (ex1, ey1),
-                                    (ex2, ey2),
-                                    (255, 0, 0),
-                                    2,
-                                )
                             draw_tag(
                                 frame,
                                 f"{normalize_label(face['eye_label'])} {face['eye_confidence']:.2f}",
@@ -464,15 +484,46 @@ class VisionWorker(QObject):
                         elif face.get("is_candidate", False):
                             draw_tag(frame, "other face", (x1, y1), (220, 220, 220), (40, 40, 40), scale=0.6)
 
+                        if (
+                            is_driver_face
+                            and self.args.save_eye_crops
+                            and saved_eye_crop_count < self.args.save_eye_crops_limit
+                        ):
+                            eye_boxes = cast(tuple[tuple[int, int, int, int], tuple[int, int, int, int]], face["eye_boxes"])
+                            per_face_eye_predictions = cast(list[tuple[str, float]], face["eye_predictions"])
+                            for eye_offset, (eye_box, eye_prediction) in enumerate(
+                                zip(eye_boxes, per_face_eye_predictions)
+                            ):
+                                if saved_eye_crop_count >= self.args.save_eye_crops_limit:
+                                    break
+                                ex1, ey1, ex2, ey2 = eye_box
+                                eye_crop = frame[ey1:ey2, ex1:ex2].copy()
+                                saved_path = save_eye_debug_crop(
+                                    self.args.save_eye_crops_dir,
+                                    run_prefix,
+                                    frame_index,
+                                    eye_offset,
+                                    eye_crop,
+                                    eye_prediction[0],
+                                    eye_prediction[1],
+                                )
+                                if saved_path is not None:
+                                    saved_eye_crop_count += 1
+
                 driver_detected = primary_face is not None
                 if primary_face is not None:
                     current_emotion = primary_face["emotion"]
                     emotion_confidence = float(primary_face["emotion_confidence"])
+                    emotion_topk = cast(list[tuple[str, float]], primary_face.get("emotion_topk", []))
+                    secondary_emotion = emotion_topk[1][0] if len(emotion_topk) > 1 else ""
+                    secondary_emotion_confidence = float(emotion_topk[1][1]) if len(emotion_topk) > 1 else 0.0
                     current_eye_label = primary_face["eye_label"]
                     eye_confidence = float(primary_face["eye_confidence"])
                 else:
                     current_emotion = "neutral"
                     emotion_confidence = 0.0
+                    secondary_emotion = ""
+                    secondary_emotion_confidence = 0.0
                     current_eye_label = "open_eye"
                     eye_confidence = 0.0
                     driver_detected = False
@@ -501,6 +552,8 @@ class VisionWorker(QObject):
                     "driver_confident": driver_detected,
                     "emotion": current_emotion,
                     "emotion_confidence": emotion_confidence,
+                    "emotion_secondary": secondary_emotion,
+                    "emotion_secondary_confidence": secondary_emotion_confidence,
                     "eye_label": current_eye_label,
                     "eye_confidence": eye_confidence,
                     "risk": risk,
