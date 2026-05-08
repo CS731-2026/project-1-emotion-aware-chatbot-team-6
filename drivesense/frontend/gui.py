@@ -10,7 +10,7 @@ from typing import Any, cast
 
 import cv2
 import torch
-from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot   
 from PyQt5.QtGui import QCloseEvent, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -57,6 +57,7 @@ from drivesense.backend.vision import (
     save_eye_debug_crop,
 )
 from drivesense.backend.speech import TextToSpeech, WhisperTranscriber, record_microphone_audio
+from drivesense.backend.wake_word import WakeWordListener, WakeWordConfig, ContinuedConversationListener
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -174,7 +175,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--default-llm-model", type=str, default=DEFAULT_MODEL, help="Default OpenRouter model.")
     parser.add_argument("--default-temperature", type=float, default=1.0, help="Default chatbot temperature.")
-    parser.add_argument("--whisper-model-size", type=str, default="base", help="faster-whisper model size.")
+    parser.add_argument("--whisper-model-size", type=str, default="tiny", help="faster-whisper model size (tiny=fastest, base=more accurate).")
+    parser.add_argument(
+        "--max-recording-duration",
+        type=float,
+        default=8.0,
+        help="Maximum recording duration in seconds (VAD may stop earlier).",
+    )
+    parser.add_argument(
+        "--silence-threshold",
+        type=float,
+        default=1.0,
+        help="Seconds of silence before auto-stopping recording (VAD).",
+    )
     parser.add_argument(
         "--print-emotion-top3",
         action=argparse.BooleanOptionalAction,
@@ -727,10 +740,20 @@ class SpeechWorker(QThread):
     _cache_lock = threading.Lock()
     _transcriber_cache: dict[tuple[str, str], WhisperTranscriber] = {}
 
-    def __init__(self, model_size: str, duration_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        model_size: str,
+        duration_seconds: float = 5.0,
+        vad_enabled: bool = True,
+        min_duration_seconds: float = 0.5,
+        silence_duration_seconds: float = 1.0,
+    ) -> None:
         super().__init__()
         self.model_size = model_size
         self.duration_seconds = duration_seconds
+        self.vad_enabled = vad_enabled
+        self.min_duration_seconds = min_duration_seconds
+        self.silence_duration_seconds = silence_duration_seconds
         self.stop_event = threading.Event()
 
     def stop_recording(self) -> None:
@@ -754,6 +777,9 @@ class SpeechWorker(QThread):
                 duration_seconds=self.duration_seconds,
                 sample_rate=16000,
                 stop_event=self.stop_event,
+                vad_enabled=self.vad_enabled,
+                min_duration_seconds=self.min_duration_seconds,
+                silence_duration_seconds=self.silence_duration_seconds,
             )
             if audio.size == 0:
                 raise RuntimeError("No audio was captured from the microphone.")
@@ -794,6 +820,10 @@ class DriverAssistantWindow(QMainWindow):
         self.last_used_model = self.args.default_llm_model
         self.last_selected_model = self.args.default_llm_model
         self.last_fallback_used = False
+        self.wake_word_listening = False
+        self.wake_word_listener: WakeWordListener | None = None
+        self.continued_listener: ContinuedConversationListener | None = None
+        self._in_continued_mode = False
 
         try:
             self.chatbot = DriverAssistantChatbot(app_title="Driver Assistant GUI")
@@ -912,9 +942,8 @@ class DriverAssistantWindow(QMainWindow):
             "QLineEdit:focus { border: 2px solid #3b82f6; }"
         )
         self.input_edit.returnPressed.connect(self.send_text_message)
-        self.mic_button = QPushButton("🎤 Talk")
-        self.mic_button.pressed.connect(self.start_recording)
-        self.mic_button.released.connect(self.stop_recording)
+        self.mic_button = QPushButton("🎤 Wake-word Listening: OFF")
+        self.mic_button.clicked.connect(self.toggle_wake_word_listening)
         self.mic_button.setStyleSheet(
             "QPushButton { background-color: #f59e0b; color: white; border: none; border-radius: 8px; "
             "padding: 8px 16px; font-weight: 600; font-size: 13px; }"
@@ -929,8 +958,21 @@ class DriverAssistantWindow(QMainWindow):
             "QPushButton:pressed { background-color: #1d4ed8; }"
         )
         self.send_button.clicked.connect(self.send_text_message)
+        # Push-to-talk button (press & hold to speak)
+        self.ptt_button = QPushButton("🎙 Hold to Talk")
+        self.ptt_button.setStyleSheet(
+            "QPushButton { background-color: #10b981; color: white; border: none; border-radius: 8px; "
+            "padding: 8px 12px; font-weight: 600; font-size: 13px; }"
+            "QPushButton:hover { background-color: #059669; }"
+            "QPushButton:pressed { background-color: #047857; }"
+        )
+        # Press & hold behaviour: start in push-to-talk mode (no VAD), stop on release
+        self.ptt_button.pressed.connect(lambda: self.start_recording(push_to_talk=True))
+        self.ptt_button.released.connect(self.stop_recording)
+
         input_row.addWidget(self.input_edit, 1)
         input_row.addWidget(self.mic_button)
+        input_row.addWidget(self.ptt_button)
         input_row.addWidget(self.send_button)
         right_panel.addLayout(input_row)
 
@@ -953,6 +995,40 @@ class DriverAssistantWindow(QMainWindow):
         self.temperature_spin.valueChanged.connect(self.push_chat_settings_to_worker)
         self.vision_thread.start()
         self.push_chat_settings_to_worker()
+
+        # Initialize wake-word listener.
+        self.wake_word_listener = WakeWordListener(
+            config=WakeWordConfig(
+                keywords=["hey moss", "hey", "moss"],
+                chunk_duration_seconds=1.0,
+                confidence_threshold=0.6,
+                whisper_model_size="tiny",
+            ),
+            on_detected=self.on_wake_word_detected,
+        )
+
+        # Start wake-word listening automatically on app launch.
+        try:
+            self.wake_word_listener.start()
+            self.wake_word_listening = True
+            self.mic_button.setVisible(False)
+            self.mic_button.setEnabled(False)
+            self.status_label.setText("Status: listening for 'hey moss")
+        except Exception as exc:
+            print(f"Failed to start wake-word listener automatically: {exc}")
+
+        # Initialize continued conversation listener (post-reply).
+        self.continued_listener = ContinuedConversationListener(
+            config=WakeWordConfig(
+                keywords=["hey moss"],  # Not needed for continued mode, but kept for consistency.
+                chunk_duration_seconds=1.0,
+                confidence_threshold=0.6,
+                whisper_model_size="tiny",
+            ),
+            on_voice_detected=self.on_continued_voice_detected,
+            on_timeout=self.on_continued_timeout,
+            timeout_seconds=10.0,
+        )
 
     def add_message(self, text: str, is_user: bool) -> None:
         bubble = ChatBubble(text, is_user=is_user)
@@ -1142,24 +1218,73 @@ class DriverAssistantWindow(QMainWindow):
 
     def clear_chat_worker(self) -> None:
         self.send_button.setEnabled(True)
-        self.mic_button.setEnabled(True)
+        # mic_button is hidden; no state toggle necessary.
         self.chat_worker = None
 
     def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
         if not text.strip():
+            # 没有 TTS 也要启动 continued listener
+            self._on_tts_finished()
             return
-        try:
-            tts = TextToSpeech(rate=150, volume=1.0)
-            tts.speak(text, emotion=emotion, wait=False)
-        except Exception as exc:
-            print(f"TTS error: {exc}")
 
-    def start_recording(self) -> None:
+        def worker() -> None:
+            try:
+                tts = TextToSpeech(rate=150, volume=1.0)
+                tts.speak(text, emotion=emotion)
+            except Exception as exc:
+                print(f"TTS error: {exc}")
+            finally:
+                # 回到主线程再操作 Qt 对象
+                from PyQt5.QtCore import QMetaObject, Qt as QtNS
+                QMetaObject.invokeMethod(
+                    self, "_on_tts_finished",
+                    QtNS.ConnectionType.QueuedConnection,
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @pyqtSlot()
+    def _on_tts_finished(self) -> None:
+        """TTS 播完后在主线程调用，此时才启动 continued listener。"""
+        # 停 wake-word，避免两个 InputStream 同时开着
+        if self.wake_word_listener is not None and self.wake_word_listening:
+            self.wake_word_listener.stop()
+            self.wake_word_listening = False
+
+        self._in_continued_mode = True
+        if self.continued_listener is not None:
+            self.continued_listener.start()
+            self.status_label.setText("Status: listening for follow-up (10 s)...")
+
+    def start_recording(self, push_to_talk: bool = False) -> None:
+        """Start recording.
+
+        If `push_to_talk` is True, disable VAD and record until user releases button.
+        Otherwise use VAD with configured silence threshold.
+        """
         if self.speech_worker is not None:
             return
-        self.status_label.setText("Status: recording audio...")
-        self.mic_button.setText("Recording...")
-        self.speech_worker = SpeechWorker(self.args.whisper_model_size, duration_seconds=5.0)
+        if push_to_talk:
+            self.status_label.setText("Status: recording (push-to-talk)...")
+            self.mic_button.setText("Recording...")
+            # Push-to-talk: disable VAD, stop on explicit release.
+            self.speech_worker = SpeechWorker(
+                self.args.whisper_model_size,
+                duration_seconds=self.args.max_recording_duration,
+                vad_enabled=False,
+            )
+        else:
+            self.status_label.setText("Status: recording audio (auto-stop on silence)...")
+            self.mic_button.setText("Recording...")
+            # Use configured max duration and silence threshold with VAD.
+            self.speech_worker = SpeechWorker(
+                self.args.whisper_model_size,
+                duration_seconds=self.args.max_recording_duration,
+                vad_enabled=True,
+                min_duration_seconds=0.5,
+                silence_duration_seconds=self.args.silence_threshold,
+            )
+
         self.speech_worker.transcription_ready.connect(self.handle_transcription)
         self.speech_worker.error.connect(self.handle_speech_error)
         self.speech_worker.finished.connect(self.clear_speech_worker)
@@ -1175,16 +1300,72 @@ class DriverAssistantWindow(QMainWindow):
             self.status_label.setText("Status: transcription ready")
             self.send_text_message()
         else:
-            self.status_label.setText("Status: no speech detected")
+            # 空转录：如果还在 continued 窗口，重新等；否则恢复 wake-word
+            if self._in_continued_mode:
+                if self.continued_listener is not None:
+                    self.continued_listener.start()
+                    self.status_label.setText("Status: listening for follow-up (10 s)...")
+            else:
+                if self.wake_word_listener is not None and not self.wake_word_listening:
+                    self.wake_word_listener.start()
+                    self.wake_word_listening = True
+                self.status_label.setText("Status: listening for 'hey moss'")
 
     def handle_speech_error(self, message: str) -> None:
         self.status_label.setText(f"Status: speech error - {message}")
 
     def clear_speech_worker(self) -> None:
-        self.mic_button.setText("Hold to Talk")
         self.speech_worker = None
+        # 如果还在 continued 窗口内（由 voice 触发了录音），
+        # continued listener 已经自己 stop 了，不需要重启 wake-word
+        if self._in_continued_mode:
+            # continued listener 触发录音后自己把 _running 置 False 了，
+            # 但线程可能还没退出；等录音结束后再决定下一步
+            # → 不做任何事，等 on_continued_timeout 或下一次 handle_chat_response
+            pass
+        else:
+            # 普通录音（wake-word / PTT）结束，恢复 wake-word
+            if self.wake_word_listener is not None and not self.wake_word_listening:
+                self.wake_word_listener.start()
+                self.wake_word_listening = True
+            self.status_label.setText("Status: listening for 'hey moss'")
+    
+    def toggle_wake_word_listening(self) -> None:
+        """Toggle wake-word listening on/off."""
+        if self.wake_word_listener is None:
+            return
+        # Wake-word listening runs in background by default. This toggle is a no-op.
+        self.status_label.setText("Status: wake-word listening is always enabled in background")
+
+    def on_wake_word_detected(self) -> None:
+        """Callback when wake-word is detected; trigger 5-second recording."""
+        if self.speech_worker is not None:
+            return
+        self.status_label.setText("Status: wake-word detected! Recording for 5 seconds...")
+        print("[Wake-word] Triggered speech recording.")
+        self.start_recording()
+
+    def on_continued_voice_detected(self) -> None:
+        """Continued listener 检测到能量，直接触发录音。"""
+        if self.speech_worker is not None:
+            return
+        # continued listener 内部已把 _running 置 False，线程会自己退出
+        self.status_label.setText("Status: follow-up voice detected, recording...")
+        self.start_recording(push_to_talk=False)
+        
+    def on_continued_timeout(self) -> None:
+        """10 s 无声，回到 idle wake-word 状态。"""
+        self._in_continued_mode = False
+        if self.wake_word_listener is not None:
+            self.wake_word_listener.start()
+            self.wake_word_listening = True
+        self.status_label.setText("Status: listening for 'hey moss'")
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
+        if self.wake_word_listener is not None and self.wake_word_listening:
+            self.wake_word_listener.stop()
+        if self.continued_listener is not None:
+            self.continued_listener.stop()
         if self.speech_worker is not None:
             self.speech_worker.stop_recording()
             self.speech_worker.wait(2000)
