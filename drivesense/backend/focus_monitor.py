@@ -22,7 +22,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from drivesense.backend.voice_chat import NoSpeechDetectedError
+from drivesense.backend.chatbot import ChatbotResponse, DriverAssistantChatbot
+from drivesense.backend.speech import TextToSpeech
+from drivesense.backend.voice_chat import NoSpeechDetectedError, VoiceChatPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -156,9 +158,9 @@ class FocusMonitor:
     def __init__(
         self,
         config: Optional[FocusMonitorConfig] = None,
-        tts: Optional[object] = None,
-        voice_pipeline: Optional[object] = None,
-        alert_chatbot: Optional[object] = None,
+        tts: Optional[TextToSpeech] = None,
+        voice_pipeline: Optional[VoiceChatPipeline] = None,
+        alert_chatbot: Optional[DriverAssistantChatbot] = None,
         on_voice_result: Optional[Callable[[Any], None]] = None,
         on_voice_error: Optional[Callable[[str], None]] = None,
     ) -> None:
