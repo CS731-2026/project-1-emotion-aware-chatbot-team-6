@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import threading
 import time
@@ -10,21 +11,28 @@ from typing import Any, cast
 
 import cv2
 import torch
-from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QCloseEvent, QImage, QPixmap
+from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot   
+from PyQt5.QtGui import QColor, QCloseEvent, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -34,8 +42,12 @@ from drivesense.backend.chatbot import (
     DEFAULT_MODEL,
     DriverAssistantChatbot,
     SUPPORTED_LLM_MODELS,
+    sanitize_driver_state,
 )
+from drivesense.backend.focus_monitor import FocusMonitor, FocusMonitorConfig
 from drivesense.backend.vision import (
+    apply_emotion_postprocess,
+    build_voice_pipeline,
     classify_crops,
     classify_crops_with_topk,
     choose_driver_face,
@@ -43,19 +55,24 @@ from drivesense.backend.vision import (
     ensure_face_model,
     estimate_eye_boxes,
     expand_box,
+    filter_primary_face_candidates,
     format_topk_prediction,
     load_timm_classifier,
     normalize_checkpoint_path,
     normalize_label,
+    prepare_eye_debug_dir,
     resolve_devices,
     resolve_latest_timm_model,
+    save_eye_debug_crop,
 )
 from drivesense.backend.speech import TextToSpeech, WhisperTranscriber, record_microphone_audio
+from drivesense.backend.wake_word import WakeWordListener, WakeWordConfig, ContinuedConversationListener
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "runs_timm"
 DEFAULT_WEIGHTS_ROOT = PROJECT_ROOT / "weights"
+DEFAULT_LLM_BENCHMARK_DIR = PROJECT_ROOT / "benchmark_results" / "llm_benchmark"
 
 
 EMOTION_COLORS_BGR = {
@@ -76,6 +93,7 @@ EMOTION_COLORS_HEX = {
     "disgust": "#8e24aa",
     "neutral": "#607d8b",
 }
+
 EMOTION_TO_RISK = {
     "anger": "HIGH",
     "fear": "HIGH",
@@ -130,26 +148,86 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--padding", type=float, default=0.15, help="Face padding ratio.")
     parser.add_argument("--max-faces", type=int, default=5, help="Maximum number of faces to process.")
     parser.add_argument(
+        "--min-face-area-ratio",
+        type=float,
+        default=0.015,
+        help="Reject faces smaller than this fraction of the full frame area.",
+    )
+    parser.add_argument(
+        "--relative-min-face-scale",
+        type=float,
+        default=0.35,
+        help="Reject faces much smaller than the largest visible face.",
+    )
+    parser.add_argument(
         "--focus-seconds",
         type=float,
         default=2.0,
         help="Closed-eye duration before the focus warning appears.",
     )
     parser.add_argument(
+        "--eye-warmup-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds after startup before eye-state results can affect focus alerts.",
+    )
+    parser.add_argument(
+        "--cooldown-seconds",
+        type=float,
+        default=30.0,
+        help="Minimum seconds between two voice interventions.",
+    )
+    parser.add_argument(
+        "--enable-voice-dialogue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the full record/transcribe/LLM/speak loop after the beep.",
+    )
+    parser.add_argument(
         "--driver-side",
         type=str,
         choices=["left", "center", "right", "largest"],
-        default="right",
+        default="left",
         help="Heuristic used to choose the driver's face when multiple faces are visible.",
     )
     parser.add_argument("--default-llm-model", type=str, default=DEFAULT_MODEL, help="Default OpenRouter model.")
     parser.add_argument("--default-temperature", type=float, default=1.0, help="Default chatbot temperature.")
-    parser.add_argument("--whisper-model-size", type=str, default="base", help="faster-whisper model size.")
+    parser.add_argument("--whisper-model-size", type=str, default="tiny", help="faster-whisper model size (tiny=fastest, base=more accurate).")
+    parser.add_argument(
+        "--max-recording-duration",
+        type=float,
+        default=8.0,
+        help="Maximum recording duration in seconds (VAD may stop earlier).",
+    )
+    parser.add_argument(
+        "--silence-threshold",
+        type=float,
+        default=1.0,
+        help="Seconds of silence before auto-stopping recording (VAD).",
+    )
     parser.add_argument(
         "--print-emotion-top3",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Print the driver's emotion top-3 probabilities for each frame.",
+    )
+    parser.add_argument(
+        "--save-eye-crops",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save the driver eye crops that are sent to the eye-state model.",
+    )
+    parser.add_argument(
+        "--save-eye-crops-dir",
+        type=Path,
+        default=PROJECT_ROOT / "debug_exports" / "eye_crops",
+        help="Directory for exported eye crops.",
+    )
+    parser.add_argument(
+        "--save-eye-crops-limit",
+        type=int,
+        default=200,
+        help="Maximum number of eye crops to save per run.",
     )
     return parser.parse_args()
 
@@ -162,6 +240,132 @@ def emotion_color_hex(emotion: str) -> str:
     return EMOTION_COLORS_HEX.get(emotion, EMOTION_COLORS_HEX["neutral"])
 
 
+def risk_color_hex(risk: str) -> str:
+    normalized = risk.strip().upper()
+    if normalized == "HIGH":
+        return "#ef4444"
+    if normalized in {"MED", "LOW"}:
+        return "#f59e0b"
+    return "#34d399"
+
+
+def build_context_summary(driver_state: dict[str, Any]) -> str:
+    if not driver_state.get("driver_detected", False):
+        return "Current context: no confident driver detected"
+    emotion = normalize_label(str(driver_state.get("emotion", "neutral")))
+    if driver_state.get("eye_warmup_active", False):
+        remaining = float(driver_state.get("eye_warmup_remaining", 0.0))
+        eyes = f"eye warm-up {remaining:.1f}s"
+    else:
+        eyes = normalize_label(str(driver_state.get("eye_label", "open_eye")))
+    risk = str(driver_state.get("risk", "OK")).upper()
+    return f"Current context: {emotion}, {eyes}, {risk}"
+
+
+def compute_attention_score(driver_state: dict[str, Any]) -> int:
+    if not driver_state.get("driver_detected", False):
+        return 25
+
+    if driver_state.get("eye_warmup_active", False):
+        return 65
+
+    score = 100
+    emotion = str(driver_state.get("emotion", "neutral")).lower()
+    risk = str(driver_state.get("risk", "OK")).upper()
+    eye_label = str(driver_state.get("eye_label", "open_eye")).lower()
+    focus_level = int(driver_state.get("focus_level", 0))
+
+    if eye_label == "closed_eye":
+        score -= 45
+    if focus_level >= 2 or driver_state.get("focus_alert", False):
+        score -= 35
+    elif focus_level == 1:
+        score -= 18
+
+    if risk == "HIGH":
+        score -= 15
+    elif risk == "MED":
+        score -= 8
+    elif risk == "LOW":
+        score -= 4
+
+    if emotion in {"anger", "fear"}:
+        score -= 10
+    elif emotion == "sad":
+        score -= 6
+
+    return max(0, min(100, score))
+
+
+class AttentionHistoryChart(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._points: list[tuple[float, float]] = []
+        self.setMinimumHeight(260)
+
+    def set_points(self, points: list[tuple[float, float]]) -> None:
+        self._points = points[-180:]
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+
+        rect = self.rect().adjusted(18, 16, -18, -24)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        grid_pen = QPen(QColor("#e8e8e8"))
+        grid_pen.setWidth(1)
+        painter.setPen(grid_pen)
+        for idx in range(5):
+            y = rect.top() + int(rect.height() * idx / 4)
+            painter.drawLine(rect.left(), y, rect.right(), y)
+
+        axis_pen = QPen(QColor("#b8b8b8"))
+        axis_pen.setWidth(1)
+        painter.setPen(axis_pen)
+        painter.drawRect(rect)
+
+        label_pen = QPen(QColor("#6b7280"))
+        painter.setPen(label_pen)
+        for value in (100, 75, 50, 25, 0):
+            y = rect.top() + int((100 - value) / 100 * rect.height())
+            painter.drawText(rect.left() + 6, y - 4, str(value))
+
+        if len(self._points) < 2:
+            painter.setPen(QPen(QColor("#9aa1ad")))
+            painter.drawText(rect.adjusted(0, 0, 0, -8), Qt.AlignmentFlag.AlignCenter, "Waiting for attention history...")
+            return
+
+        first_ts = self._points[0][0]
+        last_ts = self._points[-1][0]
+        span = max(last_ts - first_ts, 1e-6)
+
+        line_pen = QPen(QColor("#0059b5"))
+        line_pen.setWidth(3)
+        painter.setPen(line_pen)
+
+        prev_x = 0
+        prev_y = 0
+        for idx, (ts_value, score) in enumerate(self._points):
+            x = rect.left() + int(((ts_value - first_ts) / span) * rect.width())
+            y = rect.bottom() - int((score / 100.0) * rect.height())
+            if idx > 0:
+                painter.drawLine(prev_x, prev_y, x, y)
+            prev_x, prev_y = x, y
+
+        point_pen = QPen(QColor("#0071e3"))
+        point_pen.setWidth(6)
+        painter.setPen(point_pen)
+        painter.drawPoint(prev_x, prev_y)
+
+        painter.setPen(QPen(QColor("#1f2937")))
+        painter.drawText(rect.left(), rect.bottom() + 18, "Oldest")
+        painter.drawText(rect.right() - 42, rect.bottom() + 18, "Now")
+
+
 class ChatBubble(QFrame):
     def __init__(self, text: str, is_user: bool) -> None:
         super().__init__()
@@ -170,19 +374,19 @@ class ChatBubble(QFrame):
         bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         bubble.setStyleSheet(
             (
-                "background-color: #10b981; color: white; border-radius: 16px; "
-                "padding: 12px 16px; font-size: 14px; font-weight: 500;"
+                "background-color: #0059b5; color: white; border-radius: 18px; "
+                "padding: 14px 18px; font-size: 15px; line-height: 1.4;"
             )
             if is_user
             else (
-                "background-color: #3b82f6; color: white; border-radius: 16px; "
-                "padding: 12px 16px; font-size: 14px; font-weight: 500;"
+                "background-color: #eeeeee; color: #1a1c1c; border-radius: 18px; "
+                "padding: 14px 18px; font-size: 15px; line-height: 1.4;"
             )
         )
         bubble.setMaximumWidth(360)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 6, 0, 6)
+        layout.setContentsMargins(0, 8, 0, 8)
         if is_user:
             layout.addStretch()
             layout.addWidget(bubble)
@@ -194,6 +398,8 @@ class ChatBubble(QFrame):
 class VisionWorker(QObject):
     frame_ready = pyqtSignal(QImage)
     state_ready = pyqtSignal(object)
+    voice_dialogue_ready = pyqtSignal(object)
+    voice_dialogue_error = pyqtSignal(str)
     error = pyqtSignal(str)
     finished = pyqtSignal()
 
@@ -201,6 +407,12 @@ class VisionWorker(QObject):
         super().__init__()
         self.args = args
         self._running = True
+        self.current_chat_model = args.default_llm_model
+        self.current_temperature = float(args.default_temperature)
+
+    def update_chat_settings(self, model: str, temperature: float) -> None:
+        self.current_chat_model = model
+        self.current_temperature = float(temperature)
 
     def stop(self) -> None:
         self._running = False
@@ -220,6 +432,18 @@ class VisionWorker(QObject):
             face_detector = YOLO(str(face_model_path))
             emotion_classifier = load_timm_classifier(emotion_model_path, torch_device)
             eye_classifier = load_timm_classifier(eye_model_path, torch_device)
+            tts = TextToSpeech()
+            voice_pipeline = build_voice_pipeline(self.args.enable_voice_dialogue)
+            focus_monitor = FocusMonitor(
+                config=FocusMonitorConfig(
+                    closed_eye_seconds=self.args.focus_seconds,
+                    cooldown_seconds=self.args.cooldown_seconds,
+                ),
+                tts=tts,
+                voice_pipeline=voice_pipeline,
+                on_voice_result=lambda result: self.voice_dialogue_ready.emit(asdict(result)),
+                on_voice_error=self.voice_dialogue_error.emit,
+            )
 
             cap = cv2.VideoCapture(self.args.camera_index)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.args.capture_width)
@@ -228,23 +452,41 @@ class VisionWorker(QObject):
                 raise RuntimeError(f"Unable to open webcam index {self.args.camera_index}.")
 
             last_state = {
+                "driver_detected": False,
+                "driver_confident": False,
                 "emotion": "neutral",
                 "emotion_confidence": 0.0,
-                "eye_label": "open_eye",
+                "emotion_secondary": "",
+                "emotion_secondary_confidence": 0.0,
+                "eye_label": "warming_up",
                 "eye_confidence": 0.0,
+                "eye_warmup_active": True,
                 "risk": "OK",
                 "focus_alert": False,
+                "focus_level": 0,
+                "closed_eye_duration": 0.0,
+                "trigger_reason": "",
+                "driver_side": self.args.driver_side,
                 "emotion_model_path": str(emotion_model_path),
                 "eye_model_path": str(eye_model_path),
             }
             previous_time = time.perf_counter()
-            closed_eye_start: float | None = None
+            vision_started_at = previous_time
             previous_driver_center_x: float | None = None
+            saved_eye_crop_count = 0
+            frame_index = 0
+            run_prefix = time.strftime("%Y%m%d_%H%M%S")
+            if self.args.save_eye_crops:
+                prepare_eye_debug_dir(self.args.save_eye_crops_dir)
 
             while self._running:
                 ok, frame = cap.read()
                 if not ok:
                     raise RuntimeError("Failed to read a frame from the webcam.")
+                frame_index += 1
+                elapsed_since_start = time.perf_counter() - vision_started_at
+                eye_warmup_active = elapsed_since_start < self.args.eye_warmup_seconds
+                eye_warmup_remaining = max(self.args.eye_warmup_seconds - elapsed_since_start, 0.0)
 
                 frame_h, frame_w = frame.shape[:2]
                 face_result = face_detector.predict(
@@ -299,9 +541,19 @@ class VisionWorker(QObject):
                     torch_device,
                     topk=3,
                 )
-                eye_predictions = classify_crops(eye_classifier, eye_crops_bgr, torch_device)
+                if eye_warmup_active:
+                    eye_predictions = [("open_eye", 0.0)] * len(eye_crops_bgr)
+                else:
+                    eye_predictions = classify_crops(eye_classifier, eye_crops_bgr, torch_device)
                 primary_face = None
                 if detections and emotion_predictions and eye_predictions:
+                    candidate_indices = filter_primary_face_candidates(
+                        [cast(tuple[int, int, int, int], det[:4]) for det in detections],
+                        frame_w,
+                        frame_h,
+                        min_face_area_ratio=self.args.min_face_area_ratio,
+                        relative_min_face_scale=self.args.relative_min_face_scale,
+                    )
                     faces = []
                     for index, (detection, emotion_prediction) in enumerate(
                         zip(detections, emotion_predictions)
@@ -310,13 +562,20 @@ class VisionWorker(QObject):
                         emotion_topk = cast(list[tuple[str, float]], emotion_prediction)
                         emotion_label = emotion_topk[0][0]
                         emotion_confidence = float(emotion_topk[0][1])
+                        emotion_label, emotion_confidence = apply_emotion_postprocess(
+                            emotion_label,
+                            emotion_confidence,
+                        )
 
                         per_face_eye_predictions = eye_predictions[index * 2 : index * 2 + 2]
                         avg_closed_conf = (
                             sum(score for label, score in per_face_eye_predictions if label == "closed_eye")
                             / max(len(per_face_eye_predictions), 1)
                         )
-                        if avg_closed_conf > 0.80:
+                        if eye_warmup_active:
+                            eye_label = "warming_up"
+                            eye_confidence = 0.0
+                        elif avg_closed_conf > 0.80:
                             eye_label = "closed_eye"
                             eye_confidence = avg_closed_conf
                         else:
@@ -333,12 +592,15 @@ class VisionWorker(QObject):
                                 "eye_label": eye_label,
                                 "eye_confidence": eye_confidence,
                                 "eye_boxes": estimate_eye_boxes((x1, y1, x2, y2)),
+                                "eye_predictions": per_face_eye_predictions,
                                 "detection_confidence": detection_conf,
+                                "is_candidate": index in candidate_indices,
                             }
                         )
 
+                    candidate_faces = [faces[idx] for idx in candidate_indices]
                     primary_face = choose_driver_face(
-                        faces,
+                        candidate_faces,
                         frame_w,
                         self.args.driver_side,
                         previous_driver_center_x,
@@ -349,48 +611,77 @@ class VisionWorker(QObject):
                     for face in faces:
                         x1, y1, x2, y2 = face["bbox"]
                         emotion = face["emotion"]
-                        color = emotion_color_bgr(emotion)
                         is_driver_face = face is primary_face
+                        color = emotion_color_bgr(emotion) if is_driver_face else (120, 120, 120)
                         cv2.rectangle(
                             frame,
                             (x1, y1),
                             (x2, y2),
                             color,
-                            4 if is_driver_face else 3,
-                        )
-                        draw_tag(
-                            frame,
-                            f"{normalize_label(emotion)} {face['emotion_confidence']:.2f}",
-                            (x1, y1),
-                            color,
-                        )
-                        for eye_box in face["eye_boxes"]:
-                            ex1, ey1, ex2, ey2 = eye_box
-                            cv2.rectangle(
-                                frame,
-                                (ex1, ey1),
-                                (ex2, ey2),
-                                (255, 0, 0),
-                                2,
-                            )
-                        draw_tag(
-                            frame,
-                            f"{normalize_label(face['eye_label'])} {face['eye_confidence']:.2f}",
-                            (x1, min(frame_h - 5, y2 + 28)),
-                            (255, 0, 0),
+                            4 if is_driver_face else 1,
                         )
                         if is_driver_face:
+                            draw_tag(
+                                frame,
+                                f"{normalize_label(emotion)} {face['emotion_confidence']:.2f}",
+                                (x1, y1),
+                                color,
+                            )
+                            draw_tag(
+                                frame,
+                                f"{normalize_label(face['eye_label'])} {face['eye_confidence']:.2f}",
+                                (x1, min(frame_h - 5, y2 + 28)),
+                                (255, 0, 0),
+                            )
                             draw_tag(frame, "driver", (x1, y2 + 56), (255, 255, 255))
+                        elif face.get("is_candidate", False):
+                            draw_tag(frame, "other face", (x1, y1), (220, 220, 220), (40, 40, 40), scale=0.6)
 
+                        if (
+                            is_driver_face
+                            and self.args.save_eye_crops
+                            and saved_eye_crop_count < self.args.save_eye_crops_limit
+                        ):
+                            eye_boxes = cast(tuple[tuple[int, int, int, int], tuple[int, int, int, int]], face["eye_boxes"])
+                            per_face_eye_predictions = cast(list[tuple[str, float]], face["eye_predictions"])
+                            for eye_offset, (eye_box, eye_prediction) in enumerate(
+                                zip(eye_boxes, per_face_eye_predictions)
+                            ):
+                                if saved_eye_crop_count >= self.args.save_eye_crops_limit:
+                                    break
+                                ex1, ey1, ex2, ey2 = eye_box
+                                eye_crop = frame[ey1:ey2, ex1:ex2].copy()
+                                saved_path = save_eye_debug_crop(
+                                    self.args.save_eye_crops_dir,
+                                    run_prefix,
+                                    frame_index,
+                                    eye_offset,
+                                    eye_crop,
+                                    eye_prediction[0],
+                                    eye_prediction[1],
+                                )
+                                if saved_path is not None:
+                                    saved_eye_crop_count += 1
+
+                driver_detected = primary_face is not None
                 if primary_face is not None:
                     current_emotion = primary_face["emotion"]
                     emotion_confidence = float(primary_face["emotion_confidence"])
+                    emotion_topk = cast(list[tuple[str, float]], primary_face.get("emotion_topk", []))
+                    secondary_emotion = emotion_topk[1][0] if len(emotion_topk) > 1 else ""
+                    secondary_emotion_confidence = float(emotion_topk[1][1]) if len(emotion_topk) > 1 else 0.0
                     current_eye_label = primary_face["eye_label"]
                     eye_confidence = float(primary_face["eye_confidence"])
                 else:
                     current_emotion = "neutral"
                     emotion_confidence = 0.0
+                    secondary_emotion = ""
+                    secondary_emotion_confidence = 0.0
                     current_eye_label = "open_eye"
+                    eye_confidence = 0.0
+                    driver_detected = False
+                if eye_warmup_active:
+                    current_eye_label = "warming_up"
                     eye_confidence = 0.0
 
                 if self.args.print_emotion_top3:
@@ -407,26 +698,42 @@ class VisionWorker(QObject):
                     primary_face is not None
                     and current_eye_label == "closed_eye"
                 ):
-                    if closed_eye_start is None:
-                        closed_eye_start = time.perf_counter()
+                    current_closed = True
                 else:
-                    closed_eye_start = None
+                    current_closed = False
 
                 risk = EMOTION_TO_RISK.get(current_emotion, "OK")
-                focus_alert = (
-                    closed_eye_start is not None
-                    and time.perf_counter() - closed_eye_start >= self.args.focus_seconds
+                current_driver_state = {
+                    "driver_detected": driver_detected,
+                    "driver_confident": driver_detected,
+                    "emotion": current_emotion,
+                    "emotion_confidence": emotion_confidence,
+                    "emotion_secondary": secondary_emotion,
+                    "emotion_secondary_confidence": secondary_emotion_confidence,
+                    "eye_label": current_eye_label,
+                    "eye_confidence": eye_confidence,
+                    "eye_warmup_active": eye_warmup_active,
+                    "eye_warmup_remaining": eye_warmup_remaining,
+                    "risk": risk,
+                    "focus_alert": False,
+                    "driver_side": self.args.driver_side,
+                }
+                focus_monitor.set_runtime_context(
+                    chat_model=self.current_chat_model,
+                    temperature=self.current_temperature,
+                )
+                focus_alert = focus_monitor.update(
+                    eyes_closed=current_closed,
+                    emotion=current_emotion,
+                    driver_state=current_driver_state,
                 )
                 if focus_alert:
                     risk = "HIGH"
+                current_driver_state["risk"] = risk
+                current_driver_state["focus_alert"] = focus_alert
+                current_driver_state.update(focus_monitor.get_state_snapshot())
                 last_state = {
-                    "emotion": current_emotion,
-                    "emotion_confidence": emotion_confidence,
-                    "eye_label": current_eye_label,
-                    "eye_confidence": eye_confidence,
-                    "risk": risk,
-                    "focus_alert": focus_alert,
-                    "driver_side": self.args.driver_side,
+                    **current_driver_state,
                     "emotion_model_path": str(emotion_model_path),
                     "eye_model_path": str(eye_model_path),
                 }
@@ -474,10 +781,14 @@ class VisionWorker(QObject):
                     2,
                     cv2.LINE_AA,
                 )
-                if focus_alert:
-                    alert_text = "Please stay focused"
+                if last_state.get("focus_level", 0) >= 1:
+                    alert_text = (
+                        "Please stay focused"
+                        if last_state.get("focus_level", 0) >= 2
+                        else "Stay attentive"
+                    )
                     font = cv2.FONT_HERSHEY_SIMPLEX
-                    scale = 1.0
+                    scale = 1.0 if last_state.get("focus_level", 0) >= 2 else 0.8
                     thickness = 3
                     (text_w, text_h), baseline = cv2.getTextSize(
                         alert_text, font, scale, thickness
@@ -530,6 +841,7 @@ class ChatWorker(QThread):
         model: str,
         temperature: float,
         auto_trigger: bool = False,
+        driver_state: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.chatbot = chatbot
@@ -539,9 +851,17 @@ class ChatWorker(QThread):
         self.model = model
         self.temperature = temperature
         self.auto_trigger = auto_trigger
+        self.driver_state = dict(driver_state) if driver_state else None
 
     def run(self) -> None:
         try:
+            print(
+                "ChatWorker start | "
+                f"model={self.model} temperature={self.temperature:.2f} "
+                f"emotion={self.emotion} auto_trigger={self.auto_trigger} "
+                f"driver_state={sanitize_driver_state(self.driver_state)}",
+                flush=True,
+            )
             response = self.chatbot.generate_reply(
                 emotion=self.emotion,
                 user_message=self.user_message,
@@ -549,10 +869,13 @@ class ChatWorker(QThread):
                 temperature=self.temperature,
                 conversation_history=self.conversation_history,
                 auto_trigger=self.auto_trigger,
+                driver_state=self.driver_state,
             )
             self.result_ready.emit(asdict(response))
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(
+                f"model={self.model}, temperature={self.temperature:.2f}, error={exc}"
+            )
 
 
 class SpeechWorker(QThread):
@@ -562,10 +885,20 @@ class SpeechWorker(QThread):
     _cache_lock = threading.Lock()
     _transcriber_cache: dict[tuple[str, str], WhisperTranscriber] = {}
 
-    def __init__(self, model_size: str, duration_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        model_size: str,
+        duration_seconds: float = 5.0,
+        vad_enabled: bool = True,
+        min_duration_seconds: float = 0.5,
+        silence_duration_seconds: float = 1.0,
+    ) -> None:
         super().__init__()
         self.model_size = model_size
         self.duration_seconds = duration_seconds
+        self.vad_enabled = vad_enabled
+        self.min_duration_seconds = min_duration_seconds
+        self.silence_duration_seconds = silence_duration_seconds
         self.stop_event = threading.Event()
 
     def stop_recording(self) -> None:
@@ -589,6 +922,9 @@ class SpeechWorker(QThread):
                 duration_seconds=self.duration_seconds,
                 sample_rate=16000,
                 stop_event=self.stop_event,
+                vad_enabled=self.vad_enabled,
+                min_duration_seconds=self.min_duration_seconds,
+                silence_duration_seconds=self.silence_duration_seconds,
             )
             if audio.size == 0:
                 raise RuntimeError("No audio was captured from the microphone.")
@@ -604,65 +940,202 @@ class DriverAssistantWindow(QMainWindow):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
         self.args = args
-        self.setWindowTitle("Driver Assistant")
+        self.setWindowTitle("DriveSense")
         self.resize(1500, 900)
 
         self.current_emotion = "neutral"
         self.current_risk = "OK"
+        self.current_driver_state: dict[str, Any] = {
+            "driver_detected": False,
+            "driver_confident": False,
+            "emotion": "neutral",
+            "emotion_confidence": 0.0,
+            "eye_label": "open_eye",
+            "eye_confidence": 0.0,
+            "eye_warmup_active": True,
+            "eye_warmup_remaining": float(self.args.eye_warmup_seconds),
+            "risk": "OK",
+            "focus_alert": False,
+            "focus_level": 0,
+            "closed_eye_duration": 0.0,
+            "trigger_reason": "",
+            "driver_side": self.args.driver_side,
+        }
         self.conversation_history: list[dict[str, str]] = []
         self.chat_worker: ChatWorker | None = None
         self.speech_worker: SpeechWorker | None = None
+        self.last_used_model = self.args.default_llm_model
+        self.last_selected_model = self.args.default_llm_model
+        self.last_fallback_used = False
+        self.runtime_logs: list[str] = []
+        self.attention_history: list[tuple[float, float]] = []
+        self._history_started_at = time.perf_counter()
+        self._last_history_point_at = 0.0
+        self._last_logged_snapshot: tuple[bool, str, str, int] | None = None
+        self.nav_buttons: dict[str, QPushButton] = {}
+        self.wake_word_listening = False
+        self.wake_word_listener: WakeWordListener | None = None
+        self.continued_listener: ContinuedConversationListener | None = None
+        self._in_continued_mode = False
+        self.llm_benchmark_rows = self.load_llm_benchmark_rows()
 
         try:
-            self.chatbot = DriverAssistantChatbot(app_title="Driver Assistant GUI")
+            self.chatbot = DriverAssistantChatbot(app_title="DriveSense GUI")
+            self.append_log("system", "OpenRouter chatbot initialized")
         except Exception as exc:
             self.chatbot = None
             QMessageBox.warning(self, "OpenRouter", str(exc))
+            self.append_log("error", f"OpenRouter init failed: {exc}")
 
         central = QWidget()
-        central.setStyleSheet("background-color: #0f1419;")
+        central.setStyleSheet("background-color: #f9f9f9; color: #1a1c1c; font-family: Inter, Segoe UI, Arial;")
         self.setCentralWidget(central)
-        root_layout = QHBoxLayout(central)
-        root_layout.setContentsMargins(16, 16, 16, 16)
-        root_layout.setSpacing(18)
+        page_layout = QVBoxLayout(central)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        nav_bar = QFrame()
+        nav_bar.setFixedHeight(72)
+        nav_bar.setStyleSheet("background-color: #1a1c1c; color: #ffffff;")
+        nav_layout = QHBoxLayout(nav_bar)
+        nav_layout.setContentsMargins(72, 0, 72, 0)
+        nav_layout.setSpacing(26)
+        brand_label = QLabel("DriveSense")
+        brand_label.setStyleSheet("color: #ffffff; font-size: 28px; font-weight: 800;")
+        nav_layout.addWidget(brand_label)
+        for item in ["Dashboard", "Logs", "History", "Models"]:
+            nav_button = QPushButton(item)
+            nav_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            nav_button.setStyleSheet(self.nav_button_style(active=(item == "Dashboard")))
+            nav_button.clicked.connect(
+                lambda checked=False, name=item: self.switch_page(name)
+            )
+            self.nav_buttons[item] = nav_button
+            nav_layout.addWidget(nav_button)
+        nav_layout.addStretch()
+        for text in ["Settings", "Account"]:
+            nav_button = QPushButton(text)
+            nav_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            nav_button.setStyleSheet(
+                "QPushButton { background: transparent; color: #ffffff; border: none; "
+                "font-size: 13px; font-weight: 600; padding: 8px 10px; }"
+                "QPushButton:hover { background-color: #414753; border-radius: 14px; }"
+            )
+            nav_layout.addWidget(nav_button)
+        page_layout.addWidget(nav_bar)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(72, 40, 72, 28)
+        content_layout.setSpacing(28)
+        page_layout.addWidget(content, 1)
+
+        self.title_label = QLabel("Driver Monitoring")
+        self.title_label.setStyleSheet("font-size: 48px; font-weight: 800; color: #1a1c1c;")
+        self.subtitle_label = QLabel("System Active")
+        self.subtitle_label.setStyleSheet("font-size: 21px; color: #414753;")
+        content_layout.addWidget(self.title_label)
+        content_layout.addWidget(self.subtitle_label)
+
+        self.page_stack = QStackedWidget()
+        self.page_stack.setStyleSheet("background: transparent; border: none;")
+        content_layout.addWidget(self.page_stack, 1)
+
+        dashboard_page = QWidget()
+        dashboard_page.setStyleSheet("background: transparent;")
+        main_layout = QHBoxLayout(dashboard_page)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(36)
+        self.page_stack.addWidget(dashboard_page)
 
         left_panel = QVBoxLayout()
+        left_panel.setSpacing(30)
         right_panel = QVBoxLayout()
-        root_layout.addLayout(left_panel, 3)
-        root_layout.addLayout(right_panel, 2)
+        right_panel.setSpacing(26)
+        main_layout.addLayout(left_panel, 8)
+        main_layout.addLayout(right_panel, 4)
 
         self.video_label = QLabel("Camera starting...")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setMinimumSize(860, 560)
-        self.video_label.setStyleSheet("background-color: #1f2937; color: #9ca3af; border-radius: 16px; border: 1px solid #374151;")
+        self.video_label.setMinimumSize(820, 520)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_label.setStyleSheet(
+            "background-color: #2f3131; color: #ffffff; border-radius: 24px; "
+            "border: 1px solid #e2e2e2; font-size: 16px; font-weight: 700;"
+        )
         left_panel.addWidget(self.video_label)
 
         info_card = QFrame()
-        info_card.setStyleSheet("background-color: #111827; color: white; border-radius: 16px; border: 1px solid #1f2937;")
+        info_card.setStyleSheet(
+            "QFrame { background-color: #eeeeee; color: #1a1c1c; border-radius: 18px; "
+            "border: 1px solid #e2e2e2; }"
+        )
         info_layout = QVBoxLayout(info_card)
-        self.emotion_label = QLabel("Emotion: neutral")
-        self.eye_label = QLabel("Eyes: open eye")
-        self.risk_label = QLabel("Risk: OK")
-        self.focus_label = QLabel("Focus: OK")
-        self.driver_label = QLabel("Driver heuristic: right")
+        info_layout.setContentsMargins(28, 26, 28, 26)
+        info_layout.setSpacing(12)
+        telemetry_title = QLabel("Driver State")
+        telemetry_title.setStyleSheet("font-size: 26px; font-weight: 800; color: #1a1c1c; border: none;")
+        info_layout.addWidget(telemetry_title)
+
+        def add_metric_row(label_text: str, value_label: QLabel) -> None:
+            row = QFrame()
+            row.setStyleSheet("QFrame { border: none; border-bottom: 1px solid #dadada; background: transparent; }")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 10, 0, 10)
+            label = QLabel(label_text)
+            label.setStyleSheet("color: #1a1c1c; font-size: 17px; border: none; background: transparent;")
+            value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value_label.setStyleSheet("color: #1a1c1c; font-size: 17px; font-weight: 700; border: none; background: transparent;")
+            row_layout.addWidget(label)
+            row_layout.addWidget(value_label, 1)
+            info_layout.addWidget(row)
+
+        self.driver_detected_label = QLabel("No")
+        self.emotion_label = QLabel("neutral")
+        self.eye_label = QLabel("open eye")
+        self.risk_label = QLabel("OK")
+        self.focus_label = QLabel("OK")
+        self.reason_label = QLabel("none")
+        add_metric_row("Driver detected", self.driver_detected_label)
+        add_metric_row("Emotion", self.emotion_label)
+        add_metric_row("Eyes", self.eye_label)
+        add_metric_row("Risk", self.risk_label)
+        add_metric_row("Focus", self.focus_label)
+        add_metric_row("Reason", self.reason_label)
+
+        meta_block = QVBoxLayout()
+        meta_block.setContentsMargins(0, 14, 0, 0)
+        meta_block.setSpacing(4)
+        self.driver_label = QLabel("Driver heuristic: left")
+        self.model_label = QLabel(f"Selected model: {self.args.default_llm_model}")
+        self.last_model_label = QLabel(f"Last reply model: {self.args.default_llm_model}")
         self.model_path_label = QLabel("Emotion model: loading...")
         self.eye_model_path_label = QLabel("Eye model: loading...")
         self.status_label = QLabel("Status: ready")
         for label in [
-            self.emotion_label,
-            self.eye_label,
-            self.risk_label,
-            self.focus_label,
             self.driver_label,
+            self.model_label,
+            self.last_model_label,
             self.model_path_label,
             self.eye_model_path_label,
             self.status_label,
         ]:
             label.setWordWrap(True)
-            info_layout.addWidget(label)
+            label.setStyleSheet("color: #1a1c1c; font-size: 14px; border: none; background: transparent;")
+            meta_block.addWidget(label)
+        info_layout.addLayout(meta_block)
         left_panel.addWidget(info_card)
 
+        settings_card = QFrame()
+        settings_card.setStyleSheet(
+            "QFrame { background-color: #ffffff; border: 1px solid #dadada; border-radius: 18px; }"
+        )
+        settings_layout = QVBoxLayout(settings_card)
+        settings_layout.setContentsMargins(20, 18, 20, 18)
+        settings_layout.setSpacing(16)
+
         controls_row = QHBoxLayout()
+        controls_row.setSpacing(12)
         self.model_combo = QComboBox()
         self.model_combo.addItems(SUPPORTED_LLM_MODELS)
         default_index = self.model_combo.findText(self.args.default_llm_model)
@@ -670,71 +1143,107 @@ class DriverAssistantWindow(QMainWindow):
             self.model_combo.setCurrentIndex(default_index)
         self.model_combo.currentTextChanged.connect(self.handle_model_selection_change)
         self.model_combo.setStyleSheet(
-            "QComboBox { background-color: #374151; color: white; border: 1px solid #4b5563; border-radius: 8px; padding: 6px 8px; font-weight: 500; }"
+            "QComboBox { background-color: #eeeeee; color: #1a1c1c; border: none; border-radius: 8px; padding: 8px 12px; font-size: 15px; }"
             "QComboBox::drop-down { border: none; }"
             "QComboBox::down-arrow { image: none; }"
-            "QComboBox QAbstractItemView { background-color: #374151; color: white; border: 1px solid #4b5563; selection-background-color: #3b82f6; }"
+            "QComboBox QAbstractItemView { background-color: #ffffff; color: #1a1c1c; border: 1px solid #dadada; selection-background-color: #0071e3; }"
         )
         self.temperature_spin = QDoubleSpinBox()
         self.temperature_spin.setRange(0.0, 2.0)
         self.temperature_spin.setSingleStep(0.1)
         self.temperature_spin.setValue(self.args.default_temperature)
-        self.temperature_spin.setStyleSheet("QDoubleSpinBox { background-color: #374151; color: white; border: 1px solid #4b5563; border-radius: 8px; padding: 6px 8px; }")
+        self.temperature_spin.setStyleSheet("QDoubleSpinBox { background-color: #eeeeee; color: #1a1c1c; border: none; border-radius: 8px; padding: 8px 10px; font-size: 15px; }")
         label_model = QLabel("LLM Model")
-        label_model.setStyleSheet("color: white; font-weight: 600; font-size: 13px;")
+        label_model.setStyleSheet("color: #1f2937; font-weight: 700; font-size: 13px; border: none; background: transparent;")
         label_temp = QLabel("Temperature")
-        label_temp.setStyleSheet("color: white; font-weight: 600; font-size: 13px;")
+        label_temp.setStyleSheet("color: #1f2937; font-weight: 700; font-size: 13px; border: none; background: transparent;")
         controls_row.addWidget(label_model)
         controls_row.addWidget(self.model_combo, 1)
         controls_row.addWidget(label_temp)
         controls_row.addWidget(self.temperature_spin)
-        right_panel.addLayout(controls_row)
+        settings_layout.addLayout(controls_row)
 
+        self.context_label = QLabel("Current context: neutral, open eye, OK")
+        self.context_label.setWordWrap(True)
+        self.context_label.setStyleSheet(
+            "background-color: transparent; color: #1f2937; border-top: 1px solid #e5e5e5; "
+            "padding: 12px 0 0 0; font-size: 14px;"
+        )
+        settings_layout.addWidget(self.context_label)
+        right_panel.addWidget(settings_card)
+
+        chat_card = QFrame()
+        chat_card.setStyleSheet(
+            "QFrame { background-color: #ffffff; border: 1px solid #dadada; border-radius: 18px; }"
+        )
+        chat_card_layout = QVBoxLayout(chat_card)
+        chat_card_layout.setContentsMargins(0, 0, 0, 0)
+        chat_card_layout.setSpacing(0)
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setStyleSheet(
-            "QScrollArea { background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; }"
-            "QScrollBar:vertical { background-color: #f3f4f6; width: 8px; }"
-            "QScrollBar::handle:vertical { background-color: #d1d5db; border-radius: 4px; }"
+            "QScrollArea { background-color: #ffffff; border: none; border-radius: 18px; }"
+            "QScrollBar:vertical { background-color: #f4f4f4; width: 8px; }"
+            "QScrollBar::handle:vertical { background-color: #dadada; border-radius: 4px; }"
         )
         self.chat_container = QWidget()
+        self.chat_container.setStyleSheet("background-color: #ffffff; border: none;")
         self.chat_layout = QVBoxLayout(self.chat_container)
-        self.chat_layout.setContentsMargins(8, 8, 8, 8)
-        self.chat_layout.setSpacing(6)
+        self.chat_layout.setContentsMargins(22, 22, 22, 22)
+        self.chat_layout.setSpacing(10)
         self.chat_layout.addStretch()
         self.chat_scroll.setWidget(self.chat_container)
-        right_panel.addWidget(self.chat_scroll, 1)
+        chat_card_layout.addWidget(self.chat_scroll, 1)
 
         input_row = QHBoxLayout()
+        input_row.setContentsMargins(18, 16, 18, 16)
+        input_row.setSpacing(10)
         self.input_edit = QLineEdit()
         self.input_edit.setPlaceholderText("Type a short message...")
         self.input_edit.setStyleSheet(
-            "QLineEdit { background-color: white; color: #1f2937; border: 2px solid #e5e7eb; border-radius: 8px; "
-            "padding: 8px 12px; font-size: 14px; }"
-            "QLineEdit:focus { border: 2px solid #3b82f6; }"
+            "QLineEdit { background-color: #eeeeee; color: #1a1c1c; border: none; border-radius: 20px; "
+            "padding: 11px 16px; font-size: 14px; }"
+            "QLineEdit:focus { border: 1px solid #0071e3; }"
         )
         self.input_edit.returnPressed.connect(self.send_text_message)
-        self.mic_button = QPushButton("🎤 Talk")
-        self.mic_button.pressed.connect(self.start_recording)
-        self.mic_button.released.connect(self.stop_recording)
+        self.mic_button = QPushButton("🎤 Wake-word Listening: OFF")
+        self.mic_button.clicked.connect(self.toggle_wake_word_listening)
         self.mic_button.setStyleSheet(
-            "QPushButton { background-color: #f59e0b; color: white; border: none; border-radius: 8px; "
-            "padding: 8px 16px; font-weight: 600; font-size: 13px; }"
-            "QPushButton:hover { background-color: #d97706; }"
-            "QPushButton:pressed { background-color: #b45309; }"
+            "QPushButton { background-color: #eeeeee; color: #1a1c1c; border: none; border-radius: 20px; "
+            "padding: 10px 16px; font-weight: 700; font-size: 13px; }"
+            "QPushButton:hover { background-color: #e1e1e1; }"
+            "QPushButton:pressed { background-color: #d4d4d4; }"
         )
         self.send_button = QPushButton("Send")
         self.send_button.setStyleSheet(
-            "QPushButton { background-color: #3b82f6; color: white; border: none; border-radius: 8px; "
-            "padding: 8px 20px; font-weight: 600; font-size: 13px; }"
-            "QPushButton:hover { background-color: #2563eb; }"
-            "QPushButton:pressed { background-color: #1d4ed8; }"
+            "QPushButton { background-color: #0059b5; color: white; border: none; border-radius: 20px; "
+            "padding: 10px 20px; font-weight: 700; font-size: 13px; }"
+            "QPushButton:hover { background-color: #0071e3; }"
+            "QPushButton:pressed { background-color: #00458c; }"
         )
         self.send_button.clicked.connect(self.send_text_message)
+        # Push-to-talk button (press & hold to speak)
+        self.ptt_button = QPushButton("🎙 Hold to Talk")
+        self.ptt_button.setStyleSheet(
+            "QPushButton { background-color: #10b981; color: white; border: none; border-radius: 8px; "
+            "padding: 8px 12px; font-weight: 600; font-size: 13px; }"
+            "QPushButton:hover { background-color: #059669; }"
+            "QPushButton:pressed { background-color: #047857; }"
+        )
+        # Press & hold behaviour: start in push-to-talk mode (no VAD), stop on release
+        self.ptt_button.pressed.connect(lambda: self.start_recording(push_to_talk=True))
+        self.ptt_button.released.connect(self.stop_recording)
+
         input_row.addWidget(self.input_edit, 1)
         input_row.addWidget(self.mic_button)
+        input_row.addWidget(self.ptt_button)
         input_row.addWidget(self.send_button)
-        right_panel.addLayout(input_row)
+        chat_card_layout.addLayout(input_row)
+        right_panel.addWidget(chat_card, 1)
+
+        self.page_stack.addWidget(self.build_logs_page())
+        self.page_stack.addWidget(self.build_history_page())
+        self.page_stack.addWidget(self.build_models_page())
 
         self.add_message(
             "Assistant ready. I will keep replies short and adjust tone to the detected emotion.",
@@ -747,9 +1256,279 @@ class DriverAssistantWindow(QMainWindow):
         self.vision_thread.started.connect(self.vision_worker.run)
         self.vision_worker.frame_ready.connect(self.update_frame)
         self.vision_worker.state_ready.connect(self.update_emotion_state)
+        self.vision_worker.voice_dialogue_ready.connect(self.handle_voice_dialogue_result)
+        self.vision_worker.voice_dialogue_error.connect(self.handle_voice_dialogue_error)
         self.vision_worker.error.connect(self.handle_worker_error)
         self.vision_worker.finished.connect(self.vision_thread.quit)
+        self.model_combo.currentTextChanged.connect(self.push_chat_settings_to_worker)
+        self.temperature_spin.valueChanged.connect(self.push_chat_settings_to_worker)
         self.vision_thread.start()
+        self.push_chat_settings_to_worker()
+
+        # Initialize wake-word listener.
+        self.wake_word_listener = WakeWordListener(
+            config=WakeWordConfig(
+                keywords=["hey moss", "hey", "moss"],
+                chunk_duration_seconds=1.0,
+                confidence_threshold=0.6,
+                whisper_model_size="tiny",
+            ),
+            on_detected=self.on_wake_word_detected,
+        )
+
+        # Start wake-word listening automatically on app launch.
+        try:
+            self.wake_word_listener.start()
+            self.wake_word_listening = True
+            self.mic_button.setVisible(False)
+            self.mic_button.setEnabled(False)
+            self.status_label.setText("Status: listening for 'hey moss")
+            self.append_log("voice", "Wake-word listener started for 'hey moss'")
+        except Exception as exc:
+            print(f"Failed to start wake-word listener automatically: {exc}")
+            self.append_log("error", f"Wake-word listener failed to start: {exc}")
+
+        # Initialize continued conversation listener (post-reply).
+        self.continued_listener = ContinuedConversationListener(
+            config=WakeWordConfig(
+                keywords=["hey moss"],  # Not needed for continued mode, but kept for consistency.
+                chunk_duration_seconds=1.0,
+                confidence_threshold=0.6,
+                whisper_model_size="tiny",
+            ),
+            on_voice_detected=self.on_continued_voice_detected,
+            on_timeout=self.on_continued_timeout,
+            timeout_seconds=10.0,
+        )
+        self.switch_page("Dashboard")
+        self.append_log("system", "DriveSense GUI ready")
+
+    def nav_button_style(self, active: bool) -> str:
+        return (
+            "QPushButton { background: transparent; border: none; padding: 22px 0 17px 0; "
+            f"color: {'#ffffff' if active else '#c1c6d6'}; font-size: 15px; font-weight: 700; "
+            + (f"border-bottom: 2px solid {'#0071e3' if active else 'transparent'};" if active else "")
+            + "}"
+            "QPushButton:hover { color: #ffffff; }"
+        )
+
+    def switch_page(self, page_name: str) -> None:
+        page_index = {"Dashboard": 0, "Logs": 1, "History": 2, "Models": 3}.get(page_name, 0)
+        page_meta = {
+            "Dashboard": ("Driver Monitoring", "System Active"),
+            "Logs": ("Runtime Logs", "Voice, detection, and chatbot events"),
+            "History": ("Attention History", "Recent driver attention curve"),
+            "Models": ("Model Comparison", "LLM benchmark summary and current selection"),
+        }
+        self.page_stack.setCurrentIndex(page_index)
+        title, subtitle = page_meta.get(page_name, page_meta["Dashboard"])
+        self.title_label.setText(title)
+        self.subtitle_label.setText(subtitle)
+        for name, button in self.nav_buttons.items():
+            button.setStyleSheet(self.nav_button_style(active=(name == page_name)))
+
+    def build_card_frame(self) -> QFrame:
+        card = QFrame()
+        card.setStyleSheet(
+            "QFrame { background-color: #ffffff; border: 1px solid #dadada; border-radius: 18px; }"
+        )
+        return card
+
+    def build_logs_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(24)
+
+        card = self.build_card_frame()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 22, 24, 22)
+        card_layout.setSpacing(14)
+
+        title = QLabel("Logs")
+        title.setStyleSheet("font-size: 28px; font-weight: 800; color: #1a1c1c; border: none;")
+        subtitle = QLabel("Key runtime events are collected here in time order.")
+        subtitle.setStyleSheet("font-size: 15px; color: #4b5563; border: none;")
+        self.logs_summary_label = QLabel("No events yet.")
+        self.logs_summary_label.setStyleSheet("font-size: 14px; color: #6b7280; border: none;")
+        self.logs_list = QListWidget()
+        self.logs_list.setStyleSheet(
+            "QListWidget { background: #f9f9f9; border: 1px solid #e4e4e4; border-radius: 14px; "
+            "padding: 8px; font-size: 14px; color: #1f2937; }"
+            "QListWidget::item { padding: 10px 8px; border-bottom: 1px solid #ececec; }"
+            "QListWidget::item:selected { background: #e8f0ff; color: #1a1c1c; }"
+        )
+
+        card_layout.addWidget(title)
+        card_layout.addWidget(subtitle)
+        card_layout.addWidget(self.logs_summary_label)
+        card_layout.addWidget(self.logs_list, 1)
+        for entry in reversed(self.runtime_logs):
+            self.logs_list.addItem(QListWidgetItem(entry))
+        if self.runtime_logs:
+            self.logs_summary_label.setText(f"Captured {len(self.runtime_logs)} recent events.")
+        layout.addWidget(card, 1)
+        return page
+
+    def build_history_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(24)
+
+        card = self.build_card_frame()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 22, 24, 22)
+        card_layout.setSpacing(14)
+
+        title = QLabel("History")
+        title.setStyleSheet("font-size: 28px; font-weight: 800; color: #1a1c1c; border: none;")
+        subtitle = QLabel("Attention score is derived from driver detection, eye state, risk, and focus level.")
+        subtitle.setStyleSheet("font-size: 15px; color: #4b5563; border: none;")
+        self.history_summary_label = QLabel("Waiting for driver-state samples.")
+        self.history_summary_label.setStyleSheet("font-size: 14px; color: #6b7280; border: none;")
+        self.attention_chart = AttentionHistoryChart()
+
+        card_layout.addWidget(title)
+        card_layout.addWidget(subtitle)
+        card_layout.addWidget(self.history_summary_label)
+        card_layout.addWidget(self.attention_chart, 1)
+        layout.addWidget(card, 1)
+        return page
+
+    def build_models_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(24)
+
+        card = self.build_card_frame()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 22, 24, 22)
+        card_layout.setSpacing(14)
+
+        title = QLabel("LLM Comparison")
+        title.setStyleSheet("font-size: 28px; font-weight: 800; color: #1a1c1c; border: none;")
+        subtitle = QLabel("Results are loaded from benchmark CSV files under benchmark_results/llm_benchmark.")
+        subtitle.setStyleSheet("font-size: 15px; color: #4b5563; border: none;")
+        self.models_summary_label = QLabel(f"Current selected model: {self.args.default_llm_model}")
+        self.models_summary_label.setStyleSheet("font-size: 14px; color: #1f2937; border: none;")
+        self.models_table = QTableWidget(0, 4)
+        self.models_table.setHorizontalHeaderLabels(
+            ["Model", "Avg Latency (ms)", "Avg Manual Score", "Current Status"]
+        )
+        self.models_table.setStyleSheet(
+            "QTableWidget { background: #f9f9f9; border: 1px solid #e4e4e4; border-radius: 14px; "
+            "gridline-color: #ececec; font-size: 14px; color: #1f2937; }"
+            "QHeaderView::section { background: #eeeeee; border: none; padding: 10px; font-weight: 700; }"
+        )
+        self.models_table.verticalHeader().setVisible(False)
+        self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.models_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.models_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.refresh_models_table()
+
+        card_layout.addWidget(title)
+        card_layout.addWidget(subtitle)
+        card_layout.addWidget(self.models_summary_label)
+        card_layout.addWidget(self.models_table, 1)
+        layout.addWidget(card, 1)
+        return page
+
+    def load_llm_benchmark_rows(self) -> list[dict[str, str]]:
+        summary_path = DEFAULT_LLM_BENCHMARK_DIR / "model_summary.csv"
+        scores_path = DEFAULT_LLM_BENCHMARK_DIR / "manual_scores_filled.csv"
+        rows: dict[str, dict[str, str]] = {}
+
+        if summary_path.exists():
+            with summary_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    model = str(row.get("model", "")).strip()
+                    if model:
+                        rows[model] = {
+                            "model": model,
+                            "avg_latency_ms": str(row.get("avg_latency_ms", "")).strip(),
+                            "average_score": "",
+                        }
+
+        if scores_path.exists():
+            grouped_scores: dict[str, list[float]] = {}
+            with scores_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    model = str(row.get("model", "")).strip()
+                    score_text = str(row.get("average_score", "")).strip()
+                    if not model or not score_text:
+                        continue
+                    try:
+                        grouped_scores.setdefault(model, []).append(float(score_text))
+                    except ValueError:
+                        continue
+            for model, scores in grouped_scores.items():
+                record = rows.setdefault(
+                    model,
+                    {"model": model, "avg_latency_ms": "", "average_score": ""},
+                )
+                record["average_score"] = f"{sum(scores) / len(scores):.2f}"
+
+        return [rows[key] for key in SUPPORTED_LLM_MODELS if key in rows] or [
+            {"model": model, "avg_latency_ms": "", "average_score": ""}
+            for model in SUPPORTED_LLM_MODELS
+        ]
+
+    def refresh_models_table(self) -> None:
+        self.models_table.setRowCount(len(self.llm_benchmark_rows))
+        selected_model = self.model_combo.currentText() if hasattr(self, "model_combo") else self.args.default_llm_model
+        for row_index, row in enumerate(self.llm_benchmark_rows):
+            model = row.get("model", "")
+            status = []
+            if model == selected_model:
+                status.append("selected")
+            if model == self.last_used_model:
+                status.append("last used")
+            display_values = [
+                model,
+                row.get("avg_latency_ms", "") or "-",
+                row.get("average_score", "") or "-",
+                ", ".join(status) or "available",
+            ]
+            for col_index, value in enumerate(display_values):
+                item = QTableWidgetItem(value)
+                if model == selected_model:
+                    item.setBackground(QColor("#e8f0ff"))
+                self.models_table.setItem(row_index, col_index, item)
+        if hasattr(self, "models_summary_label"):
+            self.models_summary_label.setText(
+                f"Current selected model: {selected_model} | Last reply model: {self.last_used_model}"
+                + (" (fallback)" if self.last_fallback_used else "")
+            )
+
+    def append_log(self, category: str, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        entry = f"[{timestamp}] {category.upper()}: {message}"
+        self.runtime_logs.append(entry)
+        self.runtime_logs = self.runtime_logs[-200:]
+        if hasattr(self, "logs_list"):
+            self.logs_list.insertItem(0, QListWidgetItem(entry))
+            while self.logs_list.count() > 200:
+                self.logs_list.takeItem(self.logs_list.count() - 1)
+            self.logs_summary_label.setText(f"Captured {len(self.runtime_logs)} recent events.")
+
+    def record_attention_history(self, driver_state: dict[str, Any]) -> None:
+        now = time.perf_counter()
+        if now - self._last_history_point_at < 0.5:
+            return
+        self._last_history_point_at = now
+        elapsed = now - self._history_started_at
+        score = float(compute_attention_score(driver_state))
+        self.attention_history.append((elapsed, score))
+        self.attention_history = self.attention_history[-180:]
+        if hasattr(self, "attention_chart"):
+            self.attention_chart.set_points(self.attention_history)
+        if hasattr(self, "history_summary_label") and self.attention_history:
+            scores = [point[1] for point in self.attention_history]
+            self.history_summary_label.setText(
+                f"Current {scores[-1]:.0f}/100 | Avg {sum(scores)/len(scores):.1f} | Min {min(scores):.0f}"
+            )
 
     def add_message(self, text: str, is_user: bool) -> None:
         bubble = ChatBubble(text, is_user=is_user)
@@ -767,40 +1546,97 @@ class DriverAssistantWindow(QMainWindow):
         self.video_label.setPixmap(pixmap)
 
     def update_emotion_state(self, state: dict) -> None:
+        self.current_driver_state = sanitize_driver_state(state) or {}
         self.current_emotion = state["emotion"]
         self.current_risk = state["risk"]
         color = emotion_color_hex(self.current_emotion)
+        driver_detected = bool(state.get("driver_detected", False))
+        trigger_reason = str(state.get("trigger_reason", "")).strip()
+        focus_level = int(state.get("focus_level", 0))
+        closed_eye_duration = float(state.get("closed_eye_duration", 0.0))
+        eye_warmup_active = bool(state.get("eye_warmup_active", False))
+        eye_warmup_remaining = float(state.get("eye_warmup_remaining", 0.0))
+        self.record_attention_history(state)
+        snapshot = (driver_detected, self.current_emotion, self.current_risk, focus_level)
+        if snapshot != self._last_logged_snapshot:
+            self._last_logged_snapshot = snapshot
+            self.append_log(
+                "vision",
+                f"driver={'yes' if driver_detected else 'no'}, emotion={self.current_emotion}, risk={self.current_risk}, focus_level={focus_level}",
+            )
+        self.driver_detected_label.setText("Yes" if driver_detected else "No")
+        self.driver_detected_label.setStyleSheet(
+            "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            if driver_detected
+            else "color: #ff9500; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+        )
         self.emotion_label.setText(
-            f"Emotion: {normalize_label(self.current_emotion)} ({state['emotion_confidence']:.2f})"
+            f"{normalize_label(self.current_emotion)} ({state['emotion_confidence']:.2f})"
         )
-        self.emotion_label.setStyleSheet(f"color: {color}; font-size: 18px; font-weight: 600;")
-        self.eye_label.setText(
-            f"Eyes: {normalize_label(state['eye_label'])} ({state['eye_confidence']:.2f})"
+        self.emotion_label.setStyleSheet(
+            f"color: {color}; font-size: 17px; font-weight: 700; border: none; background: transparent;"
         )
-        self.eye_label.setStyleSheet("color: #60a5fa; font-size: 18px; font-weight: 600;")
-        self.risk_label.setText(f"Risk: {self.current_risk}")
+        if eye_warmup_active:
+            self.eye_label.setText(f"warming up ({eye_warmup_remaining:.1f}s)")
+        else:
+            self.eye_label.setText(
+                f"{normalize_label(state['eye_label'])} ({state['eye_confidence']:.2f})"
+            )
+        self.eye_label.setStyleSheet(
+            "color: #ff9500; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            if eye_warmup_active
+            else "color: #0059b5; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+        )
+        self.risk_label.setText(self.current_risk)
         self.risk_label.setStyleSheet(
-            f"color: {color}; font-size: 18px; font-weight: 600;"
+            f"color: {risk_color_hex(self.current_risk)}; font-size: 17px; font-weight: 700; border: none; background: transparent;"
         )
         self.focus_label.setText(
-            "Focus: Please stay focused" if state["focus_alert"] else "Focus: OK"
+            "Please stay focused"
+            if state["focus_alert"]
+            else ("Stay attentive" if focus_level == 1 else "OK")
         )
         self.focus_label.setStyleSheet(
-            "color: #ef4444; font-size: 18px; font-weight: 600;"
+            "color: #e53935; font-size: 17px; font-weight: 700; border: none; background: transparent;"
             if state["focus_alert"]
-            else "color: #34d399; font-size: 18px; font-weight: 600;"
+            else (
+                "color: #ff9500; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+                if focus_level == 1
+                else "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            )
         )
+        if trigger_reason:
+            self.reason_label.setText(
+                f"{trigger_reason} ({closed_eye_duration:.1f}s)"
+            )
+        else:
+            self.reason_label.setText("none")
         self.driver_label.setText(f"Driver heuristic: {state['driver_side']}")
+        self.model_label.setText(f"Selected model: {self.model_combo.currentText()}")
+        fallback_suffix = " (fallback)" if self.last_fallback_used else ""
+        self.last_model_label.setText(f"Last reply model: {self.last_used_model}{fallback_suffix}")
         self.model_path_label.setText(f"Emotion model: {state['emotion_model_path']}")
         self.eye_model_path_label.setText(f"Eye model: {state['eye_model_path']}")
+        self.context_label.setText(build_context_summary(state))
 
     def handle_worker_error(self, message: str) -> None:
         self.status_label.setText(f"Status: error - {message}")
+        self.append_log("error", f"Vision worker: {message}")
 
     def handle_model_selection_change(self, model_name: str) -> None:
+        self.last_selected_model = model_name
+        self.model_label.setText(f"Selected model: {model_name}")
         message = f"Selected chat model: {model_name}"
         self.status_label.setText(f"Status: {message}")
         print(message)
+        self.refresh_models_table()
+        self.append_log("models", message)
+
+    def push_chat_settings_to_worker(self, *args: object) -> None:
+        self.vision_worker.update_chat_settings(
+            self.model_combo.currentText(),
+            float(self.temperature_spin.value()),
+        )
 
     def send_text_message(self) -> None:
         text = self.input_edit.text().strip()
@@ -811,6 +1647,7 @@ class DriverAssistantWindow(QMainWindow):
         self.add_message(text, is_user=True)
         history_snapshot = list(self.conversation_history)
         self.conversation_history.append({"role": "user", "content": text})
+        self.append_log("chat", f"Manual text input: {text[:80]}")
         self.start_chat_worker(
             user_message=text,
             history_snapshot=history_snapshot,
@@ -829,6 +1666,10 @@ class DriverAssistantWindow(QMainWindow):
         selected_model = self.model_combo.currentText()
         self.status_label.setText(f"Status: contacting OpenRouter with {selected_model}...")
         print(f"Sending chat request via OpenRouter using model: {selected_model}")
+        self.append_log(
+            "chat",
+            f"Sending {'auto' if auto_trigger else 'manual'} request via {selected_model}",
+        )
         self.chat_worker = ChatWorker(
             chatbot=self.chatbot,
             emotion=self.current_emotion,
@@ -837,6 +1678,7 @@ class DriverAssistantWindow(QMainWindow):
             model=selected_model,
             temperature=self.temperature_spin.value(),
             auto_trigger=auto_trigger,
+            driver_state=self.current_driver_state,
         )
         self.chat_worker.result_ready.connect(self.handle_chat_response)
         self.chat_worker.error.connect(self.handle_chat_error)
@@ -847,41 +1689,146 @@ class DriverAssistantWindow(QMainWindow):
         self.add_message(payload["text"], is_user=False)
         self.conversation_history.append({"role": "assistant", "content": payload["text"]})
         self.speak_reply_async(payload["text"], payload.get("emotion", self.current_emotion))
+        self.last_used_model = str(payload.get("model", self.model_combo.currentText()))
+        self.last_fallback_used = bool(payload.get("fallback_used", False))
+        self.last_model_label.setText(
+            f"Last reply model: {self.last_used_model}"
+            + (" (fallback)" if self.last_fallback_used else "")
+        )
         print(
             f"OpenRouter reply received from {payload['model']} "
             f"in {payload['latency_ms']:.0f} ms"
         )
+        self.refresh_models_table()
+        self.append_log(
+            "chat",
+            f"Reply via {payload['model']} in {payload['latency_ms']:.0f} ms"
+            + (" (fallback)" if self.last_fallback_used else ""),
+        )
         self.status_label.setText(
             f"Status: OpenRouter reply in {payload['latency_ms']:.0f} ms via {payload['model']}"
+            + (" (fallback)" if self.last_fallback_used else "")
         )
 
     def handle_chat_error(self, message: str) -> None:
         self.status_label.setText(f"Status: chatbot error - {message}")
+        print(f"Chat error: {message}", flush=True)
+        self.append_log("error", f"Chatbot: {message}")
+
+    def handle_voice_dialogue_result(self, payload: dict[str, Any]) -> None:
+        user_input = str(payload.get("user_input", "")).strip()
+        bot_reply = str(payload.get("bot_reply", "")).strip()
+        if user_input:
+            self.add_message(user_input, is_user=True)
+            self.conversation_history.append({"role": "user", "content": user_input})
+        if bot_reply:
+            self.add_message(bot_reply, is_user=False)
+            self.conversation_history.append({"role": "assistant", "content": bot_reply})
+        model = payload.get("model", self.model_combo.currentText())
+        self.last_used_model = str(model)
+        self.last_fallback_used = bool(payload.get("fallback_used", False))
+        self.last_model_label.setText(
+            f"Last reply model: {self.last_used_model}"
+            + (" (fallback)" if self.last_fallback_used else "")
+        )
+        self.refresh_models_table()
+        latency_ms = payload.get("latency_ms")
+        if isinstance(latency_ms, (int, float)):
+            self.status_label.setText(
+                f"Status: voice dialogue reply in {float(latency_ms):.0f} ms via {model}"
+                + (" (fallback)" if self.last_fallback_used else "")
+            )
+            self.append_log(
+                "voice",
+                f"Voice dialogue reply via {model} in {float(latency_ms):.0f} ms"
+                + (" (fallback)" if self.last_fallback_used else ""),
+            )
+        else:
+            self.status_label.setText(f"Status: voice dialogue completed via {model}")
+            self.append_log("voice", f"Voice dialogue completed via {model}")
+
+    def handle_voice_dialogue_error(self, message: str) -> None:
+        if message.strip() == "No speech detected.":
+            self.status_label.setText("Status: no speech detected")
+            print("Voice dialogue: no speech detected", flush=True)
+            self.append_log("voice", "No follow-up speech detected")
+            return
+        self.status_label.setText(f"Status: voice dialogue error - {message}")
+        print(f"Voice dialogue error: {message}", flush=True)
+        self.append_log("error", f"Voice dialogue: {message}")
 
     def clear_chat_worker(self) -> None:
         self.send_button.setEnabled(True)
-        self.mic_button.setEnabled(True)
+        # mic_button is hidden; no state toggle necessary.
         self.chat_worker = None
 
     def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
         if not text.strip():
+            # 没有 TTS 也要启动 continued listener
+            self._on_tts_finished()
             return
 
         def worker() -> None:
             try:
                 tts = TextToSpeech(rate=150, volume=1.0)
-                tts.speak(text, emotion=emotion)
+                tts.speak(text, emotion=emotion, wait=True)
             except Exception as exc:
                 print(f"TTS error: {exc}")
+            finally:
+                # 回到主线程再操作 Qt 对象
+                from PyQt5.QtCore import QMetaObject, Qt as QtNS
+                QMetaObject.invokeMethod(
+                    self, "_on_tts_finished",
+                    QtNS.ConnectionType.QueuedConnection,
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def start_recording(self) -> None:
+    @pyqtSlot()
+    def _on_tts_finished(self) -> None:
+        """TTS 播完后在主线程调用，此时才启动 continued listener。"""
+        # 停 wake-word，避免两个 InputStream 同时开着
+        if self.wake_word_listener is not None and self.wake_word_listening:
+            self.wake_word_listener.stop()
+            self.wake_word_listening = False
+
+        self._in_continued_mode = True
+        if self.continued_listener is not None:
+            self.continued_listener.start()
+            self.status_label.setText("Status: listening for follow-up (10 s)...")
+            self.append_log("voice", "Entered 10-second follow-up listening window")
+
+    def start_recording(self, push_to_talk: bool = False) -> None:
+        """Start recording.
+
+        If `push_to_talk` is True, disable VAD and record until user releases button.
+        Otherwise use VAD with configured silence threshold.
+        """
         if self.speech_worker is not None:
             return
-        self.status_label.setText("Status: recording audio...")
-        self.mic_button.setText("Recording...")
-        self.speech_worker = SpeechWorker(self.args.whisper_model_size, duration_seconds=5.0)
+        if push_to_talk:
+            self.status_label.setText("Status: recording (push-to-talk)...")
+            self.mic_button.setText("Recording...")
+            self.append_log("voice", "Push-to-talk recording started")
+            # Push-to-talk: disable VAD, stop on explicit release.
+            self.speech_worker = SpeechWorker(
+                self.args.whisper_model_size,
+                duration_seconds=self.args.max_recording_duration,
+                vad_enabled=False,
+            )
+        else:
+            self.status_label.setText("Status: recording audio (auto-stop on silence)...")
+            self.mic_button.setText("Recording...")
+            self.append_log("voice", "Voice recording started with VAD")
+            # Use configured max duration and silence threshold with VAD.
+            self.speech_worker = SpeechWorker(
+                self.args.whisper_model_size,
+                duration_seconds=self.args.max_recording_duration,
+                vad_enabled=True,
+                min_duration_seconds=0.5,
+                silence_duration_seconds=self.args.silence_threshold,
+            )
+
         self.speech_worker.transcription_ready.connect(self.handle_transcription)
         self.speech_worker.error.connect(self.handle_speech_error)
         self.speech_worker.finished.connect(self.clear_speech_worker)
@@ -890,21 +1837,88 @@ class DriverAssistantWindow(QMainWindow):
     def stop_recording(self) -> None:
         if self.speech_worker is not None:
             self.speech_worker.stop_recording()
+            self.append_log("voice", "Recording stop requested")
 
     def handle_transcription(self, text: str) -> None:
         self.input_edit.setText(text)
-        self.status_label.setText("Status: transcription ready")
         if text.strip():
+            self.status_label.setText("Status: transcription ready")
+            self.append_log("voice", f"Transcription ready: {text[:80]}")
             self.send_text_message()
+        else:
+            # 空转录：如果还在 continued 窗口，重新等；否则恢复 wake-word
+            if self._in_continued_mode:
+                if self.continued_listener is not None:
+                    self.continued_listener.start()
+                    self.status_label.setText("Status: listening for follow-up (10 s)...")
+            else:
+                if self.wake_word_listener is not None and not self.wake_word_listening:
+                    self.wake_word_listener.start()
+                    self.wake_word_listening = True
+                self.status_label.setText("Status: listening for 'hey moss'")
+            self.append_log("voice", "Empty transcription result")
 
     def handle_speech_error(self, message: str) -> None:
         self.status_label.setText(f"Status: speech error - {message}")
+        self.append_log("error", f"Speech: {message}")
 
     def clear_speech_worker(self) -> None:
-        self.mic_button.setText("Hold to Talk")
         self.speech_worker = None
+        # 如果还在 continued 窗口内（由 voice 触发了录音），
+        # continued listener 已经自己 stop 了，不需要重启 wake-word
+        if self._in_continued_mode:
+            # continued listener 触发录音后自己把 _running 置 False 了，
+            # 但线程可能还没退出；等录音结束后再决定下一步
+            # → 不做任何事，等 on_continued_timeout 或下一次 handle_chat_response
+            pass
+        else:
+            # 普通录音（wake-word / PTT）结束，恢复 wake-word
+            if self.wake_word_listener is not None and not self.wake_word_listening:
+                self.wake_word_listener.start()
+                self.wake_word_listening = True
+            self.status_label.setText("Status: listening for 'hey moss'")
+        self.append_log("voice", "Speech worker cleared")
+    
+    def toggle_wake_word_listening(self) -> None:
+        """Toggle wake-word listening on/off."""
+        if self.wake_word_listener is None:
+            return
+        # Wake-word listening runs in background by default. This toggle is a no-op.
+        self.status_label.setText("Status: wake-word listening is always enabled in background")
+        self.append_log("voice", "Wake-word toggle pressed; listener stays on")
+
+    def on_wake_word_detected(self) -> None:
+        """Callback when wake-word is detected; trigger 5-second recording."""
+        if self.speech_worker is not None:
+            return
+        self.status_label.setText("Status: wake-word detected! Recording for 5 seconds...")
+        print("[Wake-word] Triggered speech recording.")
+        self.append_log("voice", "Wake-word detected")
+        self.start_recording()
+
+    def on_continued_voice_detected(self) -> None:
+        """Continued listener 检测到能量，直接触发录音。"""
+        if self.speech_worker is not None:
+            return
+        # continued listener 内部已把 _running 置 False，线程会自己退出
+        self.status_label.setText("Status: follow-up voice detected, recording...")
+        self.append_log("voice", "Follow-up speech detected")
+        self.start_recording(push_to_talk=False)
+        
+    def on_continued_timeout(self) -> None:
+        """10 s 无声，回到 idle wake-word 状态。"""
+        self._in_continued_mode = False
+        if self.wake_word_listener is not None:
+            self.wake_word_listener.start()
+            self.wake_word_listening = True
+        self.status_label.setText("Status: listening for 'hey moss'")
+        self.append_log("voice", "Follow-up timeout; returned to wake-word listening")
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
+        if self.wake_word_listener is not None and self.wake_word_listening:
+            self.wake_word_listener.stop()
+        if self.continued_listener is not None:
+            self.continued_listener.stop()
         if self.speech_worker is not None:
             self.speech_worker.stop_recording()
             self.speech_worker.wait(2000)

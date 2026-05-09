@@ -5,7 +5,7 @@ import json
 import time
 import urllib.request
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -33,6 +33,17 @@ EMOTION_CLASSES = {"anger", "disgust", "fear", "happy", "neutral", "sad", "surpr
 EYE_CLASSES = {"closed_eye", "open_eye"}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+EMOTION_TO_RISK = {
+    "anger": "HIGH",
+    "fear": "HIGH",
+    "sad": "MED",
+    "disgust": "LOW",
+    "surprise": "MED",
+    "happy": "OK",
+    "neutral": "OK",
+}
+LOW_CONFIDENCE_NEUTRAL_EMOTIONS = {"sad", "anger"}
+LOW_CONFIDENCE_NEUTRAL_THRESHOLD = 0.80
 
 
 class ClassifierDict(TypedDict):
@@ -133,6 +144,18 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of detected faces to process.",
     )
     parser.add_argument(
+        "--min-face-area-ratio",
+        type=float,
+        default=0.015,
+        help="Reject faces smaller than this fraction of the full frame area.",
+    )
+    parser.add_argument(
+        "--relative-min-face-scale",
+        type=float,
+        default=0.35,
+        help="Reject faces much smaller than the largest visible face.",
+    )
+    parser.add_argument(
         "--skip-frames",
         type=int,
         default=0,
@@ -160,14 +183,32 @@ def parse_args() -> argparse.Namespace:
         "--driver-side",
         type=str,
         choices=["left", "center", "right", "largest"],
-        default="right",
+        default="left",
         help="Heuristic used to choose the driver's face when multiple faces are visible.",
     )
     parser.add_argument(
         "--print-emotion-top3",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Print the driver's emotion top-3 probabilities for each frame.",
+    )
+    parser.add_argument(
+        "--save-eye-crops",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save the driver eye crops that are sent to the eye-state model.",
+    )
+    parser.add_argument(
+        "--save-eye-crops-dir",
+        type=Path,
+        default=PROJECT_ROOT / "debug_exports" / "eye_crops",
+        help="Directory for exported eye crops.",
+    )
+    parser.add_argument(
+        "--save-eye-crops-limit",
+        type=int,
+        default=200,
+        help="Maximum number of eye crops to save per run.",
     )
     return parser.parse_args()
 
@@ -182,6 +223,15 @@ def build_eval_transform(img_size: int) -> transforms.Compose:
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
     )
+
+
+def apply_emotion_postprocess(label: str, confidence: float) -> tuple[str, float]:
+    if (
+        label in LOW_CONFIDENCE_NEUTRAL_EMOTIONS
+        and confidence < LOW_CONFIDENCE_NEUTRAL_THRESHOLD
+    ):
+        return "neutral", confidence
+    return label, confidence
 
 
 def normalize_checkpoint_path(model_path: Path | None) -> Path | None:
@@ -366,6 +416,34 @@ def format_topk_prediction(predictions: list[tuple[str, float]]) -> str:
     return ", ".join(f"{label}={score:.2f}" for label, score in predictions)
 
 
+def save_eye_debug_crop(
+    output_dir: Path,
+    run_prefix: str,
+    frame_index: int,
+    eye_index: int,
+    crop_bgr: np.ndarray,
+    label: str,
+    confidence: float,
+) -> Path | None:
+    if crop_bgr.size == 0:
+        return None
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_label = normalize_label(label).replace(" ", "_")
+    filename = (
+        f"{run_prefix}_frame{frame_index:06d}_eye{eye_index}_{safe_label}_{confidence:.2f}.jpg"
+    )
+    output_path = output_dir / filename
+    cv2.imwrite(str(output_path), crop_bgr)
+    return output_path
+
+
+def prepare_eye_debug_dir(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for path in output_dir.iterdir():
+        if path.is_file():
+            path.unlink()
+
+
 def expand_box(*args: object) -> tuple[int, int, int, int]:
     if len(args) == 4:
         box, frame_width, frame_height, padding_ratio = args
@@ -408,14 +486,14 @@ def estimate_eye_boxes(
     face_w = x2 - x1
     face_h = y2 - y1
 
-    eye_w = int(face_w * 0.28)
-    eye_h = int(face_h * 0.14)
-    eye_y1 = y1 + int(face_h * 0.32)
+    eye_w = int(face_w * 0.24)
+    eye_h = int(face_h * 0.15)
+    eye_y1 = y1 + int(face_h * 0.36)
     eye_y2 = eye_y1 + eye_h
 
-    left_eye_x1 = x1 + int(face_w * 0.12)
+    left_eye_x1 = x1 + int(face_w * 0.18)
     left_eye_x2 = left_eye_x1 + eye_w
-    right_eye_x2 = x2 - int(face_w * 0.12)
+    right_eye_x2 = x2 - int(face_w * 0.18)
     right_eye_x1 = right_eye_x2 - eye_w
 
     return (
@@ -477,6 +555,16 @@ def choose_driver_face(
             return None
         return faces[cast(int, selected)]
 
+    if previous_driver_center_x is not None:
+        previous_center_px = previous_driver_center_x * max(frame_width, 1)
+        distance_pairs = [
+            (idx, abs((((box[0] + box[2]) / 2) - previous_center_px)))
+            for idx, box in enumerate(face_boxes)
+        ]
+        best_idx, best_distance = min(distance_pairs, key=lambda item: item[1])
+        if best_distance <= frame_width * 0.18:
+            return best_idx
+
     if strategy == "largest":
         return max(
             range(len(face_boxes)),
@@ -484,16 +572,58 @@ def choose_driver_face(
             * (face_boxes[idx][3] - face_boxes[idx][1]),
         )
 
+    if strategy == "left":
+        return min(
+            range(len(face_boxes)),
+            key=lambda idx: (
+                face_boxes[idx][0],
+                ((face_boxes[idx][0] + face_boxes[idx][2]) / 2),
+            ),
+        )
+
+    if strategy == "right":
+        return max(
+            range(len(face_boxes)),
+            key=lambda idx: (
+                face_boxes[idx][2],
+                ((face_boxes[idx][0] + face_boxes[idx][2]) / 2),
+            ),
+        )
+
     targets = {
-        "left": frame_width * 0.25,
         "center": frame_width * 0.5,
-        "right": frame_width * 0.75,
     }
     target_x = targets[strategy]
     return min(
         range(len(face_boxes)),
         key=lambda idx: abs(((face_boxes[idx][0] + face_boxes[idx][2]) / 2) - target_x),
     )
+
+
+def filter_primary_face_candidates(
+    face_boxes: list[tuple[int, int, int, int]],
+    frame_width: int,
+    frame_height: int,
+    min_face_area_ratio: float = 0.015,
+    relative_min_face_scale: float = 0.35,
+) -> list[int]:
+    if not face_boxes:
+        return []
+
+    frame_area = max(frame_width * frame_height, 1)
+    face_areas = [
+        max((x2 - x1) * (y2 - y1), 0)
+        for x1, y1, x2, y2 in face_boxes
+    ]
+    largest_face_area = max(face_areas, default=0)
+    absolute_min_area = frame_area * min_face_area_ratio
+    relative_min_area = largest_face_area * relative_min_face_scale
+    threshold_area = max(absolute_min_area, relative_min_area)
+
+    kept_indices = [
+        idx for idx, area in enumerate(face_areas) if area >= threshold_area
+    ]
+    return kept_indices or [int(np.argmax(np.asarray(face_areas)))]
 
 
 def build_voice_pipeline(enable: bool):
@@ -565,13 +695,20 @@ def main() -> None:
     cached_face_labels: list[tuple[str, float]] = []
     cached_face_top3: list[list[tuple[str, float]]] = []
     cached_eye_labels: list[tuple[str, float]] = []
+    cached_candidate_indices: list[int] = []
     last_frame_time = time.perf_counter()
+    saved_eye_crop_count = 0
+    frame_index = 0
+    run_prefix = time.strftime("%Y%m%d_%H%M%S")
+    if args.save_eye_crops:
+        prepare_eye_debug_dir(args.save_eye_crops_dir)
 
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
+            frame_index += 1
 
             frame_h, frame_w = frame.shape[:2]
             run_inference = frames_since_inference == 0 or args.skip_frames == 0
@@ -609,22 +746,45 @@ def main() -> None:
                     emotion_classifier, face_crops, torch_device, topk=3
                 )
                 eye_labels = classify_crops(eye_classifier, eye_crops, torch_device)
+                candidate_indices = filter_primary_face_candidates(
+                    face_boxes,
+                    frame_w,
+                    frame_h,
+                    min_face_area_ratio=args.min_face_area_ratio,
+                    relative_min_face_scale=args.relative_min_face_scale,
+                )
 
                 cached_face_boxes = face_boxes
                 cached_face_labels = face_labels
                 cached_face_top3 = face_top3
                 cached_eye_labels = eye_labels
+                cached_candidate_indices = candidate_indices
                 frames_since_inference = args.skip_frames
             else:
                 frames_since_inference -= 1
 
-            driver_idx = choose_driver_face(cached_face_boxes, frame_w, args.driver_side)
+            candidate_boxes = [cached_face_boxes[idx] for idx in cached_candidate_indices]
+            selected_candidate_idx = choose_driver_face(
+                candidate_boxes,
+                frame_w,
+                args.driver_side,
+            )
+            driver_idx = (
+                cached_candidate_indices[selected_candidate_idx]
+                if selected_candidate_idx is not None and cached_candidate_indices
+                else None
+            )
 
             current_closed = False
             driver_emotion = "neutral"
+            driver_emotion_confidence = 0.0
+            driver_secondary_emotion = ""
+            driver_secondary_emotion_confidence = 0.0
             for idx, face_box in enumerate(cached_face_boxes):
                 x1, y1, x2, y2 = face_box
                 label, confidence = cached_face_labels[idx]
+                label, confidence = apply_emotion_postprocess(label, float(confidence))
+                is_candidate = idx in cached_candidate_indices
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 draw_tag(
                     frame,
@@ -644,12 +804,10 @@ def main() -> None:
                 if idx == driver_idx:
                     current_closed = both_closed
                     driver_emotion = label
-                    print(
-                        f"[DEBUG] Driver eye preds: {eye_predictions}, "
-                        f"avg_closed_conf={avg_closed_conf:.3f}, "
-                        f"both_closed={both_closed}",
-                        flush=True,
-                    )
+                    driver_emotion_confidence = float(confidence)
+                    if idx < len(cached_face_top3) and len(cached_face_top3[idx]) > 1:
+                        driver_secondary_emotion = cached_face_top3[idx][1][0]
+                        driver_secondary_emotion_confidence = float(cached_face_top3[idx][1][1])
                     if args.print_emotion_top3 and idx < len(cached_face_top3):
                         print(
                             "Driver emotion top-3:",
@@ -661,7 +819,8 @@ def main() -> None:
                 ):
                     ex1, ey1, ex2, ey2 = eye_box
                     eye_label, eye_confidence = eye_prediction
-                    cv2.rectangle(frame, (ex1, ey1), (ex2, ey2), (255, 0, 0), 2)
+                    if is_candidate:
+                        cv2.rectangle(frame, (ex1, ey1), (ex2, ey2), (255, 0, 0), 2)
                     draw_tag(
                         frame,
                         f"{normalize_label(eye_label)} {eye_confidence:.2f}",
@@ -671,9 +830,45 @@ def main() -> None:
                         scale=0.7,
                     )
 
+                if (
+                    idx == driver_idx
+                    and args.save_eye_crops
+                    and saved_eye_crop_count < args.save_eye_crops_limit
+                ):
+                    for eye_offset, eye_prediction in enumerate(eye_predictions):
+                        if saved_eye_crop_count >= args.save_eye_crops_limit:
+                            break
+                        ex1, ey1, ex2, ey2 = (
+                            left_eye_box if eye_offset == 0 else right_eye_box
+                        )
+                        eye_crop = frame[ey1:ey2, ex1:ex2].copy()
+                        saved_path = save_eye_debug_crop(
+                            args.save_eye_crops_dir,
+                            run_prefix,
+                            frame_index,
+                            eye_offset,
+                            eye_crop,
+                            eye_prediction[0],
+                            eye_prediction[1],
+                        )
+                        if saved_path is not None:
+                            saved_eye_crop_count += 1
+
             warning_active = focus_monitor.update(
                 eyes_closed=current_closed,
                 emotion=driver_emotion,
+                driver_state={
+                    "driver_detected": driver_idx is not None,
+                    "driver_confident": driver_idx is not None,
+                    "emotion": driver_emotion,
+                    "emotion_confidence": driver_emotion_confidence,
+                    "emotion_secondary": driver_secondary_emotion,
+                    "emotion_secondary_confidence": driver_secondary_emotion_confidence,
+                    "eye_label": "closed_eye" if current_closed else "open_eye",
+                    "risk": "HIGH" if current_closed else EMOTION_TO_RISK.get(driver_emotion, "OK"),
+                    "focus_alert": False,
+                    "driver_side": args.driver_side,
+                },
             )
 
             if warning_active:

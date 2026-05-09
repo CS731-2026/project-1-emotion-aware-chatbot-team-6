@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -13,13 +14,31 @@ from openai import OpenAI
 
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "openai/gpt-4o-mini"
+FALLBACK_MODEL = "deepseek/deepseek-chat"
 DEFAULT_MAX_HISTORY_MESSAGES = 10
 SUPPORTED_LLM_MODELS = [
     "openai/gpt-4o-mini",
     "anthropic/claude-haiku-4-5",
     "deepseek/deepseek-chat",
 ]
+ALLOWED_DRIVER_STATE_KEYS = (
+    "driver_detected",
+    "driver_confident",
+    "emotion",
+    "emotion_confidence",
+    "emotion_secondary",
+    "emotion_secondary_confidence",
+    "eye_label",
+    "eye_confidence",
+    "risk",
+    "focus_alert",
+    "driver_side",
+    "closed_eye_duration",
+    "focus_level",
+    "trigger_reason",
+)
 
 EMOTION_PROMPT_RULES = {
     "anger": (
@@ -54,12 +73,57 @@ EMOTION_PROMPT_RULES = {
 class ChatbotResponse:
     text: str
     model: str
+    selected_model: str
     emotion: str
     temperature: float
     latency_ms: float
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
+    fallback_used: bool
+
+
+def format_driver_state(driver_state: dict[str, Any] | None) -> str:
+    sanitized_state = sanitize_driver_state(driver_state)
+    if not sanitized_state:
+        return "No structured driver state is available."
+
+    emotion = str(sanitized_state.get("emotion", "neutral"))
+    emotion_conf = float(sanitized_state.get("emotion_confidence", 0.0))
+    emotion_secondary = str(sanitized_state.get("emotion_secondary", ""))
+    emotion_secondary_conf = float(sanitized_state.get("emotion_secondary_confidence", 0.0))
+    eye_label = str(sanitized_state.get("eye_label", "open_eye"))
+    eye_conf = float(sanitized_state.get("eye_confidence", 0.0))
+    risk = str(sanitized_state.get("risk", "OK"))
+    focus_alert = bool(sanitized_state.get("focus_alert", False))
+    driver_detected = bool(sanitized_state.get("driver_detected", False))
+    closed_eye_duration = float(sanitized_state.get("closed_eye_duration", 0.0))
+    trigger_reason = str(sanitized_state.get("trigger_reason", "")).strip()
+    return (
+        f"DriverDetected={'yes' if driver_detected else 'no'}, "
+        f"TopEmotions={emotion} ({emotion_conf:.2f})"
+        + (
+            f", {emotion_secondary} ({emotion_secondary_conf:.2f})"
+            if emotion_secondary
+            else ""
+        )
+        + ", "
+        f"Eyes={eye_label} ({eye_conf:.2f}), "
+        f"Risk={risk}, "
+        f"FocusAlert={'yes' if focus_alert else 'no'}, "
+        f"ClosedEyeDuration={closed_eye_duration:.1f}s"
+        + (f", TriggerReason={trigger_reason}." if trigger_reason else ".")
+    )
+
+
+def sanitize_driver_state(driver_state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not driver_state:
+        return None
+    return {
+        key: driver_state[key]
+        for key in ALLOWED_DRIVER_STATE_KEYS
+        if key in driver_state
+    }
 
 
 def trim_history(
@@ -77,7 +141,12 @@ def trim_history(
     return filtered_history[-max_messages:]
 
 
-def build_system_prompt(emotion: str, auto_trigger: bool = False) -> str:
+def build_system_prompt(
+    emotion: str,
+    auto_trigger: bool = False,
+    driver_state: dict[str, Any] | None = None,
+    provider_safe: bool = False,
+) -> str:
     normalized_emotion = emotion.strip().lower() if emotion else "neutral"
     emotion_rule = EMOTION_PROMPT_RULES.get(
         normalized_emotion,
@@ -88,16 +157,32 @@ def build_system_prompt(emotion: str, auto_trigger: bool = False) -> str:
         if auto_trigger
         else "Respond directly to the driver's message."
     )
+    if provider_safe:
+        return (
+            "You are a brief conversational assistant inside a desktop application.\n"
+            "Rules:\n"
+            "- Reply in at most 2 short sentences, and never exceed 3 sentences.\n"
+            "- Stay calm, practical, and non-alarmist.\n"
+            "- Do not produce long explanations or lists.\n"
+            "- Treat app-provided state as uncertain context, not ground truth.\n"
+            "- Avoid medical, legal, or high-stakes operational instructions.\n"
+            f"- App emotion context: {normalized_emotion}.\n"
+            f"- App state context: {format_driver_state(driver_state)}\n"
+            f"- Tone guidance: {emotion_rule}\n"
+            f"- Interaction mode: {auto_rule}"
+        )
+
     return (
-        "You are an in-car emotional support assistant for a driver.\n"
+        "You are a brief wellbeing and focus-support assistant inside a desktop application.\n"
         "Rules:\n"
         "- Reply in at most 2 short sentences, and never exceed 3 sentences.\n"
         "- Stay calm, grounded, and non-alarmist.\n"
         "- Do not produce long explanations or lists.\n"
-        "- Keep the driver focused; avoid distracting follow-up questions unless necessary.\n"
-        "- If the situation sounds unsafe, gently encourage safer behavior or pulling over.\n"
-        f"- Current detected emotion: {normalized_emotion}.\n"
-        f"- Emotion guidance: {emotion_rule}\n"
+        "- Use the app signals as soft context only.\n"
+        "- Help the user stay calm and focused without sounding forceful.\n"
+        f"- Current emotion context: {normalized_emotion}.\n"
+        f"- Current app state: {format_driver_state(driver_state)}\n"
+        f"- Tone guidance: {emotion_rule}\n"
         f"- Interaction mode: {auto_rule}"
     )
 
@@ -138,8 +223,14 @@ class DriverAssistantChatbot:
         conversation_history: list[dict[str, str]] | None = None,
         max_output_tokens: int = 120,
         auto_trigger: bool = False,
+        driver_state: dict[str, Any] | None = None,
     ) -> ChatbotResponse:
-        system_prompt = build_system_prompt(emotion, auto_trigger=auto_trigger)
+        sanitized_driver_state = sanitize_driver_state(driver_state)
+        system_prompt = build_system_prompt(
+            emotion,
+            auto_trigger=auto_trigger,
+            driver_state=sanitized_driver_state,
+        )
         trimmed_history = trim_history(conversation_history)
         current_user_message = (
             user_message.strip()
@@ -157,26 +248,130 @@ class DriverAssistantChatbot:
             {"role": "user", "content": current_user_message},
         ]
 
-        start = time.perf_counter()
-        completion = self.client.chat.completions.create(
-            model=model,
-            messages=messages,  # type: ignore[arg-type]
-            temperature=temperature,
-            max_tokens=max_output_tokens,
-        )
-        latency_ms = (time.perf_counter() - start) * 1000.0
+        def attempt_completion(
+            active_model: str,
+            active_system_prompt: str,
+            provider_safe: bool,
+        ) -> Any:
+            active_messages: list[dict[str, Any]] = [
+                {"role": "system", "content": active_system_prompt},
+                *trimmed_history,
+                {"role": "user", "content": current_user_message},
+            ]
+            logger.info(
+                "OpenRouter request start | model=%s temperature=%.2f emotion=%s auto_trigger=%s provider_safe=%s driver_state=%s",
+                active_model,
+                temperature,
+                emotion,
+                auto_trigger,
+                provider_safe,
+                format_driver_state(sanitized_driver_state),
+            )
+            start = time.perf_counter()
+            try:
+                result = self.client.chat.completions.create(
+                    model=active_model,
+                    messages=active_messages,  # type: ignore[arg-type]
+                    temperature=temperature,
+                    max_tokens=max_output_tokens,
+                )
+                latency = (time.perf_counter() - start) * 1000.0
+                return result, latency
+            except Exception as exc:
+                latency = (time.perf_counter() - start) * 1000.0
+                logger.exception(
+                    "OpenRouter request failed | model=%s temperature=%.2f latency_ms=%.0f provider_safe=%s",
+                    active_model,
+                    temperature,
+                    latency,
+                    provider_safe,
+                )
+                raise RuntimeError(
+                    f"OpenRouter request failed for model '{active_model}': {exc}"
+                ) from exc
+
+        used_model = model
+        try:
+            completion, latency_ms = attempt_completion(
+                used_model,
+                system_prompt,
+                provider_safe=False,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            should_retry_provider_safe = (
+                "403" in message
+                and ("openai/" in model or "anthropic/" in model)
+            )
+            if not should_retry_provider_safe:
+                raise
+            safe_prompt = build_system_prompt(
+                emotion,
+                auto_trigger=auto_trigger,
+                driver_state=sanitized_driver_state,
+                provider_safe=True,
+            )
+            logger.warning(
+                "Retrying OpenRouter request with provider-safe prompt | model=%s",
+                model,
+            )
+            try:
+                completion, latency_ms = attempt_completion(
+                    used_model,
+                    safe_prompt,
+                    provider_safe=True,
+                )
+            except RuntimeError as safe_exc:
+                safe_message = str(safe_exc)
+                should_fallback_model = (
+                    "403" in safe_message
+                    and used_model != FALLBACK_MODEL
+                )
+                if not should_fallback_model:
+                    raise
+                used_model = FALLBACK_MODEL
+                logger.warning(
+                    "Falling back to alternative model after provider rejection | fallback_model=%s",
+                    used_model,
+                )
+                fallback_prompt = build_system_prompt(
+                    emotion,
+                    auto_trigger=auto_trigger,
+                    driver_state=sanitized_driver_state,
+                    provider_safe=True,
+                )
+                completion, latency_ms = attempt_completion(
+                    used_model,
+                    fallback_prompt,
+                    provider_safe=True,
+                )
 
         content = completion.choices[0].message.content or ""
+        if not content.strip():
+            logger.warning(
+                "OpenRouter returned empty content | model=%s latency_ms=%.0f",
+                used_model,
+                latency_ms,
+            )
         usage = completion.usage
+        logger.info(
+            "OpenRouter request success | model=%s latency_ms=%.0f prompt_tokens=%s completion_tokens=%s",
+            used_model,
+            latency_ms,
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
+        )
         return ChatbotResponse(
             text=content.strip(),
-            model=model,
+            model=used_model,
+            selected_model=model,
             emotion=emotion,
             temperature=temperature,
             latency_ms=latency_ms,
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
             total_tokens=getattr(usage, "total_tokens", None),
+            fallback_used=used_model != model,
         )
 
 
