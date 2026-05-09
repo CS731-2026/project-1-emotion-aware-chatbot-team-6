@@ -155,6 +155,12 @@ def parse_args() -> argparse.Namespace:
         help="Closed-eye duration before the focus warning appears.",
     )
     parser.add_argument(
+        "--eye-warmup-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds after startup before eye-state results can affect focus alerts.",
+    )
+    parser.add_argument(
         "--cooldown-seconds",
         type=float,
         default=30.0,
@@ -236,7 +242,11 @@ def build_context_summary(driver_state: dict[str, Any]) -> str:
     if not driver_state.get("driver_detected", False):
         return "Current context: no confident driver detected"
     emotion = normalize_label(str(driver_state.get("emotion", "neutral")))
-    eyes = normalize_label(str(driver_state.get("eye_label", "open_eye")))
+    if driver_state.get("eye_warmup_active", False):
+        remaining = float(driver_state.get("eye_warmup_remaining", 0.0))
+        eyes = f"eye warm-up {remaining:.1f}s"
+    else:
+        eyes = normalize_label(str(driver_state.get("eye_label", "open_eye")))
     risk = str(driver_state.get("risk", "OK")).upper()
     return f"Current context: {emotion}, {eyes}, {risk}"
 
@@ -249,19 +259,19 @@ class ChatBubble(QFrame):
         bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         bubble.setStyleSheet(
             (
-                "background-color: #10b981; color: white; border-radius: 16px; "
-                "padding: 12px 16px; font-size: 14px; font-weight: 500;"
+                "background-color: #0059b5; color: white; border-radius: 18px; "
+                "padding: 14px 18px; font-size: 15px; line-height: 1.4;"
             )
             if is_user
             else (
-                "background-color: #3b82f6; color: white; border-radius: 16px; "
-                "padding: 12px 16px; font-size: 14px; font-weight: 500;"
+                "background-color: #eeeeee; color: #1a1c1c; border-radius: 18px; "
+                "padding: 14px 18px; font-size: 15px; line-height: 1.4;"
             )
         )
-        bubble.setMaximumWidth(360)
+        bubble.setMaximumWidth(340)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 6, 0, 6)
+        layout.setContentsMargins(0, 8, 0, 8)
         if is_user:
             layout.addStretch()
             layout.addWidget(bubble)
@@ -333,8 +343,9 @@ class VisionWorker(QObject):
                 "emotion_confidence": 0.0,
                 "emotion_secondary": "",
                 "emotion_secondary_confidence": 0.0,
-                "eye_label": "open_eye",
+                "eye_label": "warming_up",
                 "eye_confidence": 0.0,
+                "eye_warmup_active": True,
                 "risk": "OK",
                 "focus_alert": False,
                 "focus_level": 0,
@@ -345,6 +356,7 @@ class VisionWorker(QObject):
                 "eye_model_path": str(eye_model_path),
             }
             previous_time = time.perf_counter()
+            vision_started_at = previous_time
             previous_driver_center_x: float | None = None
             saved_eye_crop_count = 0
             frame_index = 0
@@ -357,6 +369,9 @@ class VisionWorker(QObject):
                 if not ok:
                     raise RuntimeError("Failed to read a frame from the webcam.")
                 frame_index += 1
+                elapsed_since_start = time.perf_counter() - vision_started_at
+                eye_warmup_active = elapsed_since_start < self.args.eye_warmup_seconds
+                eye_warmup_remaining = max(self.args.eye_warmup_seconds - elapsed_since_start, 0.0)
 
                 frame_h, frame_w = frame.shape[:2]
                 face_result = face_detector.predict(
@@ -411,7 +426,10 @@ class VisionWorker(QObject):
                     torch_device,
                     topk=3,
                 )
-                eye_predictions = classify_crops(eye_classifier, eye_crops_bgr, torch_device)
+                if eye_warmup_active:
+                    eye_predictions = [("open_eye", 0.0)] * len(eye_crops_bgr)
+                else:
+                    eye_predictions = classify_crops(eye_classifier, eye_crops_bgr, torch_device)
                 primary_face = None
                 if detections and emotion_predictions and eye_predictions:
                     candidate_indices = filter_primary_face_candidates(
@@ -435,7 +453,10 @@ class VisionWorker(QObject):
                             sum(score for label, score in per_face_eye_predictions if label == "closed_eye")
                             / max(len(per_face_eye_predictions), 1)
                         )
-                        if avg_closed_conf > 0.80:
+                        if eye_warmup_active:
+                            eye_label = "warming_up"
+                            eye_confidence = 0.0
+                        elif avg_closed_conf > 0.80:
                             eye_label = "closed_eye"
                             eye_confidence = avg_closed_conf
                         else:
@@ -540,6 +561,9 @@ class VisionWorker(QObject):
                     current_eye_label = "open_eye"
                     eye_confidence = 0.0
                     driver_detected = False
+                if eye_warmup_active:
+                    current_eye_label = "warming_up"
+                    eye_confidence = 0.0
 
                 if self.args.print_emotion_top3:
                     if primary_face is None:
@@ -569,6 +593,8 @@ class VisionWorker(QObject):
                     "emotion_secondary_confidence": secondary_emotion_confidence,
                     "eye_label": current_eye_label,
                     "eye_confidence": eye_confidence,
+                    "eye_warmup_active": eye_warmup_active,
+                    "eye_warmup_remaining": eye_warmup_remaining,
                     "risk": risk,
                     "focus_alert": False,
                     "driver_side": self.args.driver_side,
@@ -795,7 +821,7 @@ class DriverAssistantWindow(QMainWindow):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
         self.args = args
-        self.setWindowTitle("Driver Assistant")
+        self.setWindowTitle("DriveSense")
         self.resize(1500, 900)
 
         self.current_emotion = "neutral"
@@ -807,6 +833,8 @@ class DriverAssistantWindow(QMainWindow):
             "emotion_confidence": 0.0,
             "eye_label": "open_eye",
             "eye_confidence": 0.0,
+            "eye_warmup_active": True,
+            "eye_warmup_remaining": float(self.args.eye_warmup_seconds),
             "risk": "OK",
             "focus_alert": False,
             "focus_level": 0,
@@ -826,38 +854,121 @@ class DriverAssistantWindow(QMainWindow):
         self._in_continued_mode = False
 
         try:
-            self.chatbot = DriverAssistantChatbot(app_title="Driver Assistant GUI")
+            self.chatbot = DriverAssistantChatbot(app_title="DriveSense GUI")
         except Exception as exc:
             self.chatbot = None
             QMessageBox.warning(self, "OpenRouter", str(exc))
 
         central = QWidget()
-        central.setStyleSheet("background-color: #0f1419;")
+        central.setStyleSheet("background-color: #f9f9f9; color: #1a1c1c; font-family: Inter, Segoe UI, Arial;")
         self.setCentralWidget(central)
-        root_layout = QHBoxLayout(central)
-        root_layout.setContentsMargins(16, 16, 16, 16)
-        root_layout.setSpacing(18)
+        page_layout = QVBoxLayout(central)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        nav_bar = QFrame()
+        nav_bar.setFixedHeight(72)
+        nav_bar.setStyleSheet("background-color: #1a1c1c; color: #ffffff;")
+        nav_layout = QHBoxLayout(nav_bar)
+        nav_layout.setContentsMargins(72, 0, 72, 0)
+        nav_layout.setSpacing(26)
+        brand_label = QLabel("DriveSense")
+        brand_label.setStyleSheet("color: #ffffff; font-size: 28px; font-weight: 800;")
+        nav_layout.addWidget(brand_label)
+        for item, active in [("Dashboard", True), ("Logs", False), ("Telemetry", False), ("Models", False)]:
+            nav_item = QLabel(item)
+            nav_item.setStyleSheet(
+                "font-size: 15px; font-weight: 700; padding: 22px 0 17px 0; "
+                + ("color: #ffffff; border-bottom: 2px solid #0071e3;" if active else "color: #c1c6d6;")
+            )
+            nav_layout.addWidget(nav_item)
+        nav_layout.addStretch()
+        for text in ["Settings", "Account"]:
+            nav_button = QPushButton(text)
+            nav_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            nav_button.setStyleSheet(
+                "QPushButton { background: transparent; color: #ffffff; border: none; "
+                "font-size: 13px; font-weight: 600; padding: 8px 10px; }"
+                "QPushButton:hover { background-color: #414753; border-radius: 14px; }"
+            )
+            nav_layout.addWidget(nav_button)
+        page_layout.addWidget(nav_bar)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(72, 40, 72, 28)
+        content_layout.setSpacing(28)
+        page_layout.addWidget(content, 1)
+
+        title_label = QLabel("Driver Monitoring")
+        title_label.setStyleSheet("font-size: 48px; font-weight: 800; color: #1a1c1c;")
+        subtitle_label = QLabel("System Active")
+        subtitle_label.setStyleSheet("font-size: 21px; color: #414753;")
+        content_layout.addWidget(title_label)
+        content_layout.addWidget(subtitle_label)
+
+        main_layout = QHBoxLayout()
+        main_layout.setSpacing(36)
+        content_layout.addLayout(main_layout, 1)
 
         left_panel = QVBoxLayout()
+        left_panel.setSpacing(30)
         right_panel = QVBoxLayout()
-        root_layout.addLayout(left_panel, 3)
-        root_layout.addLayout(right_panel, 2)
+        right_panel.setSpacing(26)
+        main_layout.addLayout(left_panel, 8)
+        main_layout.addLayout(right_panel, 4)
 
         self.video_label = QLabel("Camera starting...")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setMinimumSize(860, 560)
-        self.video_label.setStyleSheet("background-color: #1f2937; color: #9ca3af; border-radius: 16px; border: 1px solid #374151;")
+        self.video_label.setMinimumSize(820, 520)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_label.setStyleSheet(
+            "background-color: #2f3131; color: #ffffff; border-radius: 24px; "
+            "border: 1px solid #e2e2e2; font-size: 16px; font-weight: 700;"
+        )
         left_panel.addWidget(self.video_label)
 
         info_card = QFrame()
-        info_card.setStyleSheet("background-color: #111827; color: white; border-radius: 16px; border: 1px solid #1f2937;")
+        info_card.setStyleSheet(
+            "QFrame { background-color: #eeeeee; color: #1a1c1c; border-radius: 18px; "
+            "border: 1px solid #e2e2e2; }"
+        )
         info_layout = QVBoxLayout(info_card)
-        self.driver_detected_label = QLabel("Driver detected: No")
-        self.emotion_label = QLabel("Emotion: neutral")
-        self.eye_label = QLabel("Eyes: open eye")
-        self.risk_label = QLabel("Risk: OK")
-        self.focus_label = QLabel("Focus: OK")
-        self.reason_label = QLabel("Reason: none")
+        info_layout.setContentsMargins(28, 26, 28, 26)
+        info_layout.setSpacing(12)
+        telemetry_title = QLabel("Telemetry Logs")
+        telemetry_title.setStyleSheet("font-size: 26px; font-weight: 800; color: #1a1c1c; border: none;")
+        info_layout.addWidget(telemetry_title)
+
+        def add_metric_row(label_text: str, value_label: QLabel) -> None:
+            row = QFrame()
+            row.setStyleSheet("QFrame { border: none; border-bottom: 1px solid #dadada; background: transparent; }")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 10, 0, 10)
+            label = QLabel(label_text)
+            label.setStyleSheet("color: #1a1c1c; font-size: 17px; border: none; background: transparent;")
+            value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value_label.setStyleSheet("color: #1a1c1c; font-size: 17px; font-weight: 700; border: none; background: transparent;")
+            row_layout.addWidget(label)
+            row_layout.addWidget(value_label, 1)
+            info_layout.addWidget(row)
+
+        self.driver_detected_label = QLabel("No")
+        self.emotion_label = QLabel("neutral")
+        self.eye_label = QLabel("open eye")
+        self.risk_label = QLabel("OK")
+        self.focus_label = QLabel("OK")
+        self.reason_label = QLabel("none")
+        add_metric_row("Driver detected", self.driver_detected_label)
+        add_metric_row("Emotion", self.emotion_label)
+        add_metric_row("Eyes", self.eye_label)
+        add_metric_row("Risk", self.risk_label)
+        add_metric_row("Focus", self.focus_label)
+        add_metric_row("Reason", self.reason_label)
+
+        meta_block = QVBoxLayout()
+        meta_block.setContentsMargins(0, 14, 0, 0)
+        meta_block.setSpacing(4)
         self.driver_label = QLabel("Driver heuristic: left")
         self.model_label = QLabel(f"Selected model: {self.args.default_llm_model}")
         self.last_model_label = QLabel(f"Last reply model: {self.args.default_llm_model}")
@@ -865,12 +976,6 @@ class DriverAssistantWindow(QMainWindow):
         self.eye_model_path_label = QLabel("Eye model: loading...")
         self.status_label = QLabel("Status: ready")
         for label in [
-            self.driver_detected_label,
-            self.emotion_label,
-            self.eye_label,
-            self.risk_label,
-            self.focus_label,
-            self.reason_label,
             self.driver_label,
             self.model_label,
             self.last_model_label,
@@ -879,10 +984,21 @@ class DriverAssistantWindow(QMainWindow):
             self.status_label,
         ]:
             label.setWordWrap(True)
-            info_layout.addWidget(label)
+            label.setStyleSheet("color: #1a1c1c; font-size: 14px; border: none; background: transparent;")
+            meta_block.addWidget(label)
+        info_layout.addLayout(meta_block)
         left_panel.addWidget(info_card)
 
+        settings_card = QFrame()
+        settings_card.setStyleSheet(
+            "QFrame { background-color: #ffffff; border: 1px solid #dadada; border-radius: 18px; }"
+        )
+        settings_layout = QVBoxLayout(settings_card)
+        settings_layout.setContentsMargins(20, 18, 20, 18)
+        settings_layout.setSpacing(16)
+
         controls_row = QHBoxLayout()
+        controls_row.setSpacing(12)
         self.model_combo = QComboBox()
         self.model_combo.addItems(SUPPORTED_LLM_MODELS)
         default_index = self.model_combo.findText(self.args.default_llm_model)
@@ -890,72 +1006,83 @@ class DriverAssistantWindow(QMainWindow):
             self.model_combo.setCurrentIndex(default_index)
         self.model_combo.currentTextChanged.connect(self.handle_model_selection_change)
         self.model_combo.setStyleSheet(
-            "QComboBox { background-color: #374151; color: white; border: 1px solid #4b5563; border-radius: 8px; padding: 6px 8px; font-weight: 500; }"
+            "QComboBox { background-color: #eeeeee; color: #1a1c1c; border: none; border-radius: 8px; padding: 8px 12px; font-size: 15px; }"
             "QComboBox::drop-down { border: none; }"
             "QComboBox::down-arrow { image: none; }"
-            "QComboBox QAbstractItemView { background-color: #374151; color: white; border: 1px solid #4b5563; selection-background-color: #3b82f6; }"
+            "QComboBox QAbstractItemView { background-color: #ffffff; color: #1a1c1c; border: 1px solid #dadada; selection-background-color: #0071e3; }"
         )
         self.temperature_spin = QDoubleSpinBox()
         self.temperature_spin.setRange(0.0, 2.0)
         self.temperature_spin.setSingleStep(0.1)
         self.temperature_spin.setValue(self.args.default_temperature)
-        self.temperature_spin.setStyleSheet("QDoubleSpinBox { background-color: #374151; color: white; border: 1px solid #4b5563; border-radius: 8px; padding: 6px 8px; }")
+        self.temperature_spin.setStyleSheet("QDoubleSpinBox { background-color: #eeeeee; color: #1a1c1c; border: none; border-radius: 8px; padding: 8px 10px; font-size: 15px; }")
         label_model = QLabel("LLM Model")
-        label_model.setStyleSheet("color: white; font-weight: 600; font-size: 13px;")
+        label_model.setStyleSheet("color: #1f2937; font-weight: 700; font-size: 13px; border: none; background: transparent;")
         label_temp = QLabel("Temperature")
-        label_temp.setStyleSheet("color: white; font-weight: 600; font-size: 13px;")
+        label_temp.setStyleSheet("color: #1f2937; font-weight: 700; font-size: 13px; border: none; background: transparent;")
         controls_row.addWidget(label_model)
         controls_row.addWidget(self.model_combo, 1)
         controls_row.addWidget(label_temp)
         controls_row.addWidget(self.temperature_spin)
-        right_panel.addLayout(controls_row)
+        settings_layout.addLayout(controls_row)
 
         self.context_label = QLabel("Current context: neutral, open eye, OK")
         self.context_label.setWordWrap(True)
         self.context_label.setStyleSheet(
-            "background-color: #111827; color: #e5e7eb; border: 1px solid #1f2937; "
-            "border-radius: 12px; padding: 10px 12px; font-size: 13px; font-weight: 500;"
+            "background-color: transparent; color: #1f2937; border-top: 1px solid #e5e5e5; "
+            "padding: 12px 0 0 0; font-size: 14px;"
         )
-        right_panel.addWidget(self.context_label)
+        settings_layout.addWidget(self.context_label)
+        right_panel.addWidget(settings_card)
 
+        chat_card = QFrame()
+        chat_card.setStyleSheet(
+            "QFrame { background-color: #ffffff; border: 1px solid #dadada; border-radius: 18px; }"
+        )
+        chat_card_layout = QVBoxLayout(chat_card)
+        chat_card_layout.setContentsMargins(0, 0, 0, 0)
+        chat_card_layout.setSpacing(0)
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setStyleSheet(
-            "QScrollArea { background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; }"
-            "QScrollBar:vertical { background-color: #f3f4f6; width: 8px; }"
-            "QScrollBar::handle:vertical { background-color: #d1d5db; border-radius: 4px; }"
+            "QScrollArea { background-color: #ffffff; border: none; border-radius: 18px; }"
+            "QScrollBar:vertical { background-color: #f4f4f4; width: 8px; }"
+            "QScrollBar::handle:vertical { background-color: #dadada; border-radius: 4px; }"
         )
         self.chat_container = QWidget()
+        self.chat_container.setStyleSheet("background-color: #ffffff; border: none;")
         self.chat_layout = QVBoxLayout(self.chat_container)
-        self.chat_layout.setContentsMargins(8, 8, 8, 8)
-        self.chat_layout.setSpacing(6)
+        self.chat_layout.setContentsMargins(22, 22, 22, 22)
+        self.chat_layout.setSpacing(10)
         self.chat_layout.addStretch()
         self.chat_scroll.setWidget(self.chat_container)
-        right_panel.addWidget(self.chat_scroll, 1)
+        chat_card_layout.addWidget(self.chat_scroll, 1)
 
         input_row = QHBoxLayout()
+        input_row.setContentsMargins(18, 16, 18, 16)
+        input_row.setSpacing(10)
         self.input_edit = QLineEdit()
         self.input_edit.setPlaceholderText("Type a short message...")
         self.input_edit.setStyleSheet(
-            "QLineEdit { background-color: white; color: #1f2937; border: 2px solid #e5e7eb; border-radius: 8px; "
-            "padding: 8px 12px; font-size: 14px; }"
-            "QLineEdit:focus { border: 2px solid #3b82f6; }"
+            "QLineEdit { background-color: #eeeeee; color: #1a1c1c; border: none; border-radius: 20px; "
+            "padding: 11px 16px; font-size: 14px; }"
+            "QLineEdit:focus { border: 1px solid #0071e3; }"
         )
         self.input_edit.returnPressed.connect(self.send_text_message)
         self.mic_button = QPushButton("🎤 Wake-word Listening: OFF")
         self.mic_button.clicked.connect(self.toggle_wake_word_listening)
         self.mic_button.setStyleSheet(
-            "QPushButton { background-color: #f59e0b; color: white; border: none; border-radius: 8px; "
-            "padding: 8px 16px; font-weight: 600; font-size: 13px; }"
-            "QPushButton:hover { background-color: #d97706; }"
-            "QPushButton:pressed { background-color: #b45309; }"
+            "QPushButton { background-color: #eeeeee; color: #1a1c1c; border: none; border-radius: 20px; "
+            "padding: 10px 16px; font-weight: 700; font-size: 13px; }"
+            "QPushButton:hover { background-color: #e1e1e1; }"
+            "QPushButton:pressed { background-color: #d4d4d4; }"
         )
         self.send_button = QPushButton("Send")
         self.send_button.setStyleSheet(
-            "QPushButton { background-color: #3b82f6; color: white; border: none; border-radius: 8px; "
-            "padding: 8px 20px; font-weight: 600; font-size: 13px; }"
-            "QPushButton:hover { background-color: #2563eb; }"
-            "QPushButton:pressed { background-color: #1d4ed8; }"
+            "QPushButton { background-color: #0059b5; color: white; border: none; border-radius: 20px; "
+            "padding: 10px 20px; font-weight: 700; font-size: 13px; }"
+            "QPushButton:hover { background-color: #0071e3; }"
+            "QPushButton:pressed { background-color: #00458c; }"
         )
         self.send_button.clicked.connect(self.send_text_message)
         # Push-to-talk button (press & hold to speak)
@@ -974,7 +1101,8 @@ class DriverAssistantWindow(QMainWindow):
         input_row.addWidget(self.mic_button)
         input_row.addWidget(self.ptt_button)
         input_row.addWidget(self.send_button)
-        right_panel.addLayout(input_row)
+        chat_card_layout.addLayout(input_row)
+        right_panel.addWidget(chat_card, 1)
 
         self.add_message(
             "Assistant ready. I will keep replies short and adjust tone to the detected emotion.",
@@ -1054,46 +1182,55 @@ class DriverAssistantWindow(QMainWindow):
         trigger_reason = str(state.get("trigger_reason", "")).strip()
         focus_level = int(state.get("focus_level", 0))
         closed_eye_duration = float(state.get("closed_eye_duration", 0.0))
-        self.driver_detected_label.setText(
-            f"Driver detected: {'Yes' if driver_detected else 'No'}"
-        )
+        eye_warmup_active = bool(state.get("eye_warmup_active", False))
+        eye_warmup_remaining = float(state.get("eye_warmup_remaining", 0.0))
+        self.driver_detected_label.setText("Yes" if driver_detected else "No")
         self.driver_detected_label.setStyleSheet(
-            "color: #34d399; font-size: 18px; font-weight: 600;"
+            "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
             if driver_detected
-            else "color: #f59e0b; font-size: 18px; font-weight: 600;"
+            else "color: #ff9500; font-size: 17px; font-weight: 700; border: none; background: transparent;"
         )
         self.emotion_label.setText(
-            f"Emotion: {normalize_label(self.current_emotion)} ({state['emotion_confidence']:.2f})"
+            f"{normalize_label(self.current_emotion)} ({state['emotion_confidence']:.2f})"
         )
-        self.emotion_label.setStyleSheet(f"color: {color}; font-size: 18px; font-weight: 600;")
-        self.eye_label.setText(
-            f"Eyes: {normalize_label(state['eye_label'])} ({state['eye_confidence']:.2f})"
+        self.emotion_label.setStyleSheet(
+            f"color: {color}; font-size: 17px; font-weight: 700; border: none; background: transparent;"
         )
-        self.eye_label.setStyleSheet("color: #60a5fa; font-size: 18px; font-weight: 600;")
-        self.risk_label.setText(f"Risk: {self.current_risk}")
+        if eye_warmup_active:
+            self.eye_label.setText(f"warming up ({eye_warmup_remaining:.1f}s)")
+        else:
+            self.eye_label.setText(
+                f"{normalize_label(state['eye_label'])} ({state['eye_confidence']:.2f})"
+            )
+        self.eye_label.setStyleSheet(
+            "color: #ff9500; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            if eye_warmup_active
+            else "color: #0059b5; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+        )
+        self.risk_label.setText(self.current_risk)
         self.risk_label.setStyleSheet(
-            f"color: {risk_color_hex(self.current_risk)}; font-size: 18px; font-weight: 600;"
+            f"color: {risk_color_hex(self.current_risk)}; font-size: 17px; font-weight: 700; border: none; background: transparent;"
         )
         self.focus_label.setText(
-            "Focus: Please stay focused"
+            "Please stay focused"
             if state["focus_alert"]
-            else ("Focus: Stay attentive" if focus_level == 1 else "Focus: OK")
+            else ("Stay attentive" if focus_level == 1 else "OK")
         )
         self.focus_label.setStyleSheet(
-            "color: #ef4444; font-size: 18px; font-weight: 600;"
+            "color: #e53935; font-size: 17px; font-weight: 700; border: none; background: transparent;"
             if state["focus_alert"]
             else (
-                "color: #f59e0b; font-size: 18px; font-weight: 600;"
+                "color: #ff9500; font-size: 17px; font-weight: 700; border: none; background: transparent;"
                 if focus_level == 1
-                else "color: #34d399; font-size: 18px; font-weight: 600;"
+                else "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
             )
         )
         if trigger_reason:
             self.reason_label.setText(
-                f"Reason: {trigger_reason} (current {closed_eye_duration:.1f}s)"
+                f"{trigger_reason} ({closed_eye_duration:.1f}s)"
             )
         else:
-            self.reason_label.setText("Reason: none")
+            self.reason_label.setText("none")
         self.driver_label.setText(f"Driver heuristic: {state['driver_side']}")
         self.model_label.setText(f"Selected model: {self.model_combo.currentText()}")
         fallback_suffix = " (fallback)" if self.last_fallback_used else ""
