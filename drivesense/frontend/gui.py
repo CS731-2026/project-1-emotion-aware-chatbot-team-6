@@ -1373,7 +1373,7 @@ class DriverAssistantWindow(QMainWindow):
         def worker() -> None:
             try:
                 tts = TextToSpeech(rate=150, volume=1.0)
-                tts.speak(text, emotion=emotion)
+                tts.speak(text, emotion=emotion, wait=True)
             except Exception as exc:
                 print(f"TTS error: {exc}")
             finally:

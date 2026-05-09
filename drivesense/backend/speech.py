@@ -7,6 +7,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
@@ -157,6 +158,10 @@ class WhisperTranscriber:
 class TextToSpeech:
     """Convert text to speech using the local pyttsx3 engine."""
 
+    _engine_lock = threading.RLock()
+    _shared_engine: Any = None
+    _shared_voices: list[Any] | None = None
+
     EMOTION_RATE_OFFSETS = {
         "anger": -6,
         "fear": -10,
@@ -193,6 +198,21 @@ class TextToSpeech:
 
         self._pyttsx3 = pyttsx3
 
+    def _get_engine(self) -> Any:
+        cls = type(self)
+        with cls._engine_lock:
+            if cls._shared_engine is None:
+                cls._shared_engine = self._pyttsx3.init()
+            return cls._shared_engine
+
+    def _get_voices(self) -> list[Any]:
+        cls = type(self)
+        with cls._engine_lock:
+            if cls._shared_voices is None:
+                engine = self._get_engine()
+                cls._shared_voices = list(engine.getProperty("voices") or [])
+            return cls._shared_voices
+
     @staticmethod
     def prepare_spoken_text(text: str) -> str:
         """Keep the LLM reply unchanged except for normalizing whitespace."""
@@ -201,7 +221,7 @@ class TextToSpeech:
     def select_voice(self, emotion: str | None = None) -> str | None:
         """Prefer a softer or livelier voice depending on the driver emotion."""
         try:
-            voices = self._pyttsx3.init().getProperty("voices")
+            voices = self._get_voices()
         except Exception:
             return None
 
@@ -234,7 +254,7 @@ class TextToSpeech:
         if not spoken_text:
             return
 
-        engine = self._pyttsx3.init()
+        engine = self._get_engine()
         emotion_key = (emotion or "neutral").lower()
         emotion_rate = self.EMOTION_RATE_OFFSETS.get(emotion_key, 0)
         emotion_volume = self.EMOTION_VOLUME.get(emotion_key, self.volume)

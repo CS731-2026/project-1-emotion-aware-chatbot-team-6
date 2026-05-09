@@ -84,9 +84,9 @@ class VoiceChatPipeline:
             driver_state=driver_state,
         )
         
-        # Step 3: Speak the reply
-        print("Speaking reply...")
-        self.tts.speak(bot_response.text, emotion=emotion, wait=True)
+        # Step 3: Queue the reply TTS without blocking the result path.
+        print("Queueing reply TTS...")
+        self.tts.speak(bot_response.text, emotion=emotion, wait=False)
         
         return VoiceChatResult(
             user_input=user_input,
