@@ -38,6 +38,7 @@ from drivesense.backend.chatbot import (
 )
 from drivesense.backend.focus_monitor import FocusMonitor, FocusMonitorConfig
 from drivesense.backend.vision import (
+    apply_emotion_postprocess,
     build_voice_pipeline,
     classify_crops,
     classify_crops_with_topk,
@@ -83,6 +84,7 @@ EMOTION_COLORS_HEX = {
     "disgust": "#8e24aa",
     "neutral": "#607d8b",
 }
+
 EMOTION_TO_RISK = {
     "anger": "HIGH",
     "fear": "HIGH",
@@ -447,6 +449,10 @@ class VisionWorker(QObject):
                         emotion_topk = cast(list[tuple[str, float]], emotion_prediction)
                         emotion_label = emotion_topk[0][0]
                         emotion_confidence = float(emotion_topk[0][1])
+                        emotion_label, emotion_confidence = apply_emotion_postprocess(
+                            emotion_label,
+                            emotion_confidence,
+                        )
 
                         per_face_eye_predictions = eye_predictions[index * 2 : index * 2 + 2]
                         avg_closed_conf = (

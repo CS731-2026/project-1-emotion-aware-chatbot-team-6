@@ -4,7 +4,7 @@ Tracks how long the driver has had their eyes closed and triggers a multi-modal
 intervention when the duration exceeds a threshold (default 2 seconds):
 
     1. Audible beep alert (Windows winsound, fallback to console bell).
-    2. Spoken check-in question via pyttsx3.
+    2. Spoken short check-in via LLM + pyttsx3, with a fixed fallback sentence.
     3. Full voice dialogue loop (record -> transcribe -> LLM -> speak) using
        the existing VoiceChatPipeline.
 
@@ -51,6 +51,9 @@ class FocusMonitorConfig:
 
     chat_model: str = "openai/gpt-4o-mini"
     """OpenRouter model id used for the LLM reply step."""
+
+    alert_max_output_tokens: int = 40
+    """Maximum tokens for the short LLM-generated focus alert."""
 
 
 @dataclass
@@ -114,6 +117,17 @@ def _build_check_in_question(
     return default_question
 
 
+def _build_alert_prompt(driver_state: dict[str, Any] | None) -> str:
+    closed_duration = float((driver_state or {}).get("closed_eye_duration", 0.0))
+    risk = str((driver_state or {}).get("risk", "HIGH")).upper()
+    return (
+        "The system detected that the driver's eyes were closed long enough to trigger "
+        f"a focus alert. Risk={risk}. ClosedEyeDuration={closed_duration:.1f}s. "
+        "Say exactly one short, calm sentence to help the driver refocus. "
+        "Do not mention being an AI. Do not ask a long question."
+    )
+
+
 class FocusMonitor:
     """Watch the driver's eye state and run a voice intervention when drowsy.
 
@@ -144,12 +158,14 @@ class FocusMonitor:
         config: Optional[FocusMonitorConfig] = None,
         tts: Optional[object] = None,
         voice_pipeline: Optional[object] = None,
+        alert_chatbot: Optional[object] = None,
         on_voice_result: Optional[Callable[[Any], None]] = None,
         on_voice_error: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.config = config or FocusMonitorConfig()
         self._tts = tts
         self._voice_pipeline = voice_pipeline
+        self._alert_chatbot = alert_chatbot or getattr(voice_pipeline, "chatbot", None)
         self._on_voice_result = on_voice_result
         self._on_voice_error = on_voice_error
         self._state = _State()
@@ -296,13 +312,15 @@ class FocusMonitor:
 
             if self._tts is not None:
                 try:
-                    check_in_question = _build_check_in_question(
+                    alert_sentence = self._build_alert_sentence(
                         self.config.check_in_question,
                         emotion,
+                        chat_model,
+                        temperature,
                         driver_state,
                     )
                     self._tts.speak(
-                        check_in_question,
+                        alert_sentence,
                         emotion=emotion,
                         wait=True,
                     )
@@ -338,6 +356,51 @@ class FocusMonitor:
         finally:
             with self._state.lock:
                 self._state.is_handling_event = False
+
+    def _build_alert_sentence(
+        self,
+        default_question: str,
+        emotion: str,
+        chat_model: str,
+        temperature: float,
+        driver_state: dict[str, Any] | None,
+    ) -> str:
+        fallback_sentence = _build_check_in_question(
+            default_question,
+            emotion,
+            driver_state,
+        )
+        if self._alert_chatbot is None:
+            return fallback_sentence
+
+        try:
+            logger.info(
+                "Generating dynamic focus alert via LLM | model=%s emotion=%s",
+                chat_model,
+                emotion,
+            )
+            response = self._alert_chatbot.generate_reply(
+                emotion=emotion,
+                user_message=_build_alert_prompt(driver_state),
+                model=chat_model,
+                temperature=temperature,
+                conversation_history=[],
+                max_output_tokens=self.config.alert_max_output_tokens,
+                auto_trigger=True,
+                driver_state=driver_state,
+            )
+            text = response.text.strip()
+            if text:
+                logger.info(
+                    "Dynamic focus alert generated | model=%s fallback=%s text=%r",
+                    response.model,
+                    response.fallback_used,
+                    text,
+                )
+                return text
+        except Exception as exc:
+            logger.exception("Dynamic focus alert failed, using fallback: %s", exc)
+        return fallback_sentence
 
     def reset(self) -> None:
         """Clear all state. Useful when the camera selection changes."""

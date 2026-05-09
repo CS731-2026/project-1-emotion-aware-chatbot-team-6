@@ -42,6 +42,8 @@ EMOTION_TO_RISK = {
     "happy": "OK",
     "neutral": "OK",
 }
+LOW_CONFIDENCE_NEUTRAL_EMOTIONS = {"sad", "anger"}
+LOW_CONFIDENCE_NEUTRAL_THRESHOLD = 0.80
 
 
 class ClassifierDict(TypedDict):
@@ -221,6 +223,15 @@ def build_eval_transform(img_size: int) -> transforms.Compose:
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
     )
+
+
+def apply_emotion_postprocess(label: str, confidence: float) -> tuple[str, float]:
+    if (
+        label in LOW_CONFIDENCE_NEUTRAL_EMOTIONS
+        and confidence < LOW_CONFIDENCE_NEUTRAL_THRESHOLD
+    ):
+        return "neutral", confidence
+    return label, confidence
 
 
 def normalize_checkpoint_path(model_path: Path | None) -> Path | None:
@@ -477,7 +488,7 @@ def estimate_eye_boxes(
 
     eye_w = int(face_w * 0.24)
     eye_h = int(face_h * 0.15)
-    eye_y1 = y1 + int(face_h * 0.39)
+    eye_y1 = y1 + int(face_h * 0.36)
     eye_y2 = eye_y1 + eye_h
 
     left_eye_x1 = x1 + int(face_w * 0.18)
@@ -772,6 +783,7 @@ def main() -> None:
             for idx, face_box in enumerate(cached_face_boxes):
                 x1, y1, x2, y2 = face_box
                 label, confidence = cached_face_labels[idx]
+                label, confidence = apply_emotion_postprocess(label, float(confidence))
                 is_candidate = idx in cached_candidate_indices
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 draw_tag(
