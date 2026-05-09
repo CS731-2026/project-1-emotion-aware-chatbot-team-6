@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import threading
 import time
@@ -11,20 +12,27 @@ from typing import Any, cast
 import cv2
 import torch
 from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot   
-from PyQt5.QtGui import QCloseEvent, QImage, QPixmap
+from PyQt5.QtGui import QColor, QCloseEvent, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -64,6 +72,7 @@ from drivesense.backend.wake_word import WakeWordListener, WakeWordConfig, Conti
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNS_ROOT = PROJECT_ROOT / "runs_timm"
 DEFAULT_WEIGHTS_ROOT = PROJECT_ROOT / "weights"
+DEFAULT_LLM_BENCHMARK_DIR = PROJECT_ROOT / "benchmark_results" / "llm_benchmark"
 
 
 EMOTION_COLORS_BGR = {
@@ -251,6 +260,110 @@ def build_context_summary(driver_state: dict[str, Any]) -> str:
         eyes = normalize_label(str(driver_state.get("eye_label", "open_eye")))
     risk = str(driver_state.get("risk", "OK")).upper()
     return f"Current context: {emotion}, {eyes}, {risk}"
+
+
+def compute_attention_score(driver_state: dict[str, Any]) -> int:
+    if not driver_state.get("driver_detected", False):
+        return 25
+
+    if driver_state.get("eye_warmup_active", False):
+        return 65
+
+    score = 100
+    emotion = str(driver_state.get("emotion", "neutral")).lower()
+    risk = str(driver_state.get("risk", "OK")).upper()
+    eye_label = str(driver_state.get("eye_label", "open_eye")).lower()
+    focus_level = int(driver_state.get("focus_level", 0))
+
+    if eye_label == "closed_eye":
+        score -= 45
+    if focus_level >= 2 or driver_state.get("focus_alert", False):
+        score -= 35
+    elif focus_level == 1:
+        score -= 18
+
+    if risk == "HIGH":
+        score -= 15
+    elif risk == "MED":
+        score -= 8
+    elif risk == "LOW":
+        score -= 4
+
+    if emotion in {"anger", "fear"}:
+        score -= 10
+    elif emotion == "sad":
+        score -= 6
+
+    return max(0, min(100, score))
+
+
+class AttentionHistoryChart(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._points: list[tuple[float, float]] = []
+        self.setMinimumHeight(260)
+
+    def set_points(self, points: list[tuple[float, float]]) -> None:
+        self._points = points[-180:]
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+
+        rect = self.rect().adjusted(18, 16, -18, -24)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        grid_pen = QPen(QColor("#e8e8e8"))
+        grid_pen.setWidth(1)
+        painter.setPen(grid_pen)
+        for idx in range(5):
+            y = rect.top() + int(rect.height() * idx / 4)
+            painter.drawLine(rect.left(), y, rect.right(), y)
+
+        axis_pen = QPen(QColor("#b8b8b8"))
+        axis_pen.setWidth(1)
+        painter.setPen(axis_pen)
+        painter.drawRect(rect)
+
+        label_pen = QPen(QColor("#6b7280"))
+        painter.setPen(label_pen)
+        for value in (100, 75, 50, 25, 0):
+            y = rect.top() + int((100 - value) / 100 * rect.height())
+            painter.drawText(rect.left() + 6, y - 4, str(value))
+
+        if len(self._points) < 2:
+            painter.setPen(QPen(QColor("#9aa1ad")))
+            painter.drawText(rect.adjusted(0, 0, 0, -8), Qt.AlignmentFlag.AlignCenter, "Waiting for attention history...")
+            return
+
+        first_ts = self._points[0][0]
+        last_ts = self._points[-1][0]
+        span = max(last_ts - first_ts, 1e-6)
+
+        line_pen = QPen(QColor("#0059b5"))
+        line_pen.setWidth(3)
+        painter.setPen(line_pen)
+
+        prev_x = 0
+        prev_y = 0
+        for idx, (ts_value, score) in enumerate(self._points):
+            x = rect.left() + int(((ts_value - first_ts) / span) * rect.width())
+            y = rect.bottom() - int((score / 100.0) * rect.height())
+            if idx > 0:
+                painter.drawLine(prev_x, prev_y, x, y)
+            prev_x, prev_y = x, y
+
+        point_pen = QPen(QColor("#0071e3"))
+        point_pen.setWidth(6)
+        painter.setPen(point_pen)
+        painter.drawPoint(prev_x, prev_y)
+
+        painter.setPen(QPen(QColor("#1f2937")))
+        painter.drawText(rect.left(), rect.bottom() + 18, "Oldest")
+        painter.drawText(rect.right() - 42, rect.bottom() + 18, "Now")
 
 
 class ChatBubble(QFrame):
@@ -854,16 +967,25 @@ class DriverAssistantWindow(QMainWindow):
         self.last_used_model = self.args.default_llm_model
         self.last_selected_model = self.args.default_llm_model
         self.last_fallback_used = False
+        self.runtime_logs: list[str] = []
+        self.attention_history: list[tuple[float, float]] = []
+        self._history_started_at = time.perf_counter()
+        self._last_history_point_at = 0.0
+        self._last_logged_snapshot: tuple[bool, str, str, int] | None = None
+        self.nav_buttons: dict[str, QPushButton] = {}
         self.wake_word_listening = False
         self.wake_word_listener: WakeWordListener | None = None
         self.continued_listener: ContinuedConversationListener | None = None
         self._in_continued_mode = False
+        self.llm_benchmark_rows = self.load_llm_benchmark_rows()
 
         try:
             self.chatbot = DriverAssistantChatbot(app_title="DriveSense GUI")
+            self.append_log("system", "OpenRouter chatbot initialized")
         except Exception as exc:
             self.chatbot = None
             QMessageBox.warning(self, "OpenRouter", str(exc))
+            self.append_log("error", f"OpenRouter init failed: {exc}")
 
         central = QWidget()
         central.setStyleSheet("background-color: #f9f9f9; color: #1a1c1c; font-family: Inter, Segoe UI, Arial;")
@@ -881,13 +1003,15 @@ class DriverAssistantWindow(QMainWindow):
         brand_label = QLabel("DriveSense")
         brand_label.setStyleSheet("color: #ffffff; font-size: 28px; font-weight: 800;")
         nav_layout.addWidget(brand_label)
-        for item, active in [("Dashboard", True), ("Logs", False), ("Telemetry", False), ("Models", False)]:
-            nav_item = QLabel(item)
-            nav_item.setStyleSheet(
-                "font-size: 15px; font-weight: 700; padding: 22px 0 17px 0; "
-                + ("color: #ffffff; border-bottom: 2px solid #0071e3;" if active else "color: #c1c6d6;")
+        for item in ["Dashboard", "Logs", "History", "Models"]:
+            nav_button = QPushButton(item)
+            nav_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            nav_button.setStyleSheet(self.nav_button_style(active=(item == "Dashboard")))
+            nav_button.clicked.connect(
+                lambda checked=False, name=item: self.switch_page(name)
             )
-            nav_layout.addWidget(nav_item)
+            self.nav_buttons[item] = nav_button
+            nav_layout.addWidget(nav_button)
         nav_layout.addStretch()
         for text in ["Settings", "Account"]:
             nav_button = QPushButton(text)
@@ -906,16 +1030,23 @@ class DriverAssistantWindow(QMainWindow):
         content_layout.setSpacing(28)
         page_layout.addWidget(content, 1)
 
-        title_label = QLabel("Driver Monitoring")
-        title_label.setStyleSheet("font-size: 48px; font-weight: 800; color: #1a1c1c;")
-        subtitle_label = QLabel("System Active")
-        subtitle_label.setStyleSheet("font-size: 21px; color: #414753;")
-        content_layout.addWidget(title_label)
-        content_layout.addWidget(subtitle_label)
+        self.title_label = QLabel("Driver Monitoring")
+        self.title_label.setStyleSheet("font-size: 48px; font-weight: 800; color: #1a1c1c;")
+        self.subtitle_label = QLabel("System Active")
+        self.subtitle_label.setStyleSheet("font-size: 21px; color: #414753;")
+        content_layout.addWidget(self.title_label)
+        content_layout.addWidget(self.subtitle_label)
 
-        main_layout = QHBoxLayout()
+        self.page_stack = QStackedWidget()
+        self.page_stack.setStyleSheet("background: transparent; border: none;")
+        content_layout.addWidget(self.page_stack, 1)
+
+        dashboard_page = QWidget()
+        dashboard_page.setStyleSheet("background: transparent;")
+        main_layout = QHBoxLayout(dashboard_page)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(36)
-        content_layout.addLayout(main_layout, 1)
+        self.page_stack.addWidget(dashboard_page)
 
         left_panel = QVBoxLayout()
         left_panel.setSpacing(30)
@@ -942,7 +1073,7 @@ class DriverAssistantWindow(QMainWindow):
         info_layout = QVBoxLayout(info_card)
         info_layout.setContentsMargins(28, 26, 28, 26)
         info_layout.setSpacing(12)
-        telemetry_title = QLabel("Telemetry Logs")
+        telemetry_title = QLabel("Driver State")
         telemetry_title.setStyleSheet("font-size: 26px; font-weight: 800; color: #1a1c1c; border: none;")
         info_layout.addWidget(telemetry_title)
 
@@ -1110,6 +1241,10 @@ class DriverAssistantWindow(QMainWindow):
         chat_card_layout.addLayout(input_row)
         right_panel.addWidget(chat_card, 1)
 
+        self.page_stack.addWidget(self.build_logs_page())
+        self.page_stack.addWidget(self.build_history_page())
+        self.page_stack.addWidget(self.build_models_page())
+
         self.add_message(
             "Assistant ready. I will keep replies short and adjust tone to the detected emotion.",
             is_user=False,
@@ -1148,8 +1283,10 @@ class DriverAssistantWindow(QMainWindow):
             self.mic_button.setVisible(False)
             self.mic_button.setEnabled(False)
             self.status_label.setText("Status: listening for 'hey moss")
+            self.append_log("voice", "Wake-word listener started for 'hey moss'")
         except Exception as exc:
             print(f"Failed to start wake-word listener automatically: {exc}")
+            self.append_log("error", f"Wake-word listener failed to start: {exc}")
 
         # Initialize continued conversation listener (post-reply).
         self.continued_listener = ContinuedConversationListener(
@@ -1163,6 +1300,235 @@ class DriverAssistantWindow(QMainWindow):
             on_timeout=self.on_continued_timeout,
             timeout_seconds=10.0,
         )
+        self.switch_page("Dashboard")
+        self.append_log("system", "DriveSense GUI ready")
+
+    def nav_button_style(self, active: bool) -> str:
+        return (
+            "QPushButton { background: transparent; border: none; padding: 22px 0 17px 0; "
+            f"color: {'#ffffff' if active else '#c1c6d6'}; font-size: 15px; font-weight: 700; "
+            + (f"border-bottom: 2px solid {'#0071e3' if active else 'transparent'};" if active else "")
+            + "}"
+            "QPushButton:hover { color: #ffffff; }"
+        )
+
+    def switch_page(self, page_name: str) -> None:
+        page_index = {"Dashboard": 0, "Logs": 1, "History": 2, "Models": 3}.get(page_name, 0)
+        page_meta = {
+            "Dashboard": ("Driver Monitoring", "System Active"),
+            "Logs": ("Runtime Logs", "Voice, detection, and chatbot events"),
+            "History": ("Attention History", "Recent driver attention curve"),
+            "Models": ("Model Comparison", "LLM benchmark summary and current selection"),
+        }
+        self.page_stack.setCurrentIndex(page_index)
+        title, subtitle = page_meta.get(page_name, page_meta["Dashboard"])
+        self.title_label.setText(title)
+        self.subtitle_label.setText(subtitle)
+        for name, button in self.nav_buttons.items():
+            button.setStyleSheet(self.nav_button_style(active=(name == page_name)))
+
+    def build_card_frame(self) -> QFrame:
+        card = QFrame()
+        card.setStyleSheet(
+            "QFrame { background-color: #ffffff; border: 1px solid #dadada; border-radius: 18px; }"
+        )
+        return card
+
+    def build_logs_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(24)
+
+        card = self.build_card_frame()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 22, 24, 22)
+        card_layout.setSpacing(14)
+
+        title = QLabel("Logs")
+        title.setStyleSheet("font-size: 28px; font-weight: 800; color: #1a1c1c; border: none;")
+        subtitle = QLabel("Key runtime events are collected here in time order.")
+        subtitle.setStyleSheet("font-size: 15px; color: #4b5563; border: none;")
+        self.logs_summary_label = QLabel("No events yet.")
+        self.logs_summary_label.setStyleSheet("font-size: 14px; color: #6b7280; border: none;")
+        self.logs_list = QListWidget()
+        self.logs_list.setStyleSheet(
+            "QListWidget { background: #f9f9f9; border: 1px solid #e4e4e4; border-radius: 14px; "
+            "padding: 8px; font-size: 14px; color: #1f2937; }"
+            "QListWidget::item { padding: 10px 8px; border-bottom: 1px solid #ececec; }"
+            "QListWidget::item:selected { background: #e8f0ff; color: #1a1c1c; }"
+        )
+
+        card_layout.addWidget(title)
+        card_layout.addWidget(subtitle)
+        card_layout.addWidget(self.logs_summary_label)
+        card_layout.addWidget(self.logs_list, 1)
+        for entry in reversed(self.runtime_logs):
+            self.logs_list.addItem(QListWidgetItem(entry))
+        if self.runtime_logs:
+            self.logs_summary_label.setText(f"Captured {len(self.runtime_logs)} recent events.")
+        layout.addWidget(card, 1)
+        return page
+
+    def build_history_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(24)
+
+        card = self.build_card_frame()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 22, 24, 22)
+        card_layout.setSpacing(14)
+
+        title = QLabel("History")
+        title.setStyleSheet("font-size: 28px; font-weight: 800; color: #1a1c1c; border: none;")
+        subtitle = QLabel("Attention score is derived from driver detection, eye state, risk, and focus level.")
+        subtitle.setStyleSheet("font-size: 15px; color: #4b5563; border: none;")
+        self.history_summary_label = QLabel("Waiting for driver-state samples.")
+        self.history_summary_label.setStyleSheet("font-size: 14px; color: #6b7280; border: none;")
+        self.attention_chart = AttentionHistoryChart()
+
+        card_layout.addWidget(title)
+        card_layout.addWidget(subtitle)
+        card_layout.addWidget(self.history_summary_label)
+        card_layout.addWidget(self.attention_chart, 1)
+        layout.addWidget(card, 1)
+        return page
+
+    def build_models_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(24)
+
+        card = self.build_card_frame()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(24, 22, 24, 22)
+        card_layout.setSpacing(14)
+
+        title = QLabel("LLM Comparison")
+        title.setStyleSheet("font-size: 28px; font-weight: 800; color: #1a1c1c; border: none;")
+        subtitle = QLabel("Results are loaded from benchmark CSV files under benchmark_results/llm_benchmark.")
+        subtitle.setStyleSheet("font-size: 15px; color: #4b5563; border: none;")
+        self.models_summary_label = QLabel(f"Current selected model: {self.args.default_llm_model}")
+        self.models_summary_label.setStyleSheet("font-size: 14px; color: #1f2937; border: none;")
+        self.models_table = QTableWidget(0, 4)
+        self.models_table.setHorizontalHeaderLabels(
+            ["Model", "Avg Latency (ms)", "Avg Manual Score", "Current Status"]
+        )
+        self.models_table.setStyleSheet(
+            "QTableWidget { background: #f9f9f9; border: 1px solid #e4e4e4; border-radius: 14px; "
+            "gridline-color: #ececec; font-size: 14px; color: #1f2937; }"
+            "QHeaderView::section { background: #eeeeee; border: none; padding: 10px; font-weight: 700; }"
+        )
+        self.models_table.verticalHeader().setVisible(False)
+        self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.models_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.models_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.refresh_models_table()
+
+        card_layout.addWidget(title)
+        card_layout.addWidget(subtitle)
+        card_layout.addWidget(self.models_summary_label)
+        card_layout.addWidget(self.models_table, 1)
+        layout.addWidget(card, 1)
+        return page
+
+    def load_llm_benchmark_rows(self) -> list[dict[str, str]]:
+        summary_path = DEFAULT_LLM_BENCHMARK_DIR / "model_summary.csv"
+        scores_path = DEFAULT_LLM_BENCHMARK_DIR / "manual_scores_filled.csv"
+        rows: dict[str, dict[str, str]] = {}
+
+        if summary_path.exists():
+            with summary_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    model = str(row.get("model", "")).strip()
+                    if model:
+                        rows[model] = {
+                            "model": model,
+                            "avg_latency_ms": str(row.get("avg_latency_ms", "")).strip(),
+                            "average_score": "",
+                        }
+
+        if scores_path.exists():
+            grouped_scores: dict[str, list[float]] = {}
+            with scores_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    model = str(row.get("model", "")).strip()
+                    score_text = str(row.get("average_score", "")).strip()
+                    if not model or not score_text:
+                        continue
+                    try:
+                        grouped_scores.setdefault(model, []).append(float(score_text))
+                    except ValueError:
+                        continue
+            for model, scores in grouped_scores.items():
+                record = rows.setdefault(
+                    model,
+                    {"model": model, "avg_latency_ms": "", "average_score": ""},
+                )
+                record["average_score"] = f"{sum(scores) / len(scores):.2f}"
+
+        return [rows[key] for key in SUPPORTED_LLM_MODELS if key in rows] or [
+            {"model": model, "avg_latency_ms": "", "average_score": ""}
+            for model in SUPPORTED_LLM_MODELS
+        ]
+
+    def refresh_models_table(self) -> None:
+        self.models_table.setRowCount(len(self.llm_benchmark_rows))
+        selected_model = self.model_combo.currentText() if hasattr(self, "model_combo") else self.args.default_llm_model
+        for row_index, row in enumerate(self.llm_benchmark_rows):
+            model = row.get("model", "")
+            status = []
+            if model == selected_model:
+                status.append("selected")
+            if model == self.last_used_model:
+                status.append("last used")
+            display_values = [
+                model,
+                row.get("avg_latency_ms", "") or "-",
+                row.get("average_score", "") or "-",
+                ", ".join(status) or "available",
+            ]
+            for col_index, value in enumerate(display_values):
+                item = QTableWidgetItem(value)
+                if model == selected_model:
+                    item.setBackground(QColor("#e8f0ff"))
+                self.models_table.setItem(row_index, col_index, item)
+        if hasattr(self, "models_summary_label"):
+            self.models_summary_label.setText(
+                f"Current selected model: {selected_model} | Last reply model: {self.last_used_model}"
+                + (" (fallback)" if self.last_fallback_used else "")
+            )
+
+    def append_log(self, category: str, message: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        entry = f"[{timestamp}] {category.upper()}: {message}"
+        self.runtime_logs.append(entry)
+        self.runtime_logs = self.runtime_logs[-200:]
+        if hasattr(self, "logs_list"):
+            self.logs_list.insertItem(0, QListWidgetItem(entry))
+            while self.logs_list.count() > 200:
+                self.logs_list.takeItem(self.logs_list.count() - 1)
+            self.logs_summary_label.setText(f"Captured {len(self.runtime_logs)} recent events.")
+
+    def record_attention_history(self, driver_state: dict[str, Any]) -> None:
+        now = time.perf_counter()
+        if now - self._last_history_point_at < 0.5:
+            return
+        self._last_history_point_at = now
+        elapsed = now - self._history_started_at
+        score = float(compute_attention_score(driver_state))
+        self.attention_history.append((elapsed, score))
+        self.attention_history = self.attention_history[-180:]
+        if hasattr(self, "attention_chart"):
+            self.attention_chart.set_points(self.attention_history)
+        if hasattr(self, "history_summary_label") and self.attention_history:
+            scores = [point[1] for point in self.attention_history]
+            self.history_summary_label.setText(
+                f"Current {scores[-1]:.0f}/100 | Avg {sum(scores)/len(scores):.1f} | Min {min(scores):.0f}"
+            )
 
     def add_message(self, text: str, is_user: bool) -> None:
         bubble = ChatBubble(text, is_user=is_user)
@@ -1190,6 +1556,14 @@ class DriverAssistantWindow(QMainWindow):
         closed_eye_duration = float(state.get("closed_eye_duration", 0.0))
         eye_warmup_active = bool(state.get("eye_warmup_active", False))
         eye_warmup_remaining = float(state.get("eye_warmup_remaining", 0.0))
+        self.record_attention_history(state)
+        snapshot = (driver_detected, self.current_emotion, self.current_risk, focus_level)
+        if snapshot != self._last_logged_snapshot:
+            self._last_logged_snapshot = snapshot
+            self.append_log(
+                "vision",
+                f"driver={'yes' if driver_detected else 'no'}, emotion={self.current_emotion}, risk={self.current_risk}, focus_level={focus_level}",
+            )
         self.driver_detected_label.setText("Yes" if driver_detected else "No")
         self.driver_detected_label.setStyleSheet(
             "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
@@ -1247,6 +1621,7 @@ class DriverAssistantWindow(QMainWindow):
 
     def handle_worker_error(self, message: str) -> None:
         self.status_label.setText(f"Status: error - {message}")
+        self.append_log("error", f"Vision worker: {message}")
 
     def handle_model_selection_change(self, model_name: str) -> None:
         self.last_selected_model = model_name
@@ -1254,6 +1629,8 @@ class DriverAssistantWindow(QMainWindow):
         message = f"Selected chat model: {model_name}"
         self.status_label.setText(f"Status: {message}")
         print(message)
+        self.refresh_models_table()
+        self.append_log("models", message)
 
     def push_chat_settings_to_worker(self, *args: object) -> None:
         self.vision_worker.update_chat_settings(
@@ -1270,6 +1647,7 @@ class DriverAssistantWindow(QMainWindow):
         self.add_message(text, is_user=True)
         history_snapshot = list(self.conversation_history)
         self.conversation_history.append({"role": "user", "content": text})
+        self.append_log("chat", f"Manual text input: {text[:80]}")
         self.start_chat_worker(
             user_message=text,
             history_snapshot=history_snapshot,
@@ -1288,6 +1666,10 @@ class DriverAssistantWindow(QMainWindow):
         selected_model = self.model_combo.currentText()
         self.status_label.setText(f"Status: contacting OpenRouter with {selected_model}...")
         print(f"Sending chat request via OpenRouter using model: {selected_model}")
+        self.append_log(
+            "chat",
+            f"Sending {'auto' if auto_trigger else 'manual'} request via {selected_model}",
+        )
         self.chat_worker = ChatWorker(
             chatbot=self.chatbot,
             emotion=self.current_emotion,
@@ -1317,6 +1699,12 @@ class DriverAssistantWindow(QMainWindow):
             f"OpenRouter reply received from {payload['model']} "
             f"in {payload['latency_ms']:.0f} ms"
         )
+        self.refresh_models_table()
+        self.append_log(
+            "chat",
+            f"Reply via {payload['model']} in {payload['latency_ms']:.0f} ms"
+            + (" (fallback)" if self.last_fallback_used else ""),
+        )
         self.status_label.setText(
             f"Status: OpenRouter reply in {payload['latency_ms']:.0f} ms via {payload['model']}"
             + (" (fallback)" if self.last_fallback_used else "")
@@ -1325,6 +1713,7 @@ class DriverAssistantWindow(QMainWindow):
     def handle_chat_error(self, message: str) -> None:
         self.status_label.setText(f"Status: chatbot error - {message}")
         print(f"Chat error: {message}", flush=True)
+        self.append_log("error", f"Chatbot: {message}")
 
     def handle_voice_dialogue_result(self, payload: dict[str, Any]) -> None:
         user_input = str(payload.get("user_input", "")).strip()
@@ -1342,22 +1731,31 @@ class DriverAssistantWindow(QMainWindow):
             f"Last reply model: {self.last_used_model}"
             + (" (fallback)" if self.last_fallback_used else "")
         )
+        self.refresh_models_table()
         latency_ms = payload.get("latency_ms")
         if isinstance(latency_ms, (int, float)):
             self.status_label.setText(
                 f"Status: voice dialogue reply in {float(latency_ms):.0f} ms via {model}"
                 + (" (fallback)" if self.last_fallback_used else "")
             )
+            self.append_log(
+                "voice",
+                f"Voice dialogue reply via {model} in {float(latency_ms):.0f} ms"
+                + (" (fallback)" if self.last_fallback_used else ""),
+            )
         else:
             self.status_label.setText(f"Status: voice dialogue completed via {model}")
+            self.append_log("voice", f"Voice dialogue completed via {model}")
 
     def handle_voice_dialogue_error(self, message: str) -> None:
         if message.strip() == "No speech detected.":
             self.status_label.setText("Status: no speech detected")
             print("Voice dialogue: no speech detected", flush=True)
+            self.append_log("voice", "No follow-up speech detected")
             return
         self.status_label.setText(f"Status: voice dialogue error - {message}")
         print(f"Voice dialogue error: {message}", flush=True)
+        self.append_log("error", f"Voice dialogue: {message}")
 
     def clear_chat_worker(self) -> None:
         self.send_button.setEnabled(True)
@@ -1398,6 +1796,7 @@ class DriverAssistantWindow(QMainWindow):
         if self.continued_listener is not None:
             self.continued_listener.start()
             self.status_label.setText("Status: listening for follow-up (10 s)...")
+            self.append_log("voice", "Entered 10-second follow-up listening window")
 
     def start_recording(self, push_to_talk: bool = False) -> None:
         """Start recording.
@@ -1410,6 +1809,7 @@ class DriverAssistantWindow(QMainWindow):
         if push_to_talk:
             self.status_label.setText("Status: recording (push-to-talk)...")
             self.mic_button.setText("Recording...")
+            self.append_log("voice", "Push-to-talk recording started")
             # Push-to-talk: disable VAD, stop on explicit release.
             self.speech_worker = SpeechWorker(
                 self.args.whisper_model_size,
@@ -1419,6 +1819,7 @@ class DriverAssistantWindow(QMainWindow):
         else:
             self.status_label.setText("Status: recording audio (auto-stop on silence)...")
             self.mic_button.setText("Recording...")
+            self.append_log("voice", "Voice recording started with VAD")
             # Use configured max duration and silence threshold with VAD.
             self.speech_worker = SpeechWorker(
                 self.args.whisper_model_size,
@@ -1436,11 +1837,13 @@ class DriverAssistantWindow(QMainWindow):
     def stop_recording(self) -> None:
         if self.speech_worker is not None:
             self.speech_worker.stop_recording()
+            self.append_log("voice", "Recording stop requested")
 
     def handle_transcription(self, text: str) -> None:
         self.input_edit.setText(text)
         if text.strip():
             self.status_label.setText("Status: transcription ready")
+            self.append_log("voice", f"Transcription ready: {text[:80]}")
             self.send_text_message()
         else:
             # 空转录：如果还在 continued 窗口，重新等；否则恢复 wake-word
@@ -1453,9 +1856,11 @@ class DriverAssistantWindow(QMainWindow):
                     self.wake_word_listener.start()
                     self.wake_word_listening = True
                 self.status_label.setText("Status: listening for 'hey moss'")
+            self.append_log("voice", "Empty transcription result")
 
     def handle_speech_error(self, message: str) -> None:
         self.status_label.setText(f"Status: speech error - {message}")
+        self.append_log("error", f"Speech: {message}")
 
     def clear_speech_worker(self) -> None:
         self.speech_worker = None
@@ -1472,6 +1877,7 @@ class DriverAssistantWindow(QMainWindow):
                 self.wake_word_listener.start()
                 self.wake_word_listening = True
             self.status_label.setText("Status: listening for 'hey moss'")
+        self.append_log("voice", "Speech worker cleared")
     
     def toggle_wake_word_listening(self) -> None:
         """Toggle wake-word listening on/off."""
@@ -1479,6 +1885,7 @@ class DriverAssistantWindow(QMainWindow):
             return
         # Wake-word listening runs in background by default. This toggle is a no-op.
         self.status_label.setText("Status: wake-word listening is always enabled in background")
+        self.append_log("voice", "Wake-word toggle pressed; listener stays on")
 
     def on_wake_word_detected(self) -> None:
         """Callback when wake-word is detected; trigger 5-second recording."""
@@ -1486,6 +1893,7 @@ class DriverAssistantWindow(QMainWindow):
             return
         self.status_label.setText("Status: wake-word detected! Recording for 5 seconds...")
         print("[Wake-word] Triggered speech recording.")
+        self.append_log("voice", "Wake-word detected")
         self.start_recording()
 
     def on_continued_voice_detected(self) -> None:
@@ -1494,6 +1902,7 @@ class DriverAssistantWindow(QMainWindow):
             return
         # continued listener 内部已把 _running 置 False，线程会自己退出
         self.status_label.setText("Status: follow-up voice detected, recording...")
+        self.append_log("voice", "Follow-up speech detected")
         self.start_recording(push_to_talk=False)
         
     def on_continued_timeout(self) -> None:
@@ -1503,6 +1912,7 @@ class DriverAssistantWindow(QMainWindow):
             self.wake_word_listener.start()
             self.wake_word_listening = True
         self.status_label.setText("Status: listening for 'hey moss'")
+        self.append_log("voice", "Follow-up timeout; returned to wake-word listening")
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
         if self.wake_word_listener is not None and self.wake_word_listening:
