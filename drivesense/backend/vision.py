@@ -872,11 +872,28 @@ def main() -> None:
             )
 
             if warning_active:
+                # Choose alert text based on trigger reason.
+                focus_snap = focus_monitor.get_state_snapshot()
+                emotion_warning = focus_snap.get("emotion_warning_active", False)
+                if emotion_warning:
+                    streak_label = focus_snap.get("emotion_streak_label", "")
+                    streak_dur = focus_snap.get("emotion_streak_duration", 0.0)
+                    alert_text = f"{streak_label.capitalize()} detected - Please calm down"
+                    alert_color = {
+                        "anger": (0, 0, 255),
+                        "fear": (0, 165, 255),
+                        "sad": (255, 90, 0),
+                        "disgust": (180, 0, 180),
+                        "surprise": (0, 255, 255),
+                    }.get(streak_label, (0, 0, 255))
+                else:
+                    alert_text = "Please stay focused"
+                    alert_color = (0, 0, 255)
                 draw_tag(
                     frame,
-                    "Please stay focused",
+                    alert_text,
                     (30, 110),
-                    (0, 0, 255),
+                    alert_color,
                     (0, 0, 0),
                     scale=1.6,
                     thickness=4,
