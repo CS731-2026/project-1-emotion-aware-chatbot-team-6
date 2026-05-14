@@ -782,13 +782,27 @@ class VisionWorker(QObject):
                     cv2.LINE_AA,
                 )
                 if last_state.get("focus_level", 0) >= 1:
-                    alert_text = (
-                        "Please stay focused"
-                        if last_state.get("focus_level", 0) >= 2
-                        else "Stay attentive"
-                    )
+                    emotion_warn = last_state.get("emotion_warning_active", False)
+                    focus_lvl = last_state.get("focus_level", 0)
+                    if emotion_warn and focus_lvl >= 2:
+                        streak_label = str(last_state.get("emotion_streak_label", "")).capitalize()
+                        streak_dur = float(last_state.get("emotion_streak_duration", 0.0))
+                        alert_text = f"{streak_label} detected - Please calm down"
+                        alert_bgr = {
+                            "anger": (0, 0, 255),
+                            "fear": (0, 165, 255),
+                            "sad": (255, 90, 0),
+                            "disgust": (180, 0, 180),
+                            "surprise": (0, 255, 255),
+                        }.get(streak_label.lower(), (0, 0, 255))
+                    elif focus_lvl >= 2:
+                        alert_text = "Please stay focused"
+                        alert_bgr = (0, 0, 255)
+                    else:
+                        alert_text = "Stay attentive"
+                        alert_bgr = (0, 165, 255)
                     font = cv2.FONT_HERSHEY_SIMPLEX
-                    scale = 1.0 if last_state.get("focus_level", 0) >= 2 else 0.8
+                    scale = 1.0 if focus_lvl >= 2 else 0.8
                     thickness = 3
                     (text_w, text_h), baseline = cv2.getTextSize(
                         alert_text, font, scale, thickness
@@ -805,7 +819,7 @@ class VisionWorker(QObject):
                         (x1 + 20, y2 - 12),
                         font,
                         scale,
-                        (0, 0, 255),
+                        alert_bgr,
                         thickness,
                         cv2.LINE_AA,
                     )
@@ -1096,12 +1110,16 @@ class DriverAssistantWindow(QMainWindow):
         self.risk_label = QLabel("OK")
         self.focus_label = QLabel("OK")
         self.reason_label = QLabel("none")
+        self.emotion_streak_label = QLabel("none")
+        self.emotion_alerts_label = QLabel("0")
         add_metric_row("Driver detected", self.driver_detected_label)
         add_metric_row("Emotion", self.emotion_label)
         add_metric_row("Eyes", self.eye_label)
         add_metric_row("Risk", self.risk_label)
         add_metric_row("Focus", self.focus_label)
         add_metric_row("Reason", self.reason_label)
+        add_metric_row("Emotion streak", self.emotion_streak_label)
+        add_metric_row("Emotion alerts", self.emotion_alerts_label)
 
         meta_block = QVBoxLayout()
         meta_block.setContentsMargins(0, 14, 0, 0)
@@ -1591,11 +1609,16 @@ class DriverAssistantWindow(QMainWindow):
         self.risk_label.setStyleSheet(
             f"color: {risk_color_hex(self.current_risk)}; font-size: 17px; font-weight: 700; border: none; background: transparent;"
         )
-        self.focus_label.setText(
-            "Please stay focused"
-            if state["focus_alert"]
-            else ("Stay attentive" if focus_level == 1 else "OK")
-        )
+        emotion_warning = bool(state.get("emotion_warning_active", False))
+        if state["focus_alert"] and emotion_warning:
+            streak_lbl = str(state.get("emotion_streak_label", "")).capitalize()
+            self.focus_label.setText(f"{streak_lbl} alert active")
+        elif state["focus_alert"]:
+            self.focus_label.setText("Please stay focused")
+        elif focus_level == 1:
+            self.focus_label.setText("Stay attentive")
+        else:
+            self.focus_label.setText("OK")
         self.focus_label.setStyleSheet(
             "color: #e53935; font-size: 17px; font-weight: 700; border: none; background: transparent;"
             if state["focus_alert"]
@@ -1606,11 +1629,40 @@ class DriverAssistantWindow(QMainWindow):
             )
         )
         if trigger_reason:
-            self.reason_label.setText(
-                f"{trigger_reason} ({closed_eye_duration:.1f}s)"
-            )
+            self.reason_label.setText(trigger_reason)
         else:
             self.reason_label.setText("none")
+        # Emotion streak display
+        emotion_streak_lbl = str(state.get("emotion_streak_label", "neutral"))
+        emotion_streak_dur = float(state.get("emotion_streak_duration", 0.0))
+        if emotion_streak_lbl not in ("neutral", "happy") and emotion_streak_dur > 1.0:
+            self.emotion_streak_label.setText(
+                f"{emotion_streak_lbl} ({emotion_streak_dur:.1f}s)"
+            )
+            self.emotion_streak_label.setStyleSheet(
+                f"color: {emotion_color_hex(emotion_streak_lbl)}; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            )
+        else:
+            self.emotion_streak_label.setText("none")
+            self.emotion_streak_label.setStyleSheet(
+                "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            )
+        # Emotion alert counter
+        emotion_trigger_count = int(state.get("emotion_trigger_count", 0))
+        emotion_breakdown = state.get("emotion_trigger_breakdown", {})
+        if emotion_trigger_count > 0 and emotion_breakdown:
+            parts = [f"{k} x{v}" for k, v in emotion_breakdown.items()]
+            self.emotion_alerts_label.setText(
+                f"{emotion_trigger_count} ({', '.join(parts)})"
+            )
+            self.emotion_alerts_label.setStyleSheet(
+                "color: #e53935; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            )
+        else:
+            self.emotion_alerts_label.setText("0")
+            self.emotion_alerts_label.setStyleSheet(
+                "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            )
         self.driver_label.setText(f"Driver heuristic: {state['driver_side']}")
         self.model_label.setText(f"Selected model: {self.model_combo.currentText()}")
         fallback_suffix = " (fallback)" if self.last_fallback_used else ""
