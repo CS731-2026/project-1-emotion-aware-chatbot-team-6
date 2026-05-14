@@ -12,7 +12,7 @@ from typing import Any, cast
 import cv2
 import torch
 from PyQt5.QtCore import QObject, QMetaObject, Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QColor, QCloseEvent, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtGui import QColor, QCloseEvent, QGuiApplication, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -965,7 +965,7 @@ class DriverAssistantWindow(QMainWindow):
         super().__init__()
         self.args = args
         self.setWindowTitle("DriveSense")
-        self.resize(1500, 900)
+        self.apply_initial_window_geometry()
 
         self.current_emotion = "neutral"
         self.current_risk = "OK"
@@ -1331,6 +1331,22 @@ class DriverAssistantWindow(QMainWindow):
         )
         self.switch_page("Dashboard")
         self.append_log("system", "DriveSense GUI ready")
+
+    def apply_initial_window_geometry(self) -> None:
+        app = QGuiApplication.instance()
+        screen = app.primaryScreen() if app is not None else None
+        if screen is None:
+            self.resize(1500, 900)
+            return
+
+        available = screen.availableGeometry()
+        width = min(1500, max(960, available.width() - 48))
+        height = min(900, max(700, available.height() - 48))
+        width = min(width, available.width())
+        height = min(height, available.height())
+        x = available.x() + max(0, (available.width() - width) // 2)
+        y = available.y() + max(0, (available.height() - height) // 2)
+        self.setGeometry(x, y, width, height)
 
     def nav_button_style(self, active: bool) -> str:
         return (
