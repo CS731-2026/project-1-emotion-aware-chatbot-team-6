@@ -140,6 +140,7 @@ class WakeWordListener:
                             sample_rate=16000,
                             channels=1,
                             vad_enabled=False,
+                            wait_for_lock=False,
                         )
 
                         if audio.size == 0:
@@ -261,6 +262,7 @@ class ContinuedConversationListener:
                             sample_rate=16000,
                             channels=1,
                             vad_enabled=False,
+                            wait_for_lock=False,
                         )
                         if audio.size == 0:
                             continue

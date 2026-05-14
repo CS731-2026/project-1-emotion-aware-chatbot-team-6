@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import cv2
 import torch
-from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot   
+from PyQt5.QtCore import QObject, QMetaObject, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QColor, QCloseEvent, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -65,7 +65,14 @@ from drivesense.backend.vision import (
     resolve_latest_timm_model,
     save_eye_debug_crop,
 )
-from drivesense.backend.speech import TextToSpeech, WhisperTranscriber, record_microphone_audio
+from drivesense.backend.speech import (
+    TextToSpeech,
+    TTS_PRIORITY_CHAT,
+    WhisperTranscriber,
+    detect_text_language,
+    is_supported_zh_en_text,
+    record_microphone_audio,
+)
 from drivesense.backend.wake_word import WakeWordListener, WakeWordConfig, ContinuedConversationListener
 
 
@@ -945,7 +952,10 @@ class SpeechWorker(QThread):
 
             transcriber = self.get_transcriber(self.model_size)
             result = transcriber.transcribe_audio(audio, sample_rate=16000)
-            self.transcription_ready.emit(result.text)
+            text = result.text.strip()
+            if text and not is_supported_zh_en_text(text):
+                raise ValueError("Only Chinese and English voice input is supported.")
+            self.transcription_ready.emit(text)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -991,6 +1001,7 @@ class DriverAssistantWindow(QMainWindow):
         self.wake_word_listener: WakeWordListener | None = None
         self.continued_listener: ContinuedConversationListener | None = None
         self._in_continued_mode = False
+        self.reply_tts = TextToSpeech(rate=150, volume=1.0)
         self.llm_benchmark_rows = self.load_llm_benchmark_rows()
 
         try:
@@ -1694,6 +1705,10 @@ class DriverAssistantWindow(QMainWindow):
         text = self.input_edit.text().strip()
         if not text or self.chatbot is None or self.chat_worker is not None:
             return
+        if not is_supported_zh_en_text(text):
+            self.status_label.setText("Status: only Chinese and English text input is supported")
+            self.append_log("error", "Rejected unsupported text input")
+            return
 
         self.input_edit.clear()
         self.add_message(text, is_user=True)
@@ -1814,41 +1829,59 @@ class DriverAssistantWindow(QMainWindow):
         # mic_button is hidden; no state toggle necessary.
         self.chat_worker = None
 
-    def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
-        if not text.strip():
-            # 没有 TTS 也要启动 continued listener
-            self._on_tts_finished()
-            return
-
-        def worker() -> None:
-            try:
-                tts = TextToSpeech(rate=150, volume=1.0)
-                tts.speak(text, emotion=emotion, wait=True)
-            except Exception as exc:
-                print(f"TTS error: {exc}")
-            finally:
-                # 回到主线程再操作 Qt 对象
-                from PyQt5.QtCore import QMetaObject, Qt as QtNS
-                QMetaObject.invokeMethod(
-                    self, "_on_tts_finished",
-                    QtNS.ConnectionType.QueuedConnection,
-                )
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @pyqtSlot()
-    def _on_tts_finished(self) -> None:
-        """TTS 播完后在主线程调用，此时才启动 continued listener。"""
-        # 停 wake-word，避免两个 InputStream 同时开着
+    def _pause_voice_listeners_for_tts(self) -> None:
+        if self.continued_listener is not None:
+            self.continued_listener.stop()
         if self.wake_word_listener is not None and self.wake_word_listening:
             self.wake_word_listener.stop()
             self.wake_word_listening = False
 
+    def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
+        if not text.strip():
+            self._on_tts_finished()
+            return
+
+        self._pause_voice_listeners_for_tts()
+        self.status_label.setText("Status: speaking assistant reply...")
+        self.append_log("voice", f"Speaking assistant reply: {text[:80]}")
+
+        def on_done() -> None:
+            QMetaObject.invokeMethod(
+                self,
+                "_on_tts_finished",
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        def on_error(exc: BaseException) -> None:
+            print(f"TTS error: {exc}")
+            QMetaObject.invokeMethod(
+                self,
+                "_on_tts_failed",
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        self.reply_tts.speak(
+            text,
+            emotion=emotion,
+            wait=False,
+            on_done=on_done,
+            on_error=on_error,
+            priority=TTS_PRIORITY_CHAT,
+        )
+
+    @pyqtSlot()
+    def _on_tts_finished(self) -> None:
         self._in_continued_mode = True
         if self.continued_listener is not None:
             self.continued_listener.start()
             self.status_label.setText("Status: listening for follow-up (10 s)...")
             self.append_log("voice", "Entered 10-second follow-up listening window")
+
+    @pyqtSlot()
+    def _on_tts_failed(self) -> None:
+        self.status_label.setText("Status: assistant reply audio failed")
+        self.append_log("error", "Assistant reply TTS failed")
+        self._on_tts_finished()
 
     def start_recording(self, push_to_talk: bool = False) -> None:
         """Start recording.
@@ -1894,6 +1927,12 @@ class DriverAssistantWindow(QMainWindow):
     def handle_transcription(self, text: str) -> None:
         self.input_edit.setText(text)
         if text.strip():
+            detected_language = detect_text_language(text)
+            if detected_language is None or not is_supported_zh_en_text(text):
+                self.status_label.setText("Status: only Chinese and English voice input is supported")
+                self.append_log("error", "Rejected unsupported voice transcription")
+                self.input_edit.clear()
+                return
             self.status_label.setText("Status: transcription ready")
             self.append_log("voice", f"Transcription ready: {text[:80]}")
             self.send_text_message()
@@ -1911,6 +1950,10 @@ class DriverAssistantWindow(QMainWindow):
             self.append_log("voice", "Empty transcription result")
 
     def handle_speech_error(self, message: str) -> None:
+        if message.strip() == "Only Chinese and English voice input is supported.":
+            self.status_label.setText("Status: only Chinese and English voice input is supported")
+            self.append_log("error", "Speech: unsupported language")
+            return
         self.status_label.setText(f"Status: speech error - {message}")
         self.append_log("error", f"Speech: {message}")
 

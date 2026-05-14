@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from drivesense.backend.chatbot import ChatbotResponse, DriverAssistantChatbot
-from drivesense.backend.speech import TextToSpeech
+from drivesense.backend.speech import TTS_PRIORITY_ALERT, TextToSpeech
 from drivesense.backend.voice_chat import NoSpeechDetectedError, VoiceChatPipeline
 
 logger = logging.getLogger(__name__)
@@ -461,6 +461,8 @@ class FocusMonitor:
                         alert_sentence,
                         emotion=emotion,
                         wait=True,
+                        priority=TTS_PRIORITY_ALERT,
+                        drop_pending_below_priority=TTS_PRIORITY_ALERT,
                     )
                 except Exception as exc:
                     logger.exception("TTS speak failed: %s", exc)

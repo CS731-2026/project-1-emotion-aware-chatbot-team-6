@@ -4,10 +4,11 @@ import argparse
 import tempfile
 import threading
 import time
+import unicodedata
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import sounddevice as sd
@@ -15,6 +16,10 @@ import torch
 from faster_whisper import WhisperModel
 
 from drivesense.backend.tts_queue import TTSQueue
+
+TTS_PRIORITY_CHAT = 10
+TTS_PRIORITY_VOICE_REPLY = 50
+TTS_PRIORITY_ALERT = 100
 
 
 @dataclass
@@ -25,6 +30,81 @@ class TranscriptionResult:
     audio_path: str
 
 
+class VoiceIOGate:
+    """Global guard for microphone access and full voice sessions."""
+
+    _mic_lock = threading.Lock()
+    _session_lock = threading.Lock()
+
+    @classmethod
+    def acquire_microphone(
+        cls,
+        blocking: bool = True,
+        timeout: float | None = None,
+    ) -> bool:
+        if not blocking:
+            return cls._mic_lock.acquire(blocking=False)
+        if timeout is None:
+            return cls._mic_lock.acquire(blocking=blocking)
+        return cls._mic_lock.acquire(blocking=blocking, timeout=timeout)
+
+    @classmethod
+    def release_microphone(cls) -> None:
+        if cls._mic_lock.locked():
+            cls._mic_lock.release()
+
+    @classmethod
+    def acquire_session(
+        cls,
+        blocking: bool = True,
+        timeout: float | None = None,
+    ) -> bool:
+        if not blocking:
+            return cls._session_lock.acquire(blocking=False)
+        if timeout is None:
+            return cls._session_lock.acquire(blocking=blocking)
+        return cls._session_lock.acquire(blocking=blocking, timeout=timeout)
+
+    @classmethod
+    def release_session(cls) -> None:
+        if cls._session_lock.locked():
+            cls._session_lock.release()
+
+
+def detect_text_language(text: str) -> str | None:
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    cjk_count = sum(1 for char in stripped if "\u4e00" <= char <= "\u9fff")
+    latin_count = sum(1 for char in stripped if char.isascii() and char.isalpha())
+    if cjk_count > 0:
+        return "zh"
+    if latin_count > 0:
+        return "en"
+    return None
+
+
+def is_supported_zh_en_text(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if detect_text_language(stripped) is None:
+        return False
+
+    for char in stripped:
+        if char.isspace():
+            continue
+        if "\u4e00" <= char <= "\u9fff":
+            continue
+        if char.isascii():
+            continue
+        category = unicodedata.category(char)
+        if category.startswith("P") or category.startswith("S"):
+            continue
+        return False
+    return True
+
+
 def record_microphone_audio(
     duration_seconds: float = 5.0,
     sample_rate: int = 16000,
@@ -33,6 +113,8 @@ def record_microphone_audio(
     vad_enabled: bool = True,
     min_duration_seconds: float = 0.5,
     silence_duration_seconds: float = 1.0,
+    wait_for_lock: bool = True,
+    lock_timeout_seconds: float | None = None,
 ) -> np.ndarray:
     """Record audio from microphone with optional voice activity detection (VAD).
     
@@ -48,6 +130,12 @@ def record_microphone_audio(
     Returns:
         Recorded audio as numpy array.
     """
+    if not VoiceIOGate.acquire_microphone(
+        blocking=wait_for_lock,
+        timeout=lock_timeout_seconds,
+    ):
+        return np.empty((0,), dtype=np.float32)
+
     chunks: list[np.ndarray] = []
 
     def callback(indata, frames, time_info, status) -> None:
@@ -55,50 +143,50 @@ def record_microphone_audio(
             print(f"Audio status: {status}")
         chunks.append(indata.copy())
 
-    with sd.InputStream(
-        samplerate=sample_rate,
-        channels=channels,
-        dtype="float32",
-        callback=callback,
-    ):
-        started_at = time.perf_counter()
-        last_voice_time = started_at  # Track when we last detected voice
-        vad_threshold = 0.02  # Energy threshold for voice detection (RMS)
-        chunk_duration = 0.05  # Process every 50ms for responsiveness
+    try:
+        with sd.InputStream(
+            samplerate=sample_rate,
+            channels=channels,
+            dtype="float32",
+            callback=callback,
+        ):
+            started_at = time.perf_counter()
+            last_voice_time = started_at  # Track when we last detected voice
+            vad_threshold = 0.02  # Energy threshold for voice detection (RMS)
+            chunk_duration = 0.05  # Process every 50ms for responsiveness
 
-        while time.perf_counter() - started_at < duration_seconds:
-            if stop_event and stop_event.is_set():
-                break
+            while time.perf_counter() - started_at < duration_seconds:
+                if stop_event and stop_event.is_set():
+                    break
 
-            elapsed = time.perf_counter() - started_at
+                elapsed = time.perf_counter() - started_at
 
-            # Check for prolonged silence if VAD is enabled.
-            if vad_enabled and elapsed >= min_duration_seconds:
-                if chunks:
-                    # Compute RMS energy of most recent chunk.
-                    recent_chunk = chunks[-1]
-                    rms_energy = np.sqrt(np.mean(recent_chunk**2))
+                # Check for prolonged silence if VAD is enabled.
+                if vad_enabled and elapsed >= min_duration_seconds:
+                    if chunks:
+                        recent_chunk = chunks[-1]
+                        rms_energy = np.sqrt(np.mean(recent_chunk**2))
 
-                    if rms_energy > vad_threshold:
-                        # Voice detected; update last voice time.
-                        last_voice_time = time.perf_counter()
-                    else:
-                        # Silence detected; check if prolonged.
-                        silence_duration = time.perf_counter() - last_voice_time
-                        if silence_duration >= silence_duration_seconds:
-                            print(
-                                f"[VAD] Detected {silence_duration:.1f}s of silence; "
-                                f"stopping early at {elapsed:.1f}s"
-                            )
-                            break
+                        if rms_energy > vad_threshold:
+                            last_voice_time = time.perf_counter()
+                        else:
+                            silence_duration = time.perf_counter() - last_voice_time
+                            if silence_duration >= silence_duration_seconds:
+                                print(
+                                    f"[VAD] Detected {silence_duration:.1f}s of silence; "
+                                    f"stopping early at {elapsed:.1f}s"
+                                )
+                                break
 
-            sd.sleep(int(chunk_duration * 1000))
+                sd.sleep(int(chunk_duration * 1000))
 
-    if not chunks:
-        return np.empty((0,), dtype=np.float32)
+        if not chunks:
+            return np.empty((0,), dtype=np.float32)
 
-    audio = np.concatenate(chunks, axis=0).squeeze()
-    return audio.astype(np.float32)
+        audio = np.concatenate(chunks, axis=0).squeeze()
+        return audio.astype(np.float32)
+    finally:
+        VoiceIOGate.release_microphone()
 
 
 def save_wav(audio: np.ndarray, sample_rate: int, output_path: Path) -> None:
@@ -266,7 +354,16 @@ class TextToSpeech:
         engine.say(spoken_text)
         engine.runAndWait()
 
-    def speak(self, text: str, emotion: str | None = None, wait: bool = False) -> None:
+    def speak(
+        self,
+        text: str,
+        emotion: str | None = None,
+        wait: bool = False,
+        on_done: Callable[[], None] | None = None,
+        on_error: Callable[[BaseException], None] | None = None,
+        priority: int = TTS_PRIORITY_CHAT,
+        drop_pending_below_priority: int | None = None,
+    ) -> None:
         """Queue speech on the shared TTS worker thread."""
         spoken_text = self.prepare_spoken_text(text)
         if not spoken_text:
@@ -275,6 +372,10 @@ class TextToSpeech:
         TTSQueue.instance().submit(
             lambda: self._speak_now(spoken_text, emotion=emotion),
             wait=wait,
+            on_done=on_done,
+            on_error=on_error,
+            priority=priority,
+            drop_pending_below_priority=drop_pending_below_priority,
         )
 
 
