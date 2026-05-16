@@ -1,42 +1,55 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
 
 PROJECT_ROOT = Path(r"G:\731")
 ENTRY_SCRIPT = PROJECT_ROOT / "drivesense" / "frontend" / "gui.py"
 
 
-def add_data_dir(source: Path, target: str) -> list[tuple[str, str]]:
+def add_data_path(source: Path, target: str) -> list[tuple[str, str]]:
     return [(str(source), target)] if source.exists() else []
 
 
 datas: list[tuple[str, str]] = []
-datas += add_data_dir(PROJECT_ROOT / "weights", "weights")
-datas += add_data_dir(PROJECT_ROOT / "runs_timm", "runs_timm")
-datas += add_data_dir(PROJECT_ROOT / "benchmark_results", "benchmark_results")
-datas += add_data_dir(PROJECT_ROOT / ".env", ".")
+datas += add_data_path(PROJECT_ROOT / "weights", "weights")
+datas += add_data_path(PROJECT_ROOT / "runs_timm", "runs_timm")
+datas += add_data_path(PROJECT_ROOT / "benchmark_results", "benchmark_results")
+datas += add_data_path(PROJECT_ROOT / ".env", ".")
 
+# Runtime packages that actually need bundled non-Python assets.
+datas += collect_data_files("ultralytics")
+datas += collect_data_files("timm", includes=["**/*.json", "**/*.txt"])
+datas += collect_data_files("faster_whisper")
+
+# CTranslate2 ships native libraries that are required at runtime.
 binaries: list[tuple[str, str]] = []
-hiddenimports: list[str] = []
+binaries += collect_dynamic_libs("ctranslate2")
 
-for package_name in [
-    "ultralytics",
-    "torch",
-    "torchvision",
-    "torchaudio",
-    "faster_whisper",
-    "ctranslate2",
-    "pyttsx3",
-    "openai",
-    "dotenv",
+# Keep hidden imports narrow. Torch / torchvision / PyQt5 already have
+# first-party PyInstaller hooks; forcing collect_all() on them makes DLL
+# discovery explode and is the main reason packaging stalls.
+hiddenimports: list[str] = []
+hiddenimports += collect_submodules("timm")
+hiddenimports += collect_submodules("faster_whisper")
+hiddenimports += collect_submodules("pyttsx3.drivers")
+hiddenimports += [
     "sounddevice",
-]:
-    pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package_name)
-    datas += pkg_datas
-    binaries += pkg_binaries
-    hiddenimports += pkg_hiddenimports
+    "dotenv",
+    "openai",
+]
+
+excludes = [
+    "torchaudio",
+    "tkinter",
+    "matplotlib.tests",
+    "numpy.tests",
+]
 
 
 a = Analysis(
@@ -48,7 +61,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     noarchive=False,
     optimize=0,
 )
@@ -63,7 +76,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
 )
@@ -73,7 +86,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name="DriveSense",
 )

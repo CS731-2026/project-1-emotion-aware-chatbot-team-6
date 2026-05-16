@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 import threading
 import time
@@ -10,6 +11,37 @@ from pathlib import Path
 from typing import Any, cast
 
 import cv2
+
+
+def configure_frozen_dll_search_paths() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return
+
+    internal_root = Path(meipass)
+    dll_dirs = [
+        internal_root,
+        internal_root / "torch" / "lib",
+        internal_root / "ctranslate2",
+        internal_root / "cv2",
+    ]
+
+    existing_dirs: list[str] = []
+    for dll_dir in dll_dirs:
+        if dll_dir.exists():
+            existing_dirs.append(str(dll_dir))
+            if hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(str(dll_dir))
+
+    if existing_dirs:
+        os.environ["PATH"] = os.pathsep.join(existing_dirs + [os.environ.get("PATH", "")])
+
+
+configure_frozen_dll_search_paths()
+
 import torch
 from PyQt5.QtCore import QObject, QMetaObject, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QColor, QCloseEvent, QGuiApplication, QImage, QPainter, QPen, QPixmap

@@ -7,6 +7,51 @@
 
 DriveSense 是一个课程研究原型系统，用于实时驾驶员状态监测与简短对话辅助。系统把摄像头视觉、语音转文字、文字转语音和基于 OpenRouter 的大语言模型整合到同一个桌面应用中。
 
+## 常用命令
+
+### 激活环境
+
+```powershell
+cd G:\731
+.\.venv311\Scripts\activate
+```
+
+### 运行 GUI
+
+```powershell
+python -m drivesense.frontend.gui --device cuda
+```
+
+### 准备数据集
+
+```powershell
+python -m drivesense.data.prepare_dataset --overwrite
+```
+
+### 训练表情模型
+
+```powershell
+python -m drivesense.training.train_emotion_timm --model-key efficientnet_b0 --epochs 20 --batch-size 32 --img-size 224 --device cuda --overwrite
+```
+
+### 训练眼睛状态模型
+
+```powershell
+python -m drivesense.training.train_eye_timm --device cuda --overwrite
+```
+
+### 运行 LLM 对比实验
+
+```powershell
+python -m drivesense.benchmarks.llm_benchmark
+```
+
+### 打包生成 `.exe`
+
+```powershell
+G:\731\.venv311\Scripts\pyinstaller.exe G:\731\DriveSense.spec
+```
+
 ## 组员分工
 
 - **Peirou Zhang**：表情分类模型对比、语音输入输出
@@ -30,8 +75,8 @@ DriveSense 是一个课程研究原型系统，用于实时驾驶员状态监测
 系统按职责拆分为几个部分：
 
 - **YOLOv8 人脸检测**：负责定位人脸
-- **timm 表情分类器**：负责对人脸做表情分类
-- **timm 眼睛分类器**：负责对裁剪出的眼部区域做睁眼/闭眼分类
+- **timm 表情分类器**：负责人脸级表情分类
+- **timm 眼睛分类器**：负责对裁剪出的眼部区域做睁眼 / 闭眼分类
 - **FocusMonitor**：负责闭眼计时、专注提醒、蜂鸣、短句 TTS 和可选语音对话
 - **PyQt5 GUI**：负责实时画面、状态信息和聊天界面
 
@@ -57,9 +102,9 @@ flowchart LR
 
 ### 驾驶员选择逻辑
 
-当前系统不会把所有人脸一视同仁处理。
+当画面中存在多张人脸时，系统不会平均处理所有人脸。
 
-它会先过滤掉明显太小、太远的人脸，再从候选里选出驾驶员。当前默认规则是：
+它会先过滤掉明显太小、太远的人脸，再从候选中选出驾驶员。当前默认规则是：
 
 - 先保留“主要人脸候选”
 - 再从中选择**画面最左边**的人脸作为 driver
@@ -97,7 +142,7 @@ flowchart LR
 - 文字输入会得到：**文字回复 + 语音播报**
 - 手动语音输入会得到：**转写文本显示到聊天框 + 回复文本显示到聊天框 + 语音播报**
 - 闭眼自动触发语音干预时，也会把：**转写文本 + 模型回复** 同步显示到 GUI 聊天框
-- 所有 TTS 播放统一走**全局单消费者队列**，避免 Windows 下 `pyttsx3` 多线程抢锁
+- 所有 TTS 播放统一走**全局单消费者队列**，避免 Windows 下 `pyttsx3` 多线程抢占
 
 ## OpenRouter 与 LLM
 
@@ -147,7 +192,7 @@ GUI 当前支持以下模型：
 - `Please stay focused. Are you okay?`
 - `Please stay focused. Eyes on the road.`
 
-另外，`FocusMonitor` 触发干预前已经会同步更新 `risk` 和 `focus_alert`，所以 LLM 看到的是正确的疲劳场景状态，不会再出现“实际上在闭眼告警，但 prompt 里还是正常状态”的时序错位。
+另外，`FocusMonitor` 触发干预前已经会同步更新 `risk` 和 `focus_alert`，所以 LLM 看到的是正确的触发帧状态。
 
 ## 项目结构
 
@@ -156,6 +201,7 @@ G:\731
 |-- README.md
 |-- README.zh-CN.md
 |-- requirements.txt
+|-- DriveSense.spec
 |-- drivesense/
 |   |-- __main__.py
 |   |-- frontend/
