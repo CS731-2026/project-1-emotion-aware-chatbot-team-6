@@ -462,7 +462,6 @@ class FocusMonitor:
                         emotion=emotion,
                         wait=True,
                         priority=TTS_PRIORITY_ALERT,
-                        drop_pending_below_priority=TTS_PRIORITY_ALERT,
                     )
                 except Exception as exc:
                     logger.exception("TTS speak failed: %s", exc)

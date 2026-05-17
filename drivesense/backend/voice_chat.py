@@ -54,7 +54,11 @@ class VoiceChatPipeline:
         tts_volume: float = 1.0,
     ) -> None:
         self.chatbot = chatbot
-        self.transcriber = WhisperTranscriber(model_size=whisper_model_size)
+        self.transcriber = WhisperTranscriber(
+            model_size=whisper_model_size,
+            device="cpu",
+            compute_type="int8",
+        )
         self.tts = TextToSpeech(rate=tts_rate, volume=tts_volume)
 
     def process_voice_input(
@@ -111,7 +115,6 @@ class VoiceChatPipeline:
                 emotion=emotion,
                 wait=False,
                 priority=TTS_PRIORITY_VOICE_REPLY,
-                drop_pending_below_priority=TTS_PRIORITY_VOICE_REPLY,
             )
 
             return VoiceChatResult(

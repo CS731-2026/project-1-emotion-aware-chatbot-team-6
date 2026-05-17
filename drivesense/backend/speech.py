@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import platform
+import subprocess
 import tempfile
 import threading
 import time
@@ -20,6 +23,7 @@ from drivesense.backend.tts_queue import TTSQueue
 TTS_PRIORITY_CHAT = 10
 TTS_PRIORITY_VOICE_REPLY = 50
 TTS_PRIORITY_ALERT = 100
+TTS_CAPTURE_GUARD_SECONDS = 0.8
 
 
 @dataclass
@@ -35,6 +39,8 @@ class VoiceIOGate:
 
     _mic_lock = threading.Lock()
     _session_lock = threading.Lock()
+    _tts_state_lock = threading.Lock()
+    _tts_active_until = 0.0
 
     @classmethod
     def acquire_microphone(
@@ -69,6 +75,36 @@ class VoiceIOGate:
     def release_session(cls) -> None:
         if cls._session_lock.locked():
             cls._session_lock.release()
+
+    @classmethod
+    def mark_tts_started(cls) -> None:
+        with cls._tts_state_lock:
+            cls._tts_active_until = float("inf")
+
+    @classmethod
+    def mark_tts_finished(cls, guard_seconds: float = TTS_CAPTURE_GUARD_SECONDS) -> None:
+        with cls._tts_state_lock:
+            cls._tts_active_until = time.monotonic() + guard_seconds
+
+    @classmethod
+    def is_tts_active(cls) -> bool:
+        with cls._tts_state_lock:
+            return time.monotonic() < cls._tts_active_until
+
+    @classmethod
+    def wait_until_tts_idle(
+        cls,
+        timeout: float | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> bool:
+        started_at = time.monotonic()
+        while cls.is_tts_active():
+            if stop_event is not None and stop_event.is_set():
+                return False
+            if timeout is not None and time.monotonic() - started_at >= timeout:
+                return False
+            time.sleep(0.05)
+        return True
 
 
 def detect_text_language(text: str) -> str | None:
@@ -130,6 +166,15 @@ def record_microphone_audio(
     Returns:
         Recorded audio as numpy array.
     """
+    if wait_for_lock:
+        if not VoiceIOGate.wait_until_tts_idle(
+            timeout=lock_timeout_seconds,
+            stop_event=stop_event,
+        ):
+            return np.empty((0,), dtype=np.float32)
+    elif VoiceIOGate.is_tts_active():
+        return np.empty((0,), dtype=np.float32)
+
     if not VoiceIOGate.acquire_microphone(
         blocking=wait_for_lock,
         timeout=lock_timeout_seconds,
@@ -244,7 +289,7 @@ class WhisperTranscriber:
 
 
 class TextToSpeech:
-    """Convert text to speech using the local pyttsx3 engine."""
+    """Convert text to speech using a local engine."""
 
     _engine_lock = threading.RLock()
     _shared_engine: Any = None
@@ -277,21 +322,37 @@ class TextToSpeech:
     ) -> None:
         self.rate = rate
         self.volume = volume
-        try:
-            import pyttsx3
-        except ImportError as exc:  # pragma: no cover - environment specific
-            raise RuntimeError(
-                "pyttsx3 is required for voice output. Install it with pip."
-            ) from exc
-
-        self._pyttsx3 = pyttsx3
+        self._use_windows_sapi = platform.system() == "Windows"
+        self._pyttsx3 = None
+        if not self._use_windows_sapi:
+            try:
+                import pyttsx3
+            except ImportError as exc:  # pragma: no cover - environment specific
+                raise RuntimeError(
+                    "pyttsx3 is required for voice output. Install it with pip."
+                ) from exc
+            self._pyttsx3 = pyttsx3
 
     def _get_engine(self) -> Any:
         cls = type(self)
         with cls._engine_lock:
             if cls._shared_engine is None:
+                if self._pyttsx3 is None:
+                    raise RuntimeError("pyttsx3 is unavailable in this environment.")
                 cls._shared_engine = self._pyttsx3.init()
             return cls._shared_engine
+
+    @classmethod
+    def _reset_shared_engine(cls) -> None:
+        with cls._engine_lock:
+            engine = cls._shared_engine
+            cls._shared_engine = None
+            cls._shared_voices = None
+            if engine is not None:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
 
     def _get_voices(self) -> list[Any]:
         cls = type(self)
@@ -308,6 +369,8 @@ class TextToSpeech:
 
     def select_voice(self, emotion: str | None = None) -> str | None:
         """Prefer a softer or livelier voice depending on the driver emotion."""
+        if self._use_windows_sapi:
+            return None
         try:
             voices = self._get_voices()
         except Exception:
@@ -337,22 +400,82 @@ class TextToSpeech:
 
         return getattr(fallback_voice, "id", None)
 
+    def _speak_with_windows_sapi(self, text: str, emotion: str | None = None) -> None:
+        emotion_key = (emotion or "neutral").lower()
+        emotion_rate_offset = self.EMOTION_RATE_OFFSETS.get(emotion_key, 0)
+        base_rate = int(round((self.rate - 150) / 15)) + 2
+        sapi_rate = max(-10, min(10, base_rate + int(round(emotion_rate_offset / 4))))
+        volume_percent = max(
+            0,
+            min(100, int(round(self.EMOTION_VOLUME.get(emotion_key, self.volume) * 100))),
+        )
+        encoded_text = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        script = "\n".join(
+            [
+                "Add-Type -AssemblyName System.Speech",
+                "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer",
+                f"$synth.Rate = {sapi_rate}",
+                f"$synth.Volume = {volume_percent}",
+                f"$bytes = [System.Convert]::FromBase64String('{encoded_text}')",
+                "$text = [System.Text.Encoding]::UTF8.GetString($bytes)",
+                "$synth.Speak($text)",
+                "$synth.Dispose()",
+            ]
+        )
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            check=True,
+            timeout=max(15, min(60, len(text) // 8 + 8)),
+            capture_output=True,
+            text=True,
+        )
+
     def _speak_now(self, text: str, emotion: str | None = None) -> None:
         spoken_text = self.prepare_spoken_text(text)
         if not spoken_text:
             return
 
-        engine = self._get_engine()
-        emotion_key = (emotion or "neutral").lower()
-        emotion_rate = self.EMOTION_RATE_OFFSETS.get(emotion_key, 0)
-        emotion_volume = self.EMOTION_VOLUME.get(emotion_key, self.volume)
-        voice_id = self.select_voice(emotion)
-        if voice_id:
-            engine.setProperty("voice", voice_id)
-        engine.setProperty("rate", self.rate + emotion_rate)
-        engine.setProperty("volume", emotion_volume)
-        engine.say(spoken_text)
-        engine.runAndWait()
+        VoiceIOGate.mark_tts_started()
+        try:
+            if self._use_windows_sapi:
+                self._speak_with_windows_sapi(spoken_text, emotion=emotion)
+                return
+
+            engine = self._get_engine()
+            emotion_key = (emotion or "neutral").lower()
+            emotion_rate = self.EMOTION_RATE_OFFSETS.get(emotion_key, 0)
+            emotion_volume = self.EMOTION_VOLUME.get(emotion_key, self.volume)
+            voice_id = self.select_voice(emotion)
+
+            try:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+
+                if voice_id:
+                    engine.setProperty("voice", voice_id)
+                engine.setProperty("rate", self.rate + emotion_rate)
+                engine.setProperty("volume", emotion_volume)
+                engine.say(spoken_text)
+                engine.runAndWait()
+            except Exception:
+                type(self)._reset_shared_engine()
+                raise
+            finally:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+        finally:
+            VoiceIOGate.mark_tts_finished()
 
     def speak(
         self,
