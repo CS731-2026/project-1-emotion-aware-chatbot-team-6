@@ -645,7 +645,15 @@ class VisionWorker(QObject):
                         previous_driver_center_x,
                     )
                     if primary_face is not None:
-                        px1, _, px2, _ = primary_face["bbox"]
+                        if isinstance(primary_face, dict):
+                            bbox = cast(tuple[int, int, int, int], primary_face["bbox"])
+                            px1, _, px2, _ = bbox
+                        elif isinstance(primary_face, int):
+                            face_dict = faces[primary_face]
+                            px1, _, px2, _ = face_dict["bbox"]
+                            primary_face = face_dict
+                        else:
+                            px1, _, px2, _ = primary_face  # type: ignore[misc]
                         previous_driver_center_x = ((px1 + px2) / 2.0) / max(frame_w, 1)
                     for face in faces:
                         x1, y1, x2, y2 = face["bbox"]
@@ -703,14 +711,14 @@ class VisionWorker(QObject):
                                     saved_eye_crop_count += 1
 
                 driver_detected = primary_face is not None
-                if primary_face is not None:
-                    current_emotion = primary_face["emotion"]
-                    emotion_confidence = float(primary_face["emotion_confidence"])
+                if primary_face is not None and isinstance(primary_face, dict):
+                    current_emotion = str(primary_face.get("emotion", "neutral"))
+                    emotion_confidence = cast(float, primary_face.get("emotion_confidence", 0.0))
                     emotion_topk = cast(list[tuple[str, float]], primary_face.get("emotion_topk", []))
                     secondary_emotion = emotion_topk[1][0] if len(emotion_topk) > 1 else ""
                     secondary_emotion_confidence = float(emotion_topk[1][1]) if len(emotion_topk) > 1 else 0.0
-                    current_eye_label = primary_face["eye_label"]
-                    eye_confidence = float(primary_face["eye_confidence"])
+                    current_eye_label = str(primary_face.get("eye_label", "open_eye"))
+                    eye_confidence = cast(float, primary_face.get("eye_confidence", 0.0))
                 else:
                     current_emotion = "neutral"
                     emotion_confidence = 0.0
@@ -729,7 +737,7 @@ class VisionWorker(QObject):
                     else:
                         print(
                             "Driver emotion top-3: "
-                            f"{format_topk_prediction(primary_face.get('emotion_topk', []))}",
+                            f"{format_topk_prediction(cast(list[tuple[str, float]], primary_face.get('emotion_topk', [])))}",
                             flush=True,
                         )
 
@@ -1141,7 +1149,9 @@ class DriverAssistantWindow(QMainWindow):
             row_layout.setContentsMargins(0, 10, 0, 10)
             label = QLabel(label_text)
             label.setStyleSheet("color: #1a1c1c; font-size: 17px; border: none; background: transparent;")
-            value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value_label.setAlignment(
+                cast(Any, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            )
             value_label.setStyleSheet("color: #1a1c1c; font-size: 17px; font-weight: 700; border: none; background: transparent;")
             row_layout.addWidget(label)
             row_layout.addWidget(value_label, 1)
@@ -1366,7 +1376,14 @@ class DriverAssistantWindow(QMainWindow):
 
     def apply_initial_window_geometry(self) -> None:
         app = QGuiApplication.instance()
-        screen = app.primaryScreen() if app is not None else None
+        if app is None:
+            self.resize(1500, 900)
+            return
+
+        # QGuiApplication.instance() returns QCoreApplication in type hints,
+        # but at runtime it's always QGuiApplication when one exists.
+        # Use cast to satisfy static type checkers.
+        screen = cast(QGuiApplication, app).primaryScreen()
         if screen is None:
             self.resize(1500, 900)
             return
@@ -1499,8 +1516,8 @@ class DriverAssistantWindow(QMainWindow):
             "gridline-color: #ececec; font-size: 14px; color: #1f2937; }"
             "QHeaderView::section { background: #eeeeee; border: none; padding: 10px; font-weight: 700; }"
         )
-        self.models_table.verticalHeader().setVisible(False)
-        self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        cast(QHeaderView, self.models_table.verticalHeader()).setVisible(False)
+        cast(QHeaderView, self.models_table.horizontalHeader()).setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.models_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.models_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.refresh_models_table()

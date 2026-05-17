@@ -6,7 +6,11 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from drivesense.backend.chatbot import ChatbotResponse, DriverAssistantChatbot
+from drivesense.backend.chatbot import (
+    DEFAULT_MODEL,
+    ChatbotResponse,
+    DriverAssistantChatbot,
+)
 from drivesense.backend.speech import (
     TextToSpeech,
     TTS_PRIORITY_VOICE_REPLY,
@@ -94,7 +98,7 @@ class VoiceChatPipeline:
             bot_response: ChatbotResponse = self.chatbot.generate_reply(
                 emotion=emotion,
                 user_message=user_input,
-                model=model,
+                model=model or DEFAULT_MODEL,
                 temperature=temperature,
                 conversation_history=conversation_history,
                 auto_trigger=auto_trigger,
