@@ -12,6 +12,8 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from drivesense.backend.speech import detect_text_language, is_supported_zh_en_text
+
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 logger = logging.getLogger(__name__)
@@ -146,6 +148,7 @@ def build_system_prompt(
     auto_trigger: bool = False,
     driver_state: dict[str, Any] | None = None,
     provider_safe: bool = False,
+    response_language: str = "en",
 ) -> str:
     normalized_emotion = emotion.strip().lower() if emotion else "neutral"
     emotion_rule = EMOTION_PROMPT_RULES.get(
@@ -157,6 +160,11 @@ def build_system_prompt(
         if auto_trigger
         else "Respond directly to the driver's message."
     )
+    language_rule = (
+        "Reply only in Simplified Chinese."
+        if response_language == "zh"
+        else "Reply only in English."
+    )
     if provider_safe:
         return (
             "You are a brief conversational assistant inside a desktop application.\n"
@@ -166,6 +174,7 @@ def build_system_prompt(
             "- Do not produce long explanations or lists.\n"
             "- Treat app-provided state as uncertain context, not ground truth.\n"
             "- Avoid medical, legal, or high-stakes operational instructions.\n"
+            f"- {language_rule}\n"
             f"- App emotion context: {normalized_emotion}.\n"
             f"- App state context: {format_driver_state(driver_state)}\n"
             f"- Tone guidance: {emotion_rule}\n"
@@ -180,6 +189,7 @@ def build_system_prompt(
         "- Do not produce long explanations or lists.\n"
         "- Use the app signals as soft context only.\n"
         "- Help the user stay calm and focused without sounding forceful.\n"
+        f"- {language_rule}\n"
         f"- Current emotion context: {normalized_emotion}.\n"
         f"- Current app state: {format_driver_state(driver_state)}\n"
         f"- Tone guidance: {emotion_rule}\n"
@@ -226,10 +236,12 @@ class DriverAssistantChatbot:
         driver_state: dict[str, Any] | None = None,
     ) -> ChatbotResponse:
         sanitized_driver_state = sanitize_driver_state(driver_state)
+        response_language = "zh" if detect_text_language(user_message or "") == "zh" else "en"
         system_prompt = build_system_prompt(
             emotion,
             auto_trigger=auto_trigger,
             driver_state=sanitized_driver_state,
+            response_language=response_language,
         )
         trimmed_history = trim_history(conversation_history)
         current_user_message = (
@@ -310,6 +322,7 @@ class DriverAssistantChatbot:
                 auto_trigger=auto_trigger,
                 driver_state=sanitized_driver_state,
                 provider_safe=True,
+                response_language=response_language,
             )
             logger.warning(
                 "Retrying OpenRouter request with provider-safe prompt | model=%s",
@@ -339,6 +352,7 @@ class DriverAssistantChatbot:
                     auto_trigger=auto_trigger,
                     driver_state=sanitized_driver_state,
                     provider_safe=True,
+                    response_language=response_language,
                 )
                 completion, latency_ms = attempt_completion(
                     used_model,
@@ -346,7 +360,18 @@ class DriverAssistantChatbot:
                     provider_safe=True,
                 )
 
-        content = completion.choices[0].message.content or ""
+        content = (completion.choices[0].message.content or "").strip()
+        if content and not is_supported_zh_en_text(content):
+            logger.warning(
+                "Model returned unsupported language content | model=%s text=%r",
+                used_model,
+                content,
+            )
+            content = (
+                "Please stay calm and keep your attention on the road."
+                if response_language == "en"
+                else "请保持冷静，专注前方道路。"
+            )
         if not content.strip():
             logger.warning(
                 "OpenRouter returned empty content | model=%s latency_ms=%.0f",

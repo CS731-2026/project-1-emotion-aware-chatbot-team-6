@@ -17,8 +17,6 @@ from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
-import torch
-
 from drivesense.backend.speech import WhisperTranscriber, record_microphone_audio
 
 logger = logging.getLogger(__name__)
@@ -91,10 +89,10 @@ class WakeWordListener:
     def get_transcriber(self) -> WhisperTranscriber:
         """Get or create the Whisper transcriber (lazy load)."""
         if self._transcriber is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
             self._transcriber = WhisperTranscriber(
                 model_size=self.config.whisper_model_size,
-                device=device,
+                device="cpu",
+                compute_type="int8",
             )
         return self._transcriber
 
@@ -140,6 +138,7 @@ class WakeWordListener:
                             sample_rate=16000,
                             channels=1,
                             vad_enabled=False,
+                            wait_for_lock=False,
                         )
 
                         if audio.size == 0:
@@ -207,10 +206,10 @@ class ContinuedConversationListener:
     def get_transcriber(self) -> WhisperTranscriber:
         """Get or create the Whisper transcriber (lazy load)."""
         if self._transcriber is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
             self._transcriber = WhisperTranscriber(
                 model_size=self.config.whisper_model_size,
-                device=device,
+                device="cpu",
+                compute_type="int8",
             )
         return self._transcriber
 
@@ -261,6 +260,7 @@ class ContinuedConversationListener:
                             sample_rate=16000,
                             channels=1,
                             vad_enabled=False,
+                            wait_for_lock=False,
                         )
                         if audio.size == 0:
                             continue

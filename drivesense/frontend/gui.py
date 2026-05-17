@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 import threading
 import time
@@ -10,14 +11,46 @@ from pathlib import Path
 from typing import Any, cast
 
 import cv2
+
+
+def configure_frozen_dll_search_paths() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return
+
+    internal_root = Path(meipass)
+    dll_dirs = [
+        internal_root,
+        internal_root / "torch" / "lib",
+        internal_root / "ctranslate2",
+        internal_root / "cv2",
+    ]
+
+    existing_dirs: list[str] = []
+    for dll_dir in dll_dirs:
+        if dll_dir.exists():
+            existing_dirs.append(str(dll_dir))
+            if hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(str(dll_dir))
+
+    if existing_dirs:
+        os.environ["PATH"] = os.pathsep.join(existing_dirs + [os.environ.get("PATH", "")])
+
+
+configure_frozen_dll_search_paths()
+
 import torch
-from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot   
-from PyQt5.QtGui import QColor, QCloseEvent, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtCore import QObject, QMetaObject, Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QColor, QCloseEvent, QCursor, QGuiApplication, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QHeaderView,
     QHBoxLayout,
@@ -65,7 +98,14 @@ from drivesense.backend.vision import (
     resolve_latest_timm_model,
     save_eye_debug_crop,
 )
-from drivesense.backend.speech import TextToSpeech, WhisperTranscriber, record_microphone_audio
+from drivesense.backend.speech import (
+    TextToSpeech,
+    TTS_PRIORITY_CHAT,
+    WhisperTranscriber,
+    detect_text_language,
+    is_supported_zh_en_text,
+    record_microphone_audio,
+)
 from drivesense.backend.wake_word import WakeWordListener, WakeWordConfig, ContinuedConversationListener
 
 
@@ -383,7 +423,7 @@ class ChatBubble(QFrame):
                 "padding: 14px 18px; font-size: 15px; line-height: 1.4;"
             )
         )
-        bubble.setMaximumWidth(340)
+        bubble.setMaximumWidth(360)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 8)
@@ -606,7 +646,15 @@ class VisionWorker(QObject):
                         previous_driver_center_x,
                     )
                     if primary_face is not None:
-                        px1, _, px2, _ = primary_face["bbox"]
+                        if isinstance(primary_face, dict):
+                            bbox = cast(tuple[int, int, int, int], primary_face["bbox"])
+                            px1, _, px2, _ = bbox
+                        elif isinstance(primary_face, int):
+                            face_dict = faces[primary_face]
+                            px1, _, px2, _ = face_dict["bbox"]
+                            primary_face = face_dict
+                        else:
+                            px1, _, px2, _ = primary_face  # type: ignore[misc]
                         previous_driver_center_x = ((px1 + px2) / 2.0) / max(frame_w, 1)
                     for face in faces:
                         x1, y1, x2, y2 = face["bbox"]
@@ -664,14 +712,14 @@ class VisionWorker(QObject):
                                     saved_eye_crop_count += 1
 
                 driver_detected = primary_face is not None
-                if primary_face is not None:
-                    current_emotion = primary_face["emotion"]
-                    emotion_confidence = float(primary_face["emotion_confidence"])
+                if primary_face is not None and isinstance(primary_face, dict):
+                    current_emotion = str(primary_face.get("emotion", "neutral"))
+                    emotion_confidence = cast(float, primary_face.get("emotion_confidence", 0.0))
                     emotion_topk = cast(list[tuple[str, float]], primary_face.get("emotion_topk", []))
                     secondary_emotion = emotion_topk[1][0] if len(emotion_topk) > 1 else ""
                     secondary_emotion_confidence = float(emotion_topk[1][1]) if len(emotion_topk) > 1 else 0.0
-                    current_eye_label = primary_face["eye_label"]
-                    eye_confidence = float(primary_face["eye_confidence"])
+                    current_eye_label = str(primary_face.get("eye_label", "open_eye"))
+                    eye_confidence = cast(float, primary_face.get("eye_confidence", 0.0))
                 else:
                     current_emotion = "neutral"
                     emotion_confidence = 0.0
@@ -690,7 +738,7 @@ class VisionWorker(QObject):
                     else:
                         print(
                             "Driver emotion top-3: "
-                            f"{format_topk_prediction(primary_face.get('emotion_topk', []))}",
+                            f"{format_topk_prediction(cast(list[tuple[str, float]], primary_face.get('emotion_topk', [])))}",
                             flush=True,
                         )
 
@@ -920,13 +968,14 @@ class SpeechWorker(QThread):
 
     @classmethod
     def get_transcriber(cls, model_size: str) -> WhisperTranscriber:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cpu"
         key = (model_size, device)
         with cls._cache_lock:
             if key not in cls._transcriber_cache:
                 cls._transcriber_cache[key] = WhisperTranscriber(
                     model_size=model_size,
                     device=device,
+                    compute_type="int8",
                 )
             return cls._transcriber_cache[key]
 
@@ -945,17 +994,24 @@ class SpeechWorker(QThread):
 
             transcriber = self.get_transcriber(self.model_size)
             result = transcriber.transcribe_audio(audio, sample_rate=16000)
-            self.transcription_ready.emit(result.text)
+            text = result.text.strip()
+            if text and not is_supported_zh_en_text(text):
+                raise ValueError("Only Chinese and English voice input is supported.")
+            self.transcription_ready.emit(text)
         except Exception as exc:
             self.error.emit(str(exc))
 
 
 class DriverAssistantWindow(QMainWindow):
+    wake_word_detected_signal = pyqtSignal()
+    continued_voice_detected_signal = pyqtSignal()
+    continued_timeout_signal = pyqtSignal()
+
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
         self.args = args
         self.setWindowTitle("DriveSense")
-        self.resize(1500, 900)
+        self.apply_initial_window_geometry()
 
         self.current_emotion = "neutral"
         self.current_risk = "OK"
@@ -991,6 +1047,7 @@ class DriverAssistantWindow(QMainWindow):
         self.wake_word_listener: WakeWordListener | None = None
         self.continued_listener: ContinuedConversationListener | None = None
         self._in_continued_mode = False
+        self.reply_tts = TextToSpeech(rate=150, volume=1.0)
         self.llm_benchmark_rows = self.load_llm_benchmark_rows()
 
         try:
@@ -1098,7 +1155,9 @@ class DriverAssistantWindow(QMainWindow):
             row_layout.setContentsMargins(0, 10, 0, 10)
             label = QLabel(label_text)
             label.setStyleSheet("color: #1a1c1c; font-size: 17px; border: none; background: transparent;")
-            value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value_label.setAlignment(
+                cast(Any, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            )
             value_label.setStyleSheet("color: #1a1c1c; font-size: 17px; font-weight: 700; border: none; background: transparent;")
             row_layout.addWidget(label)
             row_layout.addWidget(value_label, 1)
@@ -1278,6 +1337,9 @@ class DriverAssistantWindow(QMainWindow):
         self.vision_worker.voice_dialogue_error.connect(self.handle_voice_dialogue_error)
         self.vision_worker.error.connect(self.handle_worker_error)
         self.vision_worker.finished.connect(self.vision_thread.quit)
+        self.wake_word_detected_signal.connect(self._handle_wake_word_detected)
+        self.continued_voice_detected_signal.connect(self._handle_continued_voice_detected)
+        self.continued_timeout_signal.connect(self._handle_continued_timeout)
         self.model_combo.currentTextChanged.connect(self.push_chat_settings_to_worker)
         self.temperature_spin.valueChanged.connect(self.push_chat_settings_to_worker)
         self.vision_thread.start()
@@ -1320,6 +1382,33 @@ class DriverAssistantWindow(QMainWindow):
         )
         self.switch_page("Dashboard")
         self.append_log("system", "DriveSense GUI ready")
+
+    def apply_initial_window_geometry(self) -> None:
+        app = QGuiApplication.instance()
+        if app is None:
+            self.resize(1500, 900)
+            return
+
+        # QGuiApplication.instance() returns QCoreApplication in type hints,
+        # but at runtime it's always QGuiApplication when one exists.
+        # Use cast to satisfy static type checkers.
+        gui_app = cast(QGuiApplication, app)
+        screen = gui_app.screenAt(QCursor.pos()) or gui_app.primaryScreen()
+        if screen is None:
+            self.resize(1500, 900)
+            return
+
+        available = screen.availableGeometry()
+        width = min(1500, max(960, available.width() - 96))
+        height = min(900, max(700, available.height() - 96))
+        width = min(width, max(640, available.width()))
+        height = min(height, max(480, available.height()))
+        x = available.x() + max(0, (available.width() - width) // 2)
+        y = available.y() + max(0, (available.height() - height) // 2)
+        x = min(max(x, available.left()), max(available.left(), available.right() - width + 1))
+        y = min(max(y, available.top()), max(available.top(), available.bottom() - height + 1))
+        self.resize(width, height)
+        self.move(x, y)
 
     def nav_button_style(self, active: bool) -> str:
         return (
@@ -1399,15 +1488,29 @@ class DriverAssistantWindow(QMainWindow):
         card_layout.setContentsMargins(24, 22, 24, 22)
         card_layout.setSpacing(14)
 
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
         title = QLabel("History")
         title.setStyleSheet("font-size: 28px; font-weight: 800; color: #1a1c1c; border: none;")
+        self.export_history_button = QPushButton("Export Chart")
+        self.export_history_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_history_button.setStyleSheet(
+            "QPushButton { background-color: #0059b5; color: white; border: none; border-radius: 8px; "
+            "padding: 9px 16px; font-weight: 700; font-size: 13px; }"
+            "QPushButton:hover { background-color: #0071e3; }"
+            "QPushButton:pressed { background-color: #00458c; }"
+        )
+        self.export_history_button.clicked.connect(self.export_attention_chart)
+        header_row.addWidget(title)
+        header_row.addStretch()
+        header_row.addWidget(self.export_history_button)
         subtitle = QLabel("Attention score is derived from driver detection, eye state, risk, and focus level.")
         subtitle.setStyleSheet("font-size: 15px; color: #4b5563; border: none;")
         self.history_summary_label = QLabel("Waiting for driver-state samples.")
         self.history_summary_label.setStyleSheet("font-size: 14px; color: #6b7280; border: none;")
         self.attention_chart = AttentionHistoryChart()
 
-        card_layout.addWidget(title)
+        card_layout.addLayout(header_row)
         card_layout.addWidget(subtitle)
         card_layout.addWidget(self.history_summary_label)
         card_layout.addWidget(self.attention_chart, 1)
@@ -1440,8 +1543,8 @@ class DriverAssistantWindow(QMainWindow):
             "gridline-color: #ececec; font-size: 14px; color: #1f2937; }"
             "QHeaderView::section { background: #eeeeee; border: none; padding: 10px; font-weight: 700; }"
         )
-        self.models_table.verticalHeader().setVisible(False)
-        self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        cast(QHeaderView, self.models_table.verticalHeader()).setVisible(False)
+        cast(QHeaderView, self.models_table.horizontalHeader()).setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.models_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.models_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.refresh_models_table()
@@ -1547,6 +1650,34 @@ class DriverAssistantWindow(QMainWindow):
             self.history_summary_label.setText(
                 f"Current {scores[-1]:.0f}/100 | Avg {sum(scores)/len(scores):.1f} | Min {min(scores):.0f}"
             )
+
+    def export_attention_chart(self) -> None:
+        if not self.attention_history:
+            QMessageBox.information(self, "Export Attention Chart", "No attention samples to export yet.")
+            return
+
+        export_dir = PROJECT_ROOT / "debug_exports" / "attention_history"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        default_path = export_dir / f"attention_history_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Attention Chart",
+            str(default_path),
+            "PNG images (*.png)",
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".png"):
+            file_path = f"{file_path}.png"
+
+        chart_pixmap = self.attention_chart.grab()
+        if not chart_pixmap.save(file_path, "PNG"):
+            QMessageBox.warning(self, "Export Attention Chart", "Failed to save the chart image.")
+            self.append_log("error", f"Failed to export attention chart to {file_path}")
+            return
+
+        self.status_label.setText(f"Status: attention chart exported to {file_path}")
+        self.append_log("history", f"Exported attention chart to {file_path}")
 
     def add_message(self, text: str, is_user: bool) -> None:
         bubble = ChatBubble(text, is_user=is_user)
@@ -1694,6 +1825,10 @@ class DriverAssistantWindow(QMainWindow):
         text = self.input_edit.text().strip()
         if not text or self.chatbot is None or self.chat_worker is not None:
             return
+        if not is_supported_zh_en_text(text):
+            self.status_label.setText("Status: only Chinese and English text input is supported")
+            self.append_log("error", "Rejected unsupported text input")
+            return
 
         self.input_edit.clear()
         self.add_message(text, is_user=True)
@@ -1814,41 +1949,59 @@ class DriverAssistantWindow(QMainWindow):
         # mic_button is hidden; no state toggle necessary.
         self.chat_worker = None
 
-    def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
-        if not text.strip():
-            # 没有 TTS 也要启动 continued listener
-            self._on_tts_finished()
-            return
-
-        def worker() -> None:
-            try:
-                tts = TextToSpeech(rate=150, volume=1.0)
-                tts.speak(text, emotion=emotion, wait=True)
-            except Exception as exc:
-                print(f"TTS error: {exc}")
-            finally:
-                # 回到主线程再操作 Qt 对象
-                from PyQt5.QtCore import QMetaObject, Qt as QtNS
-                QMetaObject.invokeMethod(
-                    self, "_on_tts_finished",
-                    QtNS.ConnectionType.QueuedConnection,
-                )
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    @pyqtSlot()
-    def _on_tts_finished(self) -> None:
-        """TTS 播完后在主线程调用，此时才启动 continued listener。"""
-        # 停 wake-word，避免两个 InputStream 同时开着
+    def _pause_voice_listeners_for_tts(self) -> None:
+        if self.continued_listener is not None:
+            self.continued_listener.stop()
         if self.wake_word_listener is not None and self.wake_word_listening:
             self.wake_word_listener.stop()
             self.wake_word_listening = False
 
+    def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
+        if not text.strip():
+            self._on_tts_finished()
+            return
+
+        self._pause_voice_listeners_for_tts()
+        self.status_label.setText("Status: speaking assistant reply...")
+        self.append_log("voice", f"Speaking assistant reply: {text[:80]}")
+
+        def on_done() -> None:
+            QMetaObject.invokeMethod(
+                self,
+                "_on_tts_finished",
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        def on_error(exc: BaseException) -> None:
+            print(f"TTS error: {exc}")
+            QMetaObject.invokeMethod(
+                self,
+                "_on_tts_failed",
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        self.reply_tts.speak(
+            text,
+            emotion=emotion,
+            wait=False,
+            on_done=on_done,
+            on_error=on_error,
+            priority=TTS_PRIORITY_CHAT,
+        )
+
+    @pyqtSlot()
+    def _on_tts_finished(self) -> None:
         self._in_continued_mode = True
         if self.continued_listener is not None:
             self.continued_listener.start()
             self.status_label.setText("Status: listening for follow-up (10 s)...")
             self.append_log("voice", "Entered 10-second follow-up listening window")
+
+    @pyqtSlot()
+    def _on_tts_failed(self) -> None:
+        self.status_label.setText("Status: assistant reply audio failed")
+        self.append_log("error", "Assistant reply TTS failed")
+        self._on_tts_finished()
 
     def start_recording(self, push_to_talk: bool = False) -> None:
         """Start recording.
@@ -1894,6 +2047,12 @@ class DriverAssistantWindow(QMainWindow):
     def handle_transcription(self, text: str) -> None:
         self.input_edit.setText(text)
         if text.strip():
+            detected_language = detect_text_language(text)
+            if detected_language is None or not is_supported_zh_en_text(text):
+                self.status_label.setText("Status: only Chinese and English voice input is supported")
+                self.append_log("error", "Rejected unsupported voice transcription")
+                self.input_edit.clear()
+                return
             self.status_label.setText("Status: transcription ready")
             self.append_log("voice", f"Transcription ready: {text[:80]}")
             self.send_text_message()
@@ -1911,6 +2070,10 @@ class DriverAssistantWindow(QMainWindow):
             self.append_log("voice", "Empty transcription result")
 
     def handle_speech_error(self, message: str) -> None:
+        if message.strip() == "Only Chinese and English voice input is supported.":
+            self.status_label.setText("Status: only Chinese and English voice input is supported")
+            self.append_log("error", "Speech: unsupported language")
+            return
         self.status_label.setText(f"Status: speech error - {message}")
         self.append_log("error", f"Speech: {message}")
 
@@ -1940,7 +2103,19 @@ class DriverAssistantWindow(QMainWindow):
         self.append_log("voice", "Wake-word toggle pressed; listener stays on")
 
     def on_wake_word_detected(self) -> None:
-        """Callback when wake-word is detected; trigger 5-second recording."""
+        """Background-thread callback from the wake-word listener."""
+        self.wake_word_detected_signal.emit()
+
+    def on_continued_voice_detected(self) -> None:
+        """Background-thread callback from the continued listener."""
+        self.continued_voice_detected_signal.emit()
+        
+    def on_continued_timeout(self) -> None:
+        """Background-thread timeout callback from the continued listener."""
+        self.continued_timeout_signal.emit()
+
+    @pyqtSlot()
+    def _handle_wake_word_detected(self) -> None:
         if self.speech_worker is not None:
             return
         self.status_label.setText("Status: wake-word detected! Recording for 5 seconds...")
@@ -1948,17 +2123,16 @@ class DriverAssistantWindow(QMainWindow):
         self.append_log("voice", "Wake-word detected")
         self.start_recording()
 
-    def on_continued_voice_detected(self) -> None:
-        """Continued listener 检测到能量，直接触发录音。"""
+    @pyqtSlot()
+    def _handle_continued_voice_detected(self) -> None:
         if self.speech_worker is not None:
             return
-        # continued listener 内部已把 _running 置 False，线程会自己退出
         self.status_label.setText("Status: follow-up voice detected, recording...")
         self.append_log("voice", "Follow-up speech detected")
         self.start_recording(push_to_talk=False)
-        
-    def on_continued_timeout(self) -> None:
-        """10 s 无声，回到 idle wake-word 状态。"""
+
+    @pyqtSlot()
+    def _handle_continued_timeout(self) -> None:
         self._in_continued_mode = False
         if self.wake_word_listener is not None:
             self.wake_word_listener.start()
