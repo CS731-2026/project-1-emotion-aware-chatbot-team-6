@@ -1,0 +1,4 @@
+model,num_responses,avg_latency_ms,avg_total_tokens
+openai/gpt-4o-mini,10,1642.1,429.7
+anthropic/claude-haiku-4-5,10,1970.0,487.8
+deepseek/deepseek-chat,10,4615.5,425.9
