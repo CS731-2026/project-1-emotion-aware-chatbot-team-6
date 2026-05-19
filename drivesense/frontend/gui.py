@@ -77,7 +77,13 @@ from drivesense.backend.chatbot import (
     SUPPORTED_LLM_MODELS,
     sanitize_driver_state,
 )
-from drivesense.backend.focus_monitor import FocusMonitor, FocusMonitorConfig
+from drivesense.backend.focus_monitor import (
+    EMOTION_FULL_DIALOGUE,
+    EMOTION_TRIGGER_THRESHOLDS,
+    EMOTION_TTS_ONLY,
+    FocusMonitor,
+    FocusMonitorConfig,
+)
 from drivesense.backend.vision import (
     apply_emotion_postprocess,
     build_voice_pipeline,
@@ -1170,6 +1176,7 @@ class DriverAssistantWindow(QMainWindow):
         self.focus_label = QLabel("OK")
         self.reason_label = QLabel("none")
         self.emotion_streak_label = QLabel("none")
+        self.emotion_timer_label = QLabel("not active")
         self.emotion_alerts_label = QLabel("0")
         add_metric_row("Driver detected", self.driver_detected_label)
         add_metric_row("Emotion", self.emotion_label)
@@ -1178,6 +1185,7 @@ class DriverAssistantWindow(QMainWindow):
         add_metric_row("Focus", self.focus_label)
         add_metric_row("Reason", self.reason_label)
         add_metric_row("Emotion streak", self.emotion_streak_label)
+        add_metric_row("Emotion timer", self.emotion_timer_label)
         add_metric_row("Emotion alerts", self.emotion_alerts_label)
 
         meta_block = QVBoxLayout()
@@ -1248,6 +1256,7 @@ class DriverAssistantWindow(QMainWindow):
         )
         settings_layout.addWidget(self.context_label)
         right_panel.addWidget(settings_card)
+        right_panel.addWidget(self.build_emotion_alert_rules_card())
 
         chat_card = QFrame()
         chat_card.setStyleSheet(
@@ -1439,6 +1448,60 @@ class DriverAssistantWindow(QMainWindow):
         card.setStyleSheet(
             "QFrame { background-color: #ffffff; border: 1px solid #dadada; border-radius: 18px; }"
         )
+        return card
+
+    def build_emotion_alert_rules_card(self) -> QFrame:
+        card = self.build_card_frame()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        title = QLabel("Emotion Alert Rules")
+        title.setStyleSheet("color: #1a1c1c; font-size: 18px; font-weight: 800; border: none; background: transparent;")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Only continuous driver emotions trigger alerts.")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #4b5563; font-size: 13px; border: none; background: transparent;")
+        layout.addWidget(subtitle)
+
+        def add_rule(emotions: list[str], action: str) -> None:
+            row = QFrame()
+            row.setStyleSheet("QFrame { border: none; border-top: 1px solid #eeeeee; background: transparent; }")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 9, 0, 0)
+            names = " / ".join(emotions)
+            thresholds = sorted({int(EMOTION_TRIGGER_THRESHOLDS[name]) for name in emotions})
+            threshold_text = f"{thresholds[0]}s" if len(thresholds) == 1 else "/".join(f"{value}s" for value in thresholds)
+            name_label = QLabel(names)
+            name_label.setStyleSheet("color: #1a1c1c; font-size: 14px; font-weight: 700; border: none; background: transparent;")
+            detail_label = QLabel(f"{threshold_text}, {action}")
+            detail_label.setAlignment(cast(Any, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
+            detail_label.setStyleSheet("color: #4b5563; font-size: 13px; border: none; background: transparent;")
+            row_layout.addWidget(name_label)
+            row_layout.addWidget(detail_label, 1)
+            layout.addWidget(row)
+
+        full_by_threshold: dict[int, list[str]] = {}
+        for emotion in sorted(EMOTION_FULL_DIALOGUE):
+            threshold = int(EMOTION_TRIGGER_THRESHOLDS[emotion])
+            full_by_threshold.setdefault(threshold, []).append(emotion)
+        for emotions in full_by_threshold.values():
+            add_rule(emotions, "beep + TTS + voice dialogue")
+
+        tts_by_threshold: dict[int, list[str]] = {}
+        for emotion in sorted(EMOTION_TTS_ONLY):
+            threshold = int(EMOTION_TRIGGER_THRESHOLDS[emotion])
+            tts_by_threshold.setdefault(threshold, []).append(emotion)
+        for emotions in tts_by_threshold.values():
+            add_rule(emotions, "beep + short TTS")
+
+        inactive = QLabel("happy / neutral: no emotion alert")
+        inactive.setStyleSheet(
+            "color: #00a86b; font-size: 13px; font-weight: 700; border: none; "
+            "background: transparent; padding-top: 6px;"
+        )
+        layout.addWidget(inactive)
         return card
 
     def build_logs_page(self) -> QWidget:
@@ -1776,6 +1839,22 @@ class DriverAssistantWindow(QMainWindow):
         else:
             self.emotion_streak_label.setText("none")
             self.emotion_streak_label.setStyleSheet(
+                "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            )
+        emotion_timer_threshold = EMOTION_TRIGGER_THRESHOLDS.get(emotion_streak_lbl)
+        if emotion_timer_threshold is not None:
+            remaining = max(0.0, emotion_timer_threshold - emotion_streak_dur)
+            self.emotion_timer_label.setText(
+                f"{emotion_streak_lbl} {emotion_streak_dur:.1f}s / {emotion_timer_threshold:.0f}s"
+                + (f" ({remaining:.1f}s left)" if remaining > 0 else " (triggered)")
+            )
+            timer_color = "#e53935" if emotion_warning else emotion_color_hex(emotion_streak_lbl)
+            self.emotion_timer_label.setStyleSheet(
+                f"color: {timer_color}; font-size: 17px; font-weight: 700; border: none; background: transparent;"
+            )
+        else:
+            self.emotion_timer_label.setText("not active")
+            self.emotion_timer_label.setStyleSheet(
                 "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
             )
         # Emotion alert counter
