@@ -220,7 +220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cooldown-seconds",
         type=float,
-        default=30.0,
+        default=10.0,
         help="Minimum seconds between two voice interventions.",
     )
     parser.add_argument(

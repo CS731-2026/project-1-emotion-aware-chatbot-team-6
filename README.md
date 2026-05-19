@@ -96,7 +96,8 @@ Non-goals for the current prototype:
 
 - **sounddevice** for microphone recording
 - **faster-whisper** for local transcription
-- **pyttsx3** for local TTS playback
+- **System.Speech / Windows SAPI** for local TTS on Windows
+- **pyttsx3** fallback for non-Windows environments
 
 ### LLM
 
@@ -147,7 +148,8 @@ flowchart LR
     I --> K["PyQt5 GUI"]
     I --> L["Prompt builder"]
     L --> M["OpenRouter LLM"]
-    M --> N["TTS queue"]
+    M --> N["Priority TTS queue"]
+    N --> O["Windows SAPI / pyttsx3 playback"]
 ```
 
 ## Vision Pipeline
@@ -162,7 +164,7 @@ Very small or far-away faces are filtered out. This avoids background faces domi
 
 ### 3. Driver face selection
 
-From the remaining candidates, the runtime selects one driver face. The current default heuristic is to choose the left-most candidate after filtering. This matches the current demo setup.
+From the remaining candidates, the runtime selects one driver face. The current default heuristic is to choose the left-most candidate after filtering, with lightweight previous-center tracking to reduce frame-to-frame jitter. This matches the current demo setup.
 
 ### 4. Emotion classification
 
@@ -176,7 +178,7 @@ The selected face crop is sent to a timm classifier trained on 7 classes:
 - `sad`
 - `surprise`
 
-The runtime also tracks top predictions and confidence, and can apply post-processing rules before using the result for risk logic.
+The runtime also tracks the top predictions and confidence. The first two emotion candidates are passed into the LLM context, and low-confidence `sad` / `anger` predictions below 80% are downgraded to `neutral` before risk logic uses them.
 
 ### 5. Eye-state classification
 
@@ -196,12 +198,18 @@ This is simpler and faster than a facial-landmark solution, but less precise.
 Current trigger paths:
 
 - **Eye-closure path**
-  - track continuous closed-eye duration
-  - raise a focus warning after the configured threshold
+  - ignore eye-state decisions during the GUI warm-up period, default 5 seconds
+  - track continuous closed-eye duration for the selected driver only
+  - raise a focus warning after the configured threshold, default 2 seconds
 
 - **Emotion path**
   - track sustained negative emotion streaks
-  - optionally trigger supportive intervention for selected emotions
+  - `anger` / `fear`: 3 seconds, HIGH risk, beep + TTS + voice dialogue
+  - `sad`: 3 seconds, MED risk, beep + TTS + voice dialogue
+  - `disgust`: 3 seconds, LOW risk, beep + short TTS only
+  - `surprise`: 3 seconds, MED risk, beep + short TTS only
+  - `happy` / `neutral`: no emotion alert
+  - eye and emotion alerts share a default 10-second cooldown
 
 Outputs from `FocusMonitor`:
 
@@ -231,7 +239,7 @@ flowchart LR
     G --> H["Text reply"]
     H --> I["GUI chat panel"]
     H --> J["Priority TTS queue"]
-    J --> K["pyttsx3 playback"]
+    J --> K["Windows SAPI / pyttsx3 playback"]
 ```
 
 ### Current interaction rules
@@ -240,6 +248,8 @@ flowchart LR
 - manual voice input produces **transcribed text + assistant text + spoken reply**
 - focus-triggered voice dialogue also writes its text results into the GUI chat log
 - input and output are restricted to **Chinese and English**
+- wake-word listening starts automatically in the GUI and listens for `hey moss`, `hey`, or `moss`
+- the push-to-talk button records while pressed
 
 ### Concurrency control
 
@@ -256,7 +266,7 @@ Current controls:
 Important limitation:
 
 - queued lower-priority jobs can be dropped before playback
-- a job that is already inside `pyttsx3.runAndWait()` is not forcefully interrupted
+- an audio job that has already started playback is not forcefully interrupted
 
 ## LLM Prompt Design
 
@@ -264,10 +274,11 @@ The LLM is not used as a raw open-ended chatbot. Replies are constrained by the 
 
 Prompt inputs include:
 
-- current emotion
+- primary and secondary emotion with confidence
 - current eye state
 - risk level
 - focus alert state
+- closed-eye duration
 - trigger reason
 - interaction mode:
   - normal reply
@@ -279,6 +290,8 @@ Prompt constraints include:
 - stay calm and non-alarmist
 - follow the detected language
 - use the driver state as soft context rather than absolute truth
+
+Internal model paths are sanitized out before state is passed to the LLM.
 
 ## OpenRouter Model Strategy
 
@@ -300,14 +313,15 @@ This lets the project compare multiple LLMs while keeping one consistent code pa
 
 The GUI is separated into several responsibilities:
 
-- **Dashboard**: live camera, driver state, context, and chat
+- **Dashboard**: live camera, driver state, emotion alert rules, context, and chat
 - **Logs**: runtime event trace
-- **History**: recent attention score curve
+- **History**: recent attention score curve with PNG chart export
 - **Models**: LLM benchmark comparison
 
 Design logic:
 
 - keep the main driving-state information visible without opening other pages
+- expose emotion alert rules and the current emotion timer on the dashboard
 - keep experimental outputs separate from the core dashboard
 - expose model switching and reply provenance directly in the interface
 
@@ -330,6 +344,7 @@ G:\731
 |   |   |-- speech.py
 |   |   |-- tts_queue.py
 |   |   |-- voice_chat.py
+|   |   |-- wake_word.py
 |   |-- data/
 |   |-- training/
 |   |-- benchmarks/
@@ -476,6 +491,15 @@ python -m drivesense.benchmarks.score_llm_results --input-csv benchmark_results\
 python -m drivesense.frontend.gui --device cuda --default-llm-model openai/gpt-4o-mini
 ```
 
+Useful GUI options:
+
+```powershell
+python -m drivesense.frontend.gui --device cuda --save-eye-crops
+python -m drivesense.frontend.gui --device cpu --no-enable-voice-dialogue
+```
+
+`--save-eye-crops` overwrites debug eye crops under `debug_exports/eye_crops/` for inspection. It is disabled by default.
+
 ### CLI vision mode
 
 ```powershell
@@ -547,6 +571,8 @@ Always check `git status` before committing.
 - This is a prototype, not a production driving system.
 - Driver selection is heuristic-based when multiple people appear.
 - Eye boxes are geometry-estimated rather than landmark-detected.
+- Eye crops can be debug-exported, but eye boxes are intentionally not emphasized in the main UI.
+- Wake-word detection is a lightweight Whisper-based prototype and can be affected by room noise.
 - LLM quality evaluation still includes manual scoring.
 - Some OpenRouter providers may reject requests depending on account/provider policy.
 

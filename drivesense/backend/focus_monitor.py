@@ -1,24 +1,22 @@
-"""Drowsiness & emotion focus monitor.
+"""Drowsiness and emotion focus monitor.
 
-Tracks TWO trigger paths for multi-modal intervention:
+Tracks two trigger paths for multi-modal intervention:
 
-  PATH A — Drowsiness (original):
-    Driver's eyes closed >= threshold (default 2 s) -> beep + LLM TTS + dialogue.
+  PATH A - Drowsiness:
+    Driver eyes closed >= threshold (default 2 s) -> beep + LLM TTS + dialogue.
 
-  PATH B — Emotion (NEW):
-    Dangerous emotion sustained >= threshold -> beep + LLM TTS + dialogue.
+  PATH B - Emotion:
+    Dangerous emotion sustained >= threshold -> beep + LLM TTS/dialogue.
     Thresholds per emotion:
-      anger / fear  -> 5 s   (HIGH risk, full dialogue)
-      sad           -> 8 s   (MED risk, full dialogue)
-      disgust       -> 10 s  (LOW risk, TTS only, no dialogue)
-      surprise      -> 10 s  (MED risk, TTS only, no dialogue)
+      anger / fear  -> 3 s  (HIGH risk, full dialogue)
+      sad           -> 3 s  (MED risk, full dialogue)
+      disgust       -> 3 s  (LOW risk, TTS only, no dialogue)
+      surprise      -> 3 s  (MED risk, TTS only, no dialogue)
       happy/neutral -> never triggered
 
 Both paths share a single cooldown timer so they never fire simultaneously.
-
-The monitor is designed to be polled once per processed frame from the main
-vision loop. All side effects (audio, network calls) run on a background
-thread so the camera loop never blocks.
+The monitor is polled once per processed frame from the vision loop. Audio and
+network side effects run on background threads so the camera loop never blocks.
 """
 
 from __future__ import annotations
@@ -42,11 +40,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 EMOTION_TRIGGER_THRESHOLDS: dict[str, float] = {
-    "anger": 5.0,
-    "fear": 5.0,
-    "sad": 8.0,
-    "disgust": 10.0,
-    "surprise": 10.0,
+    "anger": 3.0,
+    "fear": 3.0,
+    "sad": 3.0,
+    "disgust": 3.0,
+    "surprise": 3.0,
 }
 """Seconds of sustained emotion before the system intervenes."""
 
@@ -57,8 +55,8 @@ EMOTION_TTS_ONLY: set[str] = {"disgust", "surprise"}
 """Emotions that get beep -> TTS only (no microphone recording / dialogue)."""
 
 EMOTION_CHECK_IN_SENTENCES: dict[str, str] = {
-    "anger": "I noticed you seem tense. Take a slow breath — the road needs your calm focus.",
-    "fear": "You seem a bit uneasy. It's okay — stay steady, you've got this.",
+    "anger": "I noticed you seem tense. Take a slow breath - the road needs your calm focus.",
+    "fear": "You seem a bit uneasy. It's okay - stay steady, you've got this.",
     "sad": "You seem a little down. Would you like to take a short break when it's safe?",
     "disgust": "Try to stay relaxed and keep your attention on the road.",
     "surprise": "Stay calm and keep your eyes steady on the road ahead.",
@@ -72,7 +70,7 @@ class FocusMonitorConfig:
     closed_eye_seconds: float = 2.0
     """Continuous closed-eye duration that triggers a high-risk event."""
 
-    cooldown_seconds: float = 30.0
+    cooldown_seconds: float = 10.0
     """Minimum gap between two high-risk triggers (shared by eye & emotion)."""
 
     beep_frequency_hz: int = 1000
@@ -187,7 +185,7 @@ def _build_emotion_alert_prompt(
         "Say exactly one short, calm, supportive sentence to help the driver feel better "
         "and refocus on driving safely. "
         "Do not mention being an AI. Do not ask a long question. "
-        "Match your tone to the emotion — be soothing for anger/fear, gentle for sadness."
+        "Match your tone to the emotion - be soothing for anger/fear, gentle for sadness."
     )
 
 
