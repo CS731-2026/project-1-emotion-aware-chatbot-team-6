@@ -122,6 +122,10 @@ GUI 当前支持的模型：
 - `anthropic/claude-haiku-4-5`
 - `deepseek/deepseek-chat`
 
+默认模型：
+
+- `anthropic/claude-haiku-4-5`
+
 ## 系统架构
 
 ```mermaid
@@ -450,7 +454,7 @@ python -m drivesense.backend.vision --device cuda --window-width 1280 --window-h
 ### 命令行 Chatbot
 
 ```powershell
-python -m drivesense.backend.chatbot --model openai/gpt-4o-mini --emotion neutral --temperature 1.0
+python -m drivesense.backend.chatbot --model anthropic/claude-haiku-4-5 --emotion neutral --temperature 1.0
 ```
 
 ### 语音测试

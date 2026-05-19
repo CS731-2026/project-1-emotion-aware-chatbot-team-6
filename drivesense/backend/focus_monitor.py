@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from drivesense.backend.chatbot import ChatbotResponse, DriverAssistantChatbot
+from drivesense.backend.chatbot import DEFAULT_MODEL, ChatbotResponse, DriverAssistantChatbot
 from drivesense.backend.speech import TTS_PRIORITY_ALERT, TextToSpeech
 from drivesense.backend.voice_chat import NoSpeechDetectedError, VoiceChatPipeline
 
@@ -85,7 +85,7 @@ class FocusMonitorConfig:
     record_seconds: float = 5.0
     """How long to listen for the driver's reply."""
 
-    chat_model: str = "openai/gpt-4o-mini"
+    chat_model: str = DEFAULT_MODEL
     """OpenRouter model id used for the LLM reply step."""
 
     alert_max_output_tokens: int = 40
@@ -113,7 +113,7 @@ class _State:
     is_handling_event: bool = False
     last_warning_active: bool = False
     last_emotion_warning_active: bool = False
-    chat_model: str = "openai/gpt-4o-mini"
+    chat_model: str = DEFAULT_MODEL
     temperature: float = 1.0
     driver_state: dict[str, Any] | None = None
     current_level: int = 0

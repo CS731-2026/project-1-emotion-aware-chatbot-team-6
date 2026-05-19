@@ -301,6 +301,10 @@ The GUI currently exposes:
 - `anthropic/claude-haiku-4-5`
 - `deepseek/deepseek-chat`
 
+Default model:
+
+- `anthropic/claude-haiku-4-5`
+
 Fallback strategy:
 
 1. try the selected model
@@ -488,7 +492,7 @@ python -m drivesense.benchmarks.score_llm_results --input-csv benchmark_results\
 ### GUI
 
 ```powershell
-python -m drivesense.frontend.gui --device cuda --default-llm-model openai/gpt-4o-mini
+python -m drivesense.frontend.gui --device cuda --default-llm-model anthropic/claude-haiku-4-5
 ```
 
 Useful GUI options:
@@ -509,7 +513,7 @@ python -m drivesense.backend.vision --device cuda --window-width 1280 --window-h
 ### CLI chatbot
 
 ```powershell
-python -m drivesense.backend.chatbot --model openai/gpt-4o-mini --emotion neutral --temperature 1.0
+python -m drivesense.backend.chatbot --model anthropic/claude-haiku-4-5 --emotion neutral --temperature 1.0
 ```
 
 ### CLI speech test
