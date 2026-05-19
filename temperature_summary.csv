@@ -1,0 +1,4 @@
+temperature,num_responses,avg_latency_ms
+0.5,10,1863.1
+1.0,10,1877.6
+1.5,10,2065.5
