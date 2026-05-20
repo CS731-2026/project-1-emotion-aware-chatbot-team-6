@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from drivesense.backend.chatbot import ChatbotResponse, DriverAssistantChatbot
 from drivesense.backend.speech import TextToSpeech, WhisperTranscriber, record_microphone_audio
+
+
+class NoSpeechDetectedError(ValueError):
+    """Raised when speech recording completes but no useful text is transcribed."""
 
 
 @dataclass
@@ -17,10 +21,12 @@ class VoiceChatResult:
     bot_reply: str
     emotion: str
     model: str
+    selected_model: str
     latency_ms: float
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
+    fallback_used: bool
 
 
 class VoiceChatPipeline:
@@ -45,6 +51,7 @@ class VoiceChatPipeline:
         conversation_history: list[dict[str, str]] | None = None,
         auto_trigger: bool = False,
         model: str | None = None,
+        driver_state: dict[str, Any] | None = None,
     ) -> VoiceChatResult:
         """
         Record voice, transcribe, get LLM reply, and speak it aloud.
@@ -62,6 +69,8 @@ class VoiceChatPipeline:
         result = self.transcriber.transcribe_audio(audio)
         user_input = result.text
         print(f"Transcribed: {user_input}")
+        if not user_input.strip():
+            raise NoSpeechDetectedError("No speech detected.")
         
         # Step 2: Get LLM reply
         print("Generating response...")
@@ -72,21 +81,24 @@ class VoiceChatPipeline:
             temperature=temperature,
             conversation_history=conversation_history,
             auto_trigger=auto_trigger,
+            driver_state=driver_state,
         )
         
-        # Step 3: Speak the reply
-        print("Speaking reply...")
-        self.tts.speak(bot_response.text, emotion=emotion)
+        # Step 3: Queue the reply TTS without blocking the result path.
+        print("Queueing reply TTS...")
+        self.tts.speak(bot_response.text, emotion=emotion, wait=False)
         
         return VoiceChatResult(
             user_input=user_input,
             bot_reply=bot_response.text,
             emotion=bot_response.emotion,
             model=bot_response.model,
+            selected_model=bot_response.selected_model,
             latency_ms=bot_response.latency_ms,
             prompt_tokens=bot_response.prompt_tokens,
             completion_tokens=bot_response.completion_tokens,
             total_tokens=bot_response.total_tokens,
+            fallback_used=bot_response.fallback_used,
         )
     
     def process_voice_input_async(

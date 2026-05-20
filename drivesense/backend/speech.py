@@ -7,11 +7,14 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
 import torch
 from faster_whisper import WhisperModel
+
+from drivesense.backend.tts_queue import TTSQueue
 
 
 @dataclass
@@ -27,7 +30,24 @@ def record_microphone_audio(
     sample_rate: int = 16000,
     channels: int = 1,
     stop_event: threading.Event | None = None,
+    vad_enabled: bool = True,
+    min_duration_seconds: float = 0.5,
+    silence_duration_seconds: float = 1.0,
 ) -> np.ndarray:
+    """Record audio from microphone with optional voice activity detection (VAD).
+    
+    Args:
+        duration_seconds: Maximum recording duration in seconds.
+        sample_rate: Audio sample rate (Hz).
+        channels: Number of audio channels.
+        stop_event: Threading event to signal early stop.
+        vad_enabled: Enable intelligent stop on prolonged silence.
+        min_duration_seconds: Minimum recording duration before VAD can trigger.
+        silence_duration_seconds: Duration of silence (seconds) before auto-stop.
+    
+    Returns:
+        Recorded audio as numpy array.
+    """
     chunks: list[np.ndarray] = []
 
     def callback(indata, frames, time_info, status) -> None:
@@ -42,10 +62,37 @@ def record_microphone_audio(
         callback=callback,
     ):
         started_at = time.perf_counter()
+        last_voice_time = started_at  # Track when we last detected voice
+        vad_threshold = 0.02  # Energy threshold for voice detection (RMS)
+        chunk_duration = 0.05  # Process every 50ms for responsiveness
+
         while time.perf_counter() - started_at < duration_seconds:
             if stop_event and stop_event.is_set():
                 break
-            sd.sleep(50)
+
+            elapsed = time.perf_counter() - started_at
+
+            # Check for prolonged silence if VAD is enabled.
+            if vad_enabled and elapsed >= min_duration_seconds:
+                if chunks:
+                    # Compute RMS energy of most recent chunk.
+                    recent_chunk = chunks[-1]
+                    rms_energy = np.sqrt(np.mean(recent_chunk**2))
+
+                    if rms_energy > vad_threshold:
+                        # Voice detected; update last voice time.
+                        last_voice_time = time.perf_counter()
+                    else:
+                        # Silence detected; check if prolonged.
+                        silence_duration = time.perf_counter() - last_voice_time
+                        if silence_duration >= silence_duration_seconds:
+                            print(
+                                f"[VAD] Detected {silence_duration:.1f}s of silence; "
+                                f"stopping early at {elapsed:.1f}s"
+                            )
+                            break
+
+            sd.sleep(int(chunk_duration * 1000))
 
     if not chunks:
         return np.empty((0,), dtype=np.float32)
@@ -111,6 +158,10 @@ class WhisperTranscriber:
 class TextToSpeech:
     """Convert text to speech using the local pyttsx3 engine."""
 
+    _engine_lock = threading.RLock()
+    _shared_engine: Any = None
+    _shared_voices: list[Any] | None = None
+
     EMOTION_RATE_OFFSETS = {
         "anger": -6,
         "fear": -10,
@@ -147,6 +198,21 @@ class TextToSpeech:
 
         self._pyttsx3 = pyttsx3
 
+    def _get_engine(self) -> Any:
+        cls = type(self)
+        with cls._engine_lock:
+            if cls._shared_engine is None:
+                cls._shared_engine = self._pyttsx3.init()
+            return cls._shared_engine
+
+    def _get_voices(self) -> list[Any]:
+        cls = type(self)
+        with cls._engine_lock:
+            if cls._shared_voices is None:
+                engine = self._get_engine()
+                cls._shared_voices = list(engine.getProperty("voices") or [])
+            return cls._shared_voices
+
     @staticmethod
     def prepare_spoken_text(text: str) -> str:
         """Keep the LLM reply unchanged except for normalizing whitespace."""
@@ -155,7 +221,7 @@ class TextToSpeech:
     def select_voice(self, emotion: str | None = None) -> str | None:
         """Prefer a softer or livelier voice depending on the driver emotion."""
         try:
-            voices = self._pyttsx3.init().getProperty("voices")
+            voices = self._get_voices()
         except Exception:
             return None
 
@@ -183,13 +249,12 @@ class TextToSpeech:
 
         return getattr(fallback_voice, "id", None)
 
-    def speak(self, text: str, emotion: str | None = None) -> None:
-        """Speak the given text."""
+    def _speak_now(self, text: str, emotion: str | None = None) -> None:
         spoken_text = self.prepare_spoken_text(text)
         if not spoken_text:
             return
 
-        engine = self._pyttsx3.init()
+        engine = self._get_engine()
         emotion_key = (emotion or "neutral").lower()
         emotion_rate = self.EMOTION_RATE_OFFSETS.get(emotion_key, 0)
         emotion_volume = self.EMOTION_VOLUME.get(emotion_key, self.volume)
@@ -200,6 +265,17 @@ class TextToSpeech:
         engine.setProperty("volume", emotion_volume)
         engine.say(spoken_text)
         engine.runAndWait()
+
+    def speak(self, text: str, emotion: str | None = None, wait: bool = False) -> None:
+        """Queue speech on the shared TTS worker thread."""
+        spoken_text = self.prepare_spoken_text(text)
+        if not spoken_text:
+            return
+
+        TTSQueue.instance().submit(
+            lambda: self._speak_now(spoken_text, emotion=emotion),
+            wait=wait,
+        )
 
 
 def parse_args() -> argparse.Namespace:

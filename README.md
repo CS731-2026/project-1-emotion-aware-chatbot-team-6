@@ -5,7 +5,7 @@
 **DriveSense - Real-time Emotion Detection Chatbot for Drivers**  
 **COMPSYS 731, Group 6**
 
-DriveSense is a research-driven driver assistance prototype that combines real-time computer vision, local speech transcription, and LLM-based dialogue support. The system monitors a webcam feed, detects the driver's face, classifies facial emotion and eye state, estimates distraction risk, and responds through a concise in-car chatbot designed to avoid overloading the driver.
+DriveSense is a research prototype for real-time driver-state monitoring and short-form conversational support. It combines webcam-based face analysis, local speech transcription, text-to-speech, and OpenRouter-based LLM replies in a single desktop application.
 
 ## Team
 
@@ -13,82 +13,160 @@ DriveSense is a research-driven driver assistance prototype that combines real-t
 - **Xiangteng Mao**: LLM benchmarking and model selection, test case design
 - **Daniel Shaw**: UI development and system integration
 
-## Project Goals
+## What The System Does
 
-- Detect the driver's face in real time.
-- Classify facial emotion into 7 classes: `anger`, `disgust`, `fear`, `happy`, `neutral`, `sad`, `surprise`.
-- Detect eye state as `open_eye` or `closed_eye`.
-- Trigger a focus warning when the driver keeps their eyes closed beyond a threshold.
-- Provide short, emotion-aware chatbot responses through OpenRouter.
-- Benchmark both vision models and LLMs under controlled settings.
+- Detects faces from the webcam with YOLO.
+- Selects the driver face from the visible people.
+- Classifies driver emotion into 7 classes:
+  `anger`, `disgust`, `fear`, `happy`, `neutral`, `sad`, `surprise`
+- Classifies eye state into 2 classes:
+  `open_eye`, `closed_eye`
+- Raises a focus warning when the driver keeps eyes closed beyond a threshold.
+- Supports text chat and voice-triggered chat in the same GUI.
+- Uses OpenRouter to compare multiple LLMs behind one API client.
 
-## Technology Stack
+## Current Runtime Design
 
-### Vision pipeline
+The live system is intentionally split into separate responsibilities:
 
-- **YOLOv8 face detector**: real-time face localization from webcam frames
-- **timm**: image classification backbone library for emotion and eye-state classifiers
-- **PyTorch / torchvision**: training, evaluation, augmentation, inference
-- **OpenCV**: webcam capture, frame processing, overlays
+- **YOLOv8 face detection** handles localization.
+- **timm emotion classifier** handles face-level emotion classification.
+- **timm eye classifier** handles eye-state classification on cropped eye regions.
+- **FocusMonitor** handles closed-eye timing, warning state, beep, short TTS prompt, and optional voice dialogue.
+- **PyQt5 GUI** displays the video, driver state, and chat history.
 
-### Language and speech pipeline
+This keeps detection and classification decoupled and makes model benchmarking easier.
 
-- **OpenRouter**: unified gateway for comparing multiple LLMs
-- **openai Python package**: client SDK, configured with OpenRouter `base_url`
-- **faster-whisper**: local speech-to-text inference without an external speech API
-- **pyttsx3**: local text-to-speech with emotion-aware speech rate adjustment
-
-### Application layer
-
-- **PyQt5**: desktop GUI for webcam monitoring and chat interaction
-- **VS Code**: recommended development environment
-- **Python 3.11**: recommended interpreter on Windows for PyTorch CUDA support
-
-## Why YOLO + timm
-
-The project uses a split design on purpose:
-
-- **YOLO** is used for **where the face is**.
-- **timm models** are used for **what the face/eyes mean**.
-
-This is a cleaner engineering choice than forcing a single detector to do everything. Face detection and emotion classification are different tasks with different optimization targets:
-
-- detection needs fast and stable bounding boxes
-- classification needs strong feature extraction and fair backbone comparison
-
-This design also makes benchmarking easier because the same dataset and training settings can be reused across multiple `timm` backbones.
-
-## System Architecture
+## Vision Pipeline
 
 ```mermaid
 flowchart LR
-    A["Webcam"] --> B["YOLOv8 Face Detection"]
-    B --> C["Driver Face Selection"]
-    C --> D["Face Crop"]
-    D --> E["timm Emotion Classifier"]
-    C --> F["Estimated Eye Regions"]
-    F --> G["timm Eye-State Classifier"]
-    G --> H["Focus Warning Logic"]
-    E --> I["GUI State Panel"]
+    A["Webcam frame"] --> B["YOLOv8 face detector"]
+    B --> C["Primary face filtering"]
+    C --> D["Driver face selection"]
+    D --> E["Face crop"]
+    E --> F["timm emotion classifier"]
+    D --> G["Estimated left/right eye boxes"]
+    G --> H["timm eye-state classifier"]
+    F --> I["Driver state"]
     H --> I
-    A --> I
-    J["Microphone"] --> K["faster-whisper"]
-    K --> L["Emotion-aware Chatbot"]
-    E --> L
-    L --> M["OpenRouter"]
-    M --> N["Selected LLM"]
-    N --> I
+    I --> J["FocusMonitor"]
+    I --> K["GUI overlays"]
+    J --> K
 ```
+
+### Driver selection logic
+
+When multiple faces are visible, the system does **not** use all faces equally.
+
+It first filters out very small / far faces, then selects the driver from the remaining candidates. The current default heuristic is:
+
+- keep only primary face candidates
+- choose the **left-most** candidate as the driver
+
+This matches the current project assumption for the demo setup.
+
+### Eye-state logic
+
+Current eye detection is not landmark-based. The system:
+
+1. detects the face
+2. estimates left and right eye boxes from the face box geometry
+3. crops those eye patches
+4. sends the patches to the eye classifier
+
+This is simple and fast, but less precise than a dedicated facial-landmark pipeline.
+
+## Speech And LLM Pipeline
+
+```mermaid
+flowchart LR
+    A["Microphone"] --> B["Local recording"]
+    B --> C["faster-whisper transcription"]
+    C --> D["DriverAssistantChatbot"]
+    D --> E["OpenRouter"]
+    E --> F["Selected LLM"]
+    F --> G["Text reply"]
+    G --> H["TTS queue"]
+    H --> I["Spoken reply"]
+    G --> J["GUI chat panel"]
+```
+
+### Important runtime behaviors
+
+- Text input produces **text output + spoken output**.
+- Manual voice input produces **transcribed text in the chat panel + text reply in the chat panel + spoken reply**.
+- Closed-eye auto intervention also pushes **transcribed text + assistant reply** into the GUI chat panel.
+- TTS playback is serialized through a **single global queue** to avoid `pyttsx3` thread-safety issues on Windows.
+
+## OpenRouter / LLM Behavior
+
+The GUI currently supports:
+
+- `openai/gpt-4o-mini`
+- `anthropic/claude-haiku-4-5`
+- `deepseek/deepseek-chat`
+
+The code uses the `openai` Python package with:
+
+- `base_url = https://openrouter.ai/api/v1`
+
+### Prompt behavior
+
+The chatbot prompt is built from:
+
+- detected emotion
+- eye state
+- risk level
+- focus alert state
+- driver-side context
+- current interaction mode (`direct reply` vs `auto-triggered check-in`)
+
+Internal file paths such as checkpoint paths are **not** included in the LLM state anymore.
+
+### Provider fallback
+
+If some OpenRouter providers reject a request with `403`, the runtime:
+
+1. retries with a more provider-safe system prompt
+2. falls back to `deepseek/deepseek-chat` if needed
+
+## Focus Warning Behavior
+
+When the selected driver keeps eyes closed longer than the configured threshold:
+
+1. the GUI shows a focus warning
+2. a beep is played
+3. a short TTS prompt is spoken
+4. optional voice dialogue starts
+
+The short warning prompt is no longer fully fixed. It now varies by emotion and risk context, for example:
+
+- `Please stay focused. Take a breath.`
+- `Please stay focused. Stay calm.`
+- `Please stay focused. Are you okay?`
+- `Please stay focused. Eyes on the road.`
+
+The focus-monitor state is synchronized before intervention is launched, so the LLM sees the correct `risk` and `focus_alert` values for the triggering frame.
 
 ## Repository Structure
 
 ```text
 G:\731
+|-- README.md
+|-- README.zh-CN.md
 |-- requirements.txt
 |-- drivesense/
 |   |-- __main__.py
 |   |-- frontend/
+|   |   |-- gui.py
 |   |-- backend/
+|   |   |-- vision.py
+|   |   |-- chatbot.py
+|   |   |-- focus_monitor.py
+|   |   |-- speech.py
+|   |   |-- tts_queue.py
+|   |   |-- voice_chat.py
 |   |-- data/
 |   |-- training/
 |   |-- benchmarks/
@@ -96,40 +174,27 @@ G:\731
 |   |-- utils/
 |-- tests/
 |-- dataset/                 # raw datasets, ignored by Git
-|-- prepared_datasets/       # generated training sets, ignored by Git
+|-- prepared_datasets/       # generated datasets, ignored by Git
 |-- runs_timm/               # training outputs, ignored by Git
-|-- runs/                    # legacy outputs, ignored by Git
 |-- weights/                 # detector weights
 ```
 
-## Code Organization
-
-- `drivesense/frontend`: GUI layer and user-facing desktop interaction
-- `drivesense/backend`: vision, chatbot, and speech runtime logic
-- `drivesense/data`: dataset preparation and label repair utilities
-- `drivesense/training`: model training entry points
-- `drivesense/benchmarks`: vision and LLM evaluation scripts
-- `drivesense/database`: reserved storage layer; currently file-based and stateless
-- `drivesense/utils`: small utility helpers
-- `tests`: smoke tests for package layout and import stability
-- `python -m drivesense.<module>`: the only supported way to run project modules
-
 ## Datasets
 
-The project expects raw data under `dataset/`. Current data sources include:
+Raw datasets are expected under:
 
 - `dataset/emotion`
 - `dataset/eye`
 - `dataset/Affectnet-HQ`
 
-After preparation, the processed datasets are written to:
+Prepared datasets are written to:
 
 - `prepared_datasets/emotion`
 - `prepared_datasets/eye`
 
-### Standardized labels
+### Standard label sets
 
-Emotion classes:
+Emotion labels:
 
 - `anger`
 - `disgust`
@@ -139,53 +204,12 @@ Emotion classes:
 - `sad`
 - `surprise`
 
-Eye-state classes:
+Eye labels:
 
 - `closed_eye`
 - `open_eye`
 
-## Model Benchmark Design
-
-The emotion benchmark compares five backbones under the same training conditions:
-
-- `resnet50`
-- `efficientnet_b0`
-- `efficientnet_b3`
-- `swin_tiny`
-- `mobilenet_v2`
-
-Fair comparison rules:
-
-- same dataset split
-- same image size
-- same epoch count
-- same training script
-- same evaluation logic
-- only the model backbone changes
-
-Outputs include:
-
-- validation accuracy history
-- best validation accuracy
-- test accuracy
-- average inference speed
-- summary plots and comparison tables
-
-## LLM Benchmark Design
-
-The chatbot comparison currently targets:
-
-- `openai/gpt-4o-mini`
-- `anthropic/claude-haiku-4-5`
-- `deepseek/deepseek-chat`
-
-Evaluation dimensions:
-
-- response latency
-- manual safety/tone quality score
-- usage cost
-
-Fixed scenarios are used so all models are tested under the same prompts and emotional context.
+If raw images or CSV labels are changed, rerun dataset preparation before training.
 
 ## Environment Setup
 
@@ -196,7 +220,7 @@ git clone https://github.com/CS731-2026/project-1-emotion-aware-chatbot-team-6.g
 cd project-1-emotion-aware-chatbot-team-6
 ```
 
-If you are working directly in `G:\731`, use that directory as the repository root.
+If you work directly in `G:\731`, that directory is the project root.
 
 ### 2. Create a virtual environment
 
@@ -208,14 +232,14 @@ python -m pip install --upgrade pip
 
 ### 3. Install dependencies
 
-For CUDA-enabled PyTorch on Windows:
+Example for CUDA-enabled PyTorch on Windows:
 
 ```powershell
 python -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu130
 python -m pip install -r requirements.txt
 ```
 
-If CUDA is unavailable, install the CPU version of PyTorch and run training with `--device cpu`.
+If CUDA is unavailable, install a CPU build of PyTorch and run with `--device cpu`.
 
 ### 4. Configure environment variables
 
@@ -226,21 +250,19 @@ OPENROUTER_API_KEY=your_openrouter_api_key_here
 OPENROUTER_HTTP_REFERER=https://openrouter.ai
 ```
 
-The `.env` file is ignored by Git and should never be committed.
+Do not commit `.env`.
 
-## Preparing the Datasets
+## Preparing Datasets
 
-Before training, prepare the datasets into the unified folder structure:
+Run this whenever raw images or label files change:
 
 ```powershell
 python -m drivesense.data.prepare_dataset --overwrite
 ```
 
-This step is required whenever the raw dataset is changed or relabeled.
-
 ## Training
 
-### Emotion classification
+### Emotion models
 
 Example:
 
@@ -256,156 +278,116 @@ Available `--model-key` values:
 - `swin_tiny`
 - `mobilenet_v2`
 
-### Eye-state classification
+### Eye-state model
 
 ```powershell
 python -m drivesense.training.train_eye_timm --device cuda --overwrite
 ```
 
-Training outputs are stored under `runs_timm/`, for example:
+Training outputs are saved under `runs_timm/`, for example:
 
 - `runs_timm/efficientnet_b0/`
 - `runs_timm/eye_efficientnet_b0/`
 
-Each run typically includes:
+## Benchmark Commands
 
-- `best_model.pth`
-- `last_model.pth`
-- `metadata.json`
-- logs and plots
-
-## Benchmark Summary
-
-After finishing the five emotion runs:
+### Summarize the five timm emotion runs
 
 ```powershell
 python -m drivesense.benchmarks.summarize_timm_benchmark --run-names resnet50 efficientnet_b0 efficientnet_b3 swin_tiny mobilenet_v2
 ```
 
-## Real-Time Webcam Monitoring
-
-### CLI mode
-
-```powershell
-python -m drivesense.backend.vision --device cuda --window-width 1280 --window-height 720
-```
-
-Behavior:
-
-- green box: face and emotion
-- blue box: eye regions and eye state
-- warning text appears when the selected driver keeps eyes closed for too long
-- optional per-frame emotion top-3 probabilities can be printed for debugging
-
-### GUI mode
-
-```powershell
-python -m drivesense.frontend.gui --device cuda --default-llm-model openai/gpt-4o-mini
-```
-
-GUI features:
-
-- live webcam display
-- current emotion and risk level
-- OpenRouter LLM selection
-- text chat interface
-- press-and-hold microphone recording
-- background-thread execution to avoid UI freezes
-
-## Chatbot Usage
-
-### CLI chatbot
-
-```powershell
-python -m drivesense.backend.chatbot --model openai/gpt-4o-mini --emotion anger --temperature 1.0
-```
-
-Design principles:
-
-- reply in at most 2 to 3 short sentences
-- stay calm and non-alarmist
-- adapt tone to the detected emotion
-- minimize distraction while driving
-
-## Speech-to-Text
-
-```powershell
-python -m drivesense.backend.speech --duration 5 --model-size base
-```
-
-This runs `faster-whisper` locally and does not require an external speech API.
-
-## LLM Benchmark Commands
+### LLM benchmark
 
 ```powershell
 python -m drivesense.benchmarks.llm_benchmark
 python -m drivesense.benchmarks.score_llm_results --input-csv benchmark_results\llm_benchmark\manual_scores_template.csv
 ```
 
-Temperature follow-up experiment:
+### Temperature sweep
 
 ```powershell
 python -m drivesense.benchmarks.temperature_sweep --model openai/gpt-4o-mini
 python -m drivesense.benchmarks.score_llm_results --input-csv benchmark_results\temperature_sweep\manual_scores_template.csv --group-by temperature
 ```
 
-## Version Control and Collaboration
+## Running The System
 
-This project is intended for team collaboration. Follow a basic Git workflow instead of pushing directly from unreviewed local experiments.
+### GUI
 
-### Recommended workflow
+```powershell
+python -m drivesense.frontend.gui --device cuda --default-llm-model openai/gpt-4o-mini
+```
 
-1. Pull the latest changes.
-2. Create a feature branch.
-3. Make focused commits.
-4. Push the branch to GitHub.
-5. Open a Pull Request.
-6. Review and merge after confirmation.
+### CLI vision mode
+
+```powershell
+python -m drivesense.backend.vision --device cuda --window-width 1280 --window-height 720
+```
+
+### CLI chatbot
+
+```powershell
+python -m drivesense.backend.chatbot --model openai/gpt-4o-mini --emotion neutral --temperature 1.0
+```
+
+### CLI speech test
+
+```powershell
+python -m drivesense.backend.speech --duration 5 --model-size base
+```
+
+## GUI Features
+
+- live webcam stream
+- face box and eye box overlays
+- current driver emotion / eye state / risk display
+- LLM model selection
+- text chat
+- press-and-hold microphone input
+- automatic focus-triggered voice intervention
+- synchronized chat log for text and voice interactions
+
+## Version Control
+
+Recommended workflow:
+
+1. pull latest `main`
+2. create a feature branch
+3. make focused commits
+4. push the branch
+5. open a PR
+6. merge after review
 
 Example:
 
 ```powershell
 git pull origin main
-git checkout -b feature/update-gui-warning
+git checkout -b feature/update-focus-monitor
 git add .
-git commit -m "Improve driver warning overlay placement"
-git push -u origin feature/update-gui-warning
+git commit -m "Improve focus monitor state synchronization"
+git push -u origin feature/update-focus-monitor
 ```
 
-### What should not be committed
+### Do not commit
 
-Do **not** commit:
-
-- virtual environments such as `.venv311/`
+- `.venv311/`
 - `.env`
-- raw datasets under `dataset/`
-- processed datasets under `prepared_datasets/`
-- training outputs under `runs/` and `runs_timm/`
-- large checkpoint files such as `*.pth`
+- `dataset/`
+- `prepared_datasets/`
+- `runs_timm/`
+- large checkpoints such as `*.pth`
 
-These paths are already covered in `.gitignore`, but contributors should still check `git status` before committing.
-
-### Commit style guidance
-
-- Keep one logical change per commit.
-- Use clear commit messages.
-- Avoid mixing dataset edits, model outputs, and source code changes in one commit.
-- Re-run the relevant script before pushing if your change affects training or inference behavior.
-
-## Reproducibility Notes
-
-- Run `prepare_dataset.py` after changing raw data.
-- Use the same benchmark settings when comparing models.
-- Keep model checkpoints out of Git history.
-- Prefer storing final trained weights externally if they exceed GitHub size limits.
+Always check `git status` before committing.
 
 ## Known Constraints
 
-- Real driving deployment is out of scope; this is a prototype and research project.
-- Webcam-based face selection is heuristic when multiple people appear.
-- Eye regions are estimated geometrically from face boxes rather than detected by a dedicated landmark model.
-- LLM quality scoring still includes manual evaluation.
+- This is a prototype, not a production driving system.
+- Driver selection is heuristic-based when multiple people appear.
+- Eye boxes are geometry-estimated from face boxes, not landmark-detected.
+- LLM safety/tone evaluation still includes manual scoring.
+- Some OpenRouter providers may reject requests depending on account/provider policy.
 
-## License and Academic Use
+## Academic Use
 
-This repository is for COMPSYS 731 coursework and research prototyping. If a formal license is needed for external reuse, add a dedicated `LICENSE` file and align it with course or team requirements.
+This repository is primarily for COMPSYS 731 coursework and prototype research. Add a dedicated `LICENSE` file if the project needs formal external reuse terms.
