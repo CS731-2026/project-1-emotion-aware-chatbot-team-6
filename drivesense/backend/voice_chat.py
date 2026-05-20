@@ -84,12 +84,18 @@ class VoiceChatPipeline:
             raise RuntimeError("Another voice session is already active.")
 
         try:
+            if VoiceIOGate.is_tts_active():
+                raise NoSpeechDetectedError("No speech detected.")
             print(f"Recording for {duration_seconds} seconds...")
             audio = record_microphone_audio(duration_seconds=duration_seconds)
 
             if audio.size == 0:
                 raise ValueError("No audio was captured. Please try again.")
+            if VoiceIOGate.is_tts_active():
+                raise NoSpeechDetectedError("No speech detected.")
 
+            # Do not transcribe audio captured around local playback. This avoids
+            # feeding the assistant's own TTS output back into Whisper.
             result = self.transcriber.transcribe_audio(audio)
             user_input = result.text.strip()
             print(f"Transcribed: {user_input}")

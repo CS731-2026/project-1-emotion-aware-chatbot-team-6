@@ -17,12 +17,12 @@ from drivesense.backend.speech import detect_text_language, is_supported_zh_en_t
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 logger = logging.getLogger(__name__)
-DEFAULT_MODEL = "openai/gpt-4o-mini"
+DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
 FALLBACK_MODEL = "deepseek/deepseek-chat"
 DEFAULT_MAX_HISTORY_MESSAGES = 10
 SUPPORTED_LLM_MODELS = [
-    "openai/gpt-4o-mini",
     "anthropic/claude-haiku-4-5",
+    "openai/gpt-4o-mini",
     "deepseek/deepseek-chat",
 ]
 ALLOWED_DRIVER_STATE_KEYS = (

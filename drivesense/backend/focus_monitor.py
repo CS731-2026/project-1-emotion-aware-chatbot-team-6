@@ -1,24 +1,22 @@
-"""Drowsiness & emotion focus monitor.
+"""Drowsiness and emotion focus monitor.
 
-Tracks TWO trigger paths for multi-modal intervention:
+Tracks two trigger paths for multi-modal intervention:
 
-  PATH A — Drowsiness (original):
-    Driver's eyes closed >= threshold (default 2 s) -> beep + LLM TTS + dialogue.
+  PATH A - Drowsiness:
+    Driver eyes closed >= threshold (default 2 s) -> beep + LLM TTS + dialogue.
 
-  PATH B — Emotion (NEW):
-    Dangerous emotion sustained >= threshold -> beep + LLM TTS + dialogue.
+  PATH B - Emotion:
+    Dangerous emotion sustained >= threshold -> beep + LLM TTS/dialogue.
     Thresholds per emotion:
-      anger / fear  -> 5 s   (HIGH risk, full dialogue)
-      sad           -> 8 s   (MED risk, full dialogue)
-      disgust       -> 10 s  (LOW risk, TTS only, no dialogue)
-      surprise      -> 10 s  (MED risk, TTS only, no dialogue)
+      anger / fear  -> 3 s  (HIGH risk, full dialogue)
+      sad           -> 3 s  (MED risk, full dialogue)
+      disgust       -> 3 s  (LOW risk, TTS only, no dialogue)
+      surprise      -> 3 s  (MED risk, TTS only, no dialogue)
       happy/neutral -> never triggered
 
 Both paths share a single cooldown timer so they never fire simultaneously.
-
-The monitor is designed to be polled once per processed frame from the main
-vision loop. All side effects (audio, network calls) run on a background
-thread so the camera loop never blocks.
+The monitor is polled once per processed frame from the vision loop. Audio and
+network side effects run on background threads so the camera loop never blocks.
 """
 
 from __future__ import annotations
@@ -30,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from drivesense.backend.chatbot import ChatbotResponse, DriverAssistantChatbot
+from drivesense.backend.chatbot import DEFAULT_MODEL, ChatbotResponse, DriverAssistantChatbot
 from drivesense.backend.speech import TTS_PRIORITY_ALERT, TextToSpeech
 from drivesense.backend.voice_chat import NoSpeechDetectedError, VoiceChatPipeline
 
@@ -42,11 +40,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 EMOTION_TRIGGER_THRESHOLDS: dict[str, float] = {
-    "anger": 5.0,
-    "fear": 5.0,
-    "sad": 8.0,
-    "disgust": 10.0,
-    "surprise": 10.0,
+    "anger": 3.0,
+    "fear": 3.0,
+    "sad": 3.0,
+    "disgust": 3.0,
+    "surprise": 3.0,
 }
 """Seconds of sustained emotion before the system intervenes."""
 
@@ -57,8 +55,8 @@ EMOTION_TTS_ONLY: set[str] = {"disgust", "surprise"}
 """Emotions that get beep -> TTS only (no microphone recording / dialogue)."""
 
 EMOTION_CHECK_IN_SENTENCES: dict[str, str] = {
-    "anger": "I noticed you seem tense. Take a slow breath — the road needs your calm focus.",
-    "fear": "You seem a bit uneasy. It's okay — stay steady, you've got this.",
+    "anger": "I noticed you seem tense. Take a slow breath - the road needs your calm focus.",
+    "fear": "You seem a bit uneasy. It's okay - stay steady, you've got this.",
     "sad": "You seem a little down. Would you like to take a short break when it's safe?",
     "disgust": "Try to stay relaxed and keep your attention on the road.",
     "surprise": "Stay calm and keep your eyes steady on the road ahead.",
@@ -72,7 +70,7 @@ class FocusMonitorConfig:
     closed_eye_seconds: float = 2.0
     """Continuous closed-eye duration that triggers a high-risk event."""
 
-    cooldown_seconds: float = 30.0
+    cooldown_seconds: float = 10.0
     """Minimum gap between two high-risk triggers (shared by eye & emotion)."""
 
     beep_frequency_hz: int = 1000
@@ -87,7 +85,7 @@ class FocusMonitorConfig:
     record_seconds: float = 5.0
     """How long to listen for the driver's reply."""
 
-    chat_model: str = "openai/gpt-4o-mini"
+    chat_model: str = DEFAULT_MODEL
     """OpenRouter model id used for the LLM reply step."""
 
     alert_max_output_tokens: int = 40
@@ -115,7 +113,7 @@ class _State:
     is_handling_event: bool = False
     last_warning_active: bool = False
     last_emotion_warning_active: bool = False
-    chat_model: str = "openai/gpt-4o-mini"
+    chat_model: str = DEFAULT_MODEL
     temperature: float = 1.0
     driver_state: dict[str, Any] | None = None
     current_level: int = 0
@@ -187,7 +185,7 @@ def _build_emotion_alert_prompt(
         "Say exactly one short, calm, supportive sentence to help the driver feel better "
         "and refocus on driving safely. "
         "Do not mention being an AI. Do not ask a long question. "
-        "Match your tone to the emotion — be soothing for anger/fear, gentle for sadness."
+        "Match your tone to the emotion - be soothing for anger/fear, gentle for sadness."
     )
 
 
@@ -216,6 +214,10 @@ class FocusMonitor:
         self._on_voice_error = on_voice_error
         self._state = _State()
         self._state.chat_model = self.config.chat_model
+        self._voice_dialogue_enabled = True
+
+    def set_voice_dialogue_enabled(self, enabled: bool) -> None:
+        self._voice_dialogue_enabled = enabled
 
     def get_state_snapshot(self) -> dict[str, Any]:
         with self._state.lock:
@@ -460,8 +462,9 @@ class FocusMonitor:
                     self._tts.speak(
                         alert_sentence,
                         emotion=emotion,
-                        wait=True,
+                        wait=False,
                         priority=TTS_PRIORITY_ALERT,
+                        drop_pending_below_priority=TTS_PRIORITY_ALERT,
                     )
                 except Exception as exc:
                     logger.exception("TTS speak failed: %s", exc)
@@ -471,7 +474,11 @@ class FocusMonitor:
                 trigger_type == "emotion" and normalized_emotion in EMOTION_FULL_DIALOGUE
             )
 
-            if use_dialogue and self._voice_pipeline is not None:
+            if (
+                use_dialogue
+                and self._voice_dialogue_enabled
+                and self._voice_pipeline is not None
+            ):
                 try:
                     result = self._voice_pipeline.process_voice_input(
                         duration_seconds=self.config.record_seconds,

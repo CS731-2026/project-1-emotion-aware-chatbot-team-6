@@ -296,12 +296,12 @@ class TextToSpeech:
     _shared_voices: list[Any] | None = None
 
     EMOTION_RATE_OFFSETS = {
-        "anger": -6,
-        "fear": -10,
-        "sad": -12,
+        "anger": 0,
+        "fear": 0,
+        "sad": 0,
         "happy": 8,
         "surprise": 6,
-        "disgust": -4,
+        "disgust": 0,
         "neutral": 0,
     }
 
@@ -404,7 +404,10 @@ class TextToSpeech:
         emotion_key = (emotion or "neutral").lower()
         emotion_rate_offset = self.EMOTION_RATE_OFFSETS.get(emotion_key, 0)
         base_rate = int(round((self.rate - 150) / 15)) + 2
-        sapi_rate = max(-10, min(10, base_rate + int(round(emotion_rate_offset / 4))))
+        sapi_rate = max(
+            -10,
+            min(10, max(base_rate, base_rate + int(round(emotion_rate_offset / 4)))),
+        )
         volume_percent = max(
             0,
             min(100, int(round(self.EMOTION_VOLUME.get(emotion_key, self.volume) * 100))),
@@ -462,7 +465,7 @@ class TextToSpeech:
 
                 if voice_id:
                     engine.setProperty("voice", voice_id)
-                engine.setProperty("rate", self.rate + emotion_rate)
+                engine.setProperty("rate", max(self.rate, self.rate + emotion_rate))
                 engine.setProperty("volume", emotion_volume)
                 engine.say(spoken_text)
                 engine.runAndWait()

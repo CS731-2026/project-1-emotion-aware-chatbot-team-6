@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
-from drivesense.backend.speech import WhisperTranscriber, record_microphone_audio
+from drivesense.backend.speech import VoiceIOGate, WhisperTranscriber, record_microphone_audio
 
 logger = logging.getLogger(__name__)
 
@@ -101,22 +101,27 @@ class WakeWordListener:
         with self._lock:
             if self._running:
                 return
+            if self._thread is not None and not self._thread.is_alive():
+                self._thread = None
+            if self._thread is not None:
+                return
             self._running = True
 
         self._thread = threading.Thread(target=self._listen_loop, daemon=True, name="WakeWordListener")
         self._thread.start()
         logger.info(f"Wake-word listener started. Listening for: {self.config.keywords}")
 
-    def stop(self) -> None:
+    def stop(self, wait: bool = True) -> None:
         """Stop the background listener thread."""
         with self._lock:
             if not self._running:
                 return
             self._running = False
 
-        if self._thread is not None:
+        if wait and self._thread is not None:
             self._thread.join(timeout=5.0)
-            self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
         logger.info("Wake-word listener stopped.")
 
     def _listen_loop(self) -> None:
@@ -131,6 +136,9 @@ class WakeWordListener:
 
                 while self._running:
                     try:
+                        if VoiceIOGate.is_tts_active():
+                            time.sleep(0.08)
+                            continue
                         # Record a short chunk (e.g., 1 second) to transcribe.
                         # VAD disabled: short fixed chunks, not user speech input.
                         audio = record_microphone_audio(
@@ -142,7 +150,13 @@ class WakeWordListener:
                         )
 
                         if audio.size == 0:
-                            # No audio captured; continue.
+                            if VoiceIOGate.is_tts_active():
+                                time.sleep(0.08)
+                            else:
+                                time.sleep(0.02)
+                            continue
+                        if VoiceIOGate.is_tts_active():
+                            time.sleep(0.08)
                             continue
 
                         # Transcribe the chunk with Whisper.
@@ -218,6 +232,10 @@ class ContinuedConversationListener:
         with self._lock:
             if self._running:
                 return
+            if self._thread is not None and not self._thread.is_alive():
+                self._thread = None
+            if self._thread is not None:
+                return
             self._running = True
 
         self._thread = threading.Thread(
@@ -226,16 +244,17 @@ class ContinuedConversationListener:
         self._thread.start()
         logger.info(f"[Continued] Listening for follow-up input (timeout: {self.timeout_seconds}s)")
 
-    def stop(self) -> None:
+    def stop(self, wait: bool = True) -> None:
         """Stop the continued conversation listener."""
         with self._lock:
             if not self._running:
                 return
             self._running = False
 
-        if self._thread is not None:
+        if wait and self._thread is not None:
             self._thread.join(timeout=5.0)
-            self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
         logger.info("[Continued] Listener stopped.")
 
     def _listen_loop(self) -> None:
@@ -255,6 +274,9 @@ class ContinuedConversationListener:
                         break
 
                     try:
+                        if VoiceIOGate.is_tts_active():
+                            time.sleep(0.08)
+                            continue
                         audio = record_microphone_audio(
                             duration_seconds=CHUNK_SECONDS,
                             sample_rate=16000,
@@ -263,6 +285,13 @@ class ContinuedConversationListener:
                             wait_for_lock=False,
                         )
                         if audio.size == 0:
+                            if VoiceIOGate.is_tts_active():
+                                time.sleep(0.08)
+                            else:
+                                time.sleep(0.02)
+                            continue
+                        if VoiceIOGate.is_tts_active():
+                            time.sleep(0.08)
                             continue
 
                         rms = float(np.sqrt(np.mean(audio ** 2)))
