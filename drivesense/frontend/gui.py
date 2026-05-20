@@ -112,6 +112,7 @@ from drivesense.backend.speech import (
     is_supported_zh_en_text,
     record_microphone_audio,
 )
+from drivesense.backend.tts_queue import TTSQueue
 from drivesense.backend.wake_word import WakeWordListener, WakeWordConfig, ContinuedConversationListener
 
 
@@ -455,10 +456,14 @@ class VisionWorker(QObject):
         self._running = True
         self.current_chat_model = args.default_llm_model
         self.current_temperature = float(args.default_temperature)
+        self.voice_dialogue_enabled = bool(args.enable_voice_dialogue)
 
     def update_chat_settings(self, model: str, temperature: float) -> None:
         self.current_chat_model = model
         self.current_temperature = float(temperature)
+
+    def update_voice_dialogue_enabled(self, enabled: bool) -> None:
+        self.voice_dialogue_enabled = enabled
 
     def stop(self) -> None:
         self._running = False
@@ -772,6 +777,7 @@ class VisionWorker(QObject):
                     "focus_alert": False,
                     "driver_side": self.args.driver_side,
                 }
+                focus_monitor.set_voice_dialogue_enabled(self.voice_dialogue_enabled)
                 focus_monitor.set_runtime_context(
                     chat_model=self.current_chat_model,
                     temperature=self.current_temperature,
@@ -1050,6 +1056,8 @@ class DriverAssistantWindow(QMainWindow):
         self._last_logged_snapshot: tuple[bool, str, str, int] | None = None
         self.nav_buttons: dict[str, QPushButton] = {}
         self.wake_word_listening = False
+        self.voice_input_enabled = True
+        self.tts_muted = TTSQueue.instance().is_muted()
         self.wake_word_listener: WakeWordListener | None = None
         self.continued_listener: ContinuedConversationListener | None = None
         self._in_continued_mode = False
@@ -1255,6 +1263,20 @@ class DriverAssistantWindow(QMainWindow):
             "padding: 12px 0 0 0; font-size: 14px;"
         )
         settings_layout.addWidget(self.context_label)
+
+        audio_controls_row = QHBoxLayout()
+        audio_controls_row.setSpacing(10)
+        self.mute_button = QPushButton("Mute TTS")
+        self.mute_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mute_button.clicked.connect(self.toggle_tts_mute)
+        self.mute_button.setStyleSheet(self.secondary_control_button_style(active=False))
+        self.stop_listening_button = QPushButton("Stop Listening")
+        self.stop_listening_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_listening_button.clicked.connect(self.toggle_voice_input)
+        self.stop_listening_button.setStyleSheet(self.secondary_control_button_style(active=False))
+        audio_controls_row.addWidget(self.mute_button)
+        audio_controls_row.addWidget(self.stop_listening_button)
+        settings_layout.addLayout(audio_controls_row)
         right_panel.addWidget(settings_card)
         right_panel.addWidget(self.build_emotion_alert_rules_card())
 
@@ -1369,9 +1391,10 @@ class DriverAssistantWindow(QMainWindow):
         try:
             self.wake_word_listener.start()
             self.wake_word_listening = True
-            self.mic_button.setVisible(False)
-            self.mic_button.setEnabled(False)
-            self.status_label.setText("Status: listening for 'hey moss")
+            self.mic_button.setText("Wake-word: ON")
+            self.mic_button.setEnabled(True)
+            self.status_label.setText("Status: listening for 'hey moss'")
+            self.update_audio_control_buttons()
             self.append_log("voice", "Wake-word listener started for 'hey moss'")
         except Exception as exc:
             print(f"Failed to start wake-word listener automatically: {exc}")
@@ -1426,6 +1449,17 @@ class DriverAssistantWindow(QMainWindow):
             + (f"border-bottom: 2px solid {'#0071e3' if active else 'transparent'};" if active else "")
             + "}"
             "QPushButton:hover { color: #ffffff; }"
+        )
+
+    def secondary_control_button_style(self, active: bool) -> str:
+        bg = "#fee2e2" if active else "#eeeeee"
+        hover = "#fecaca" if active else "#e1e1e1"
+        fg = "#991b1b" if active else "#1a1c1c"
+        return (
+            f"QPushButton {{ background-color: {bg}; color: {fg}; border: none; "
+            "border-radius: 10px; padding: 9px 12px; font-weight: 700; font-size: 13px; }}"
+            f"QPushButton:hover {{ background-color: {hover}; }}"
+            "QPushButton:disabled { color: #9ca3af; background-color: #f3f4f6; }"
         )
 
     def switch_page(self, page_name: str) -> None:
@@ -2025,8 +2059,24 @@ class DriverAssistantWindow(QMainWindow):
 
     def clear_chat_worker(self) -> None:
         self.send_button.setEnabled(True)
-        # mic_button is hidden; no state toggle necessary.
+        self.mic_button.setEnabled(self.voice_input_enabled)
         self.chat_worker = None
+
+    def update_audio_control_buttons(self) -> None:
+        self.mute_button.setText("Unmute TTS" if self.tts_muted else "Mute TTS")
+        self.mute_button.setStyleSheet(self.secondary_control_button_style(active=self.tts_muted))
+        self.stop_listening_button.setText(
+            "Start Listening" if not self.voice_input_enabled else "Stop Listening"
+        )
+        self.stop_listening_button.setStyleSheet(
+            self.secondary_control_button_style(active=not self.voice_input_enabled)
+        )
+        self.ptt_button.setEnabled(self.voice_input_enabled)
+        self.mic_button.setEnabled(self.voice_input_enabled)
+        if not self.voice_input_enabled:
+            self.mic_button.setText("Wake-word: OFF")
+        elif self.wake_word_listening:
+            self.mic_button.setText("Wake-word: ON")
 
     def _pause_voice_listeners_for_tts(self) -> None:
         if self.continued_listener is not None:
@@ -2034,10 +2084,16 @@ class DriverAssistantWindow(QMainWindow):
         if self.wake_word_listener is not None and self.wake_word_listening:
             self.wake_word_listener.stop()
             self.wake_word_listening = False
+        self.update_audio_control_buttons()
 
     def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
         if not text.strip():
             self._on_tts_finished()
+            return
+
+        if self.tts_muted or TTSQueue.instance().is_muted():
+            self.status_label.setText("Status: assistant reply audio muted")
+            self.append_log("voice", "Assistant reply TTS skipped because mute is enabled")
             return
 
         self._pause_voice_listeners_for_tts()
@@ -2070,6 +2126,12 @@ class DriverAssistantWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_tts_finished(self) -> None:
+        if not self.voice_input_enabled:
+            self._in_continued_mode = False
+            self.status_label.setText("Status: speech finished; listening is stopped")
+            self.append_log("voice", "TTS finished; follow-up listening skipped because listening is stopped")
+            self.update_audio_control_buttons()
+            return
         self._in_continued_mode = True
         if self.continued_listener is not None:
             self.continued_listener.start()
@@ -2088,6 +2150,10 @@ class DriverAssistantWindow(QMainWindow):
         If `push_to_talk` is True, disable VAD and record until user releases button.
         Otherwise use VAD with configured silence threshold.
         """
+        if not self.voice_input_enabled:
+            self.status_label.setText("Status: microphone listening is stopped")
+            self.append_log("voice", "Recording request ignored because listening is stopped")
+            return
         if self.speech_worker is not None:
             return
         if push_to_talk:
@@ -2138,17 +2204,32 @@ class DriverAssistantWindow(QMainWindow):
         else:
             # 空转录：如果还在 continued 窗口，重新等；否则恢复 wake-word
             if self._in_continued_mode:
-                if self.continued_listener is not None:
+                if self.voice_input_enabled and self.continued_listener is not None:
                     self.continued_listener.start()
                     self.status_label.setText("Status: listening for follow-up (10 s)...")
             else:
-                if self.wake_word_listener is not None and not self.wake_word_listening:
+                if (
+                    self.voice_input_enabled
+                    and self.wake_word_listener is not None
+                    and not self.wake_word_listening
+                ):
                     self.wake_word_listener.start()
                     self.wake_word_listening = True
-                self.status_label.setText("Status: listening for 'hey moss'")
+                self.status_label.setText(
+                    "Status: listening for 'hey moss'"
+                    if self.voice_input_enabled
+                    else "Status: microphone listening stopped"
+                )
+            self.update_audio_control_buttons()
             self.append_log("voice", "Empty transcription result")
 
     def handle_speech_error(self, message: str) -> None:
+        if not self.voice_input_enabled and (
+            "No audio was captured" in message or "microphone" in message.lower()
+        ):
+            self.status_label.setText("Status: microphone listening stopped")
+            self.append_log("voice", "Speech worker stopped after listening was disabled")
+            return
         if message.strip() == "Only Chinese and English voice input is supported.":
             self.status_label.setText("Status: only Chinese and English voice input is supported")
             self.append_log("error", "Speech: unsupported language")
@@ -2167,19 +2248,67 @@ class DriverAssistantWindow(QMainWindow):
             pass
         else:
             # 普通录音（wake-word / PTT）结束，恢复 wake-word
-            if self.wake_word_listener is not None and not self.wake_word_listening:
+            if (
+                self.voice_input_enabled
+                and self.wake_word_listener is not None
+                and not self.wake_word_listening
+            ):
                 self.wake_word_listener.start()
                 self.wake_word_listening = True
-            self.status_label.setText("Status: listening for 'hey moss'")
+            self.status_label.setText(
+                "Status: listening for 'hey moss'"
+                if self.voice_input_enabled
+                else "Status: microphone listening stopped"
+            )
+        self.update_audio_control_buttons()
         self.append_log("voice", "Speech worker cleared")
     
+    def toggle_tts_mute(self) -> None:
+        self.tts_muted = not self.tts_muted
+        TTSQueue.instance().set_muted(self.tts_muted)
+        if self.tts_muted:
+            self.status_label.setText("Status: TTS muted")
+            self.append_log("voice", "TTS muted; pending speech jobs cleared")
+        else:
+            self.status_label.setText("Status: TTS unmuted")
+            self.append_log("voice", "TTS unmuted")
+        self.update_audio_control_buttons()
+
+    def stop_all_listening(self) -> None:
+        if self.continued_listener is not None:
+            self.continued_listener.stop()
+        if self.wake_word_listener is not None and self.wake_word_listening:
+            self.wake_word_listener.stop()
+        self.wake_word_listening = False
+        self._in_continued_mode = False
+        if self.speech_worker is not None:
+            self.speech_worker.stop_recording()
+
+    def start_background_listening(self) -> None:
+        if self.wake_word_listener is not None and not self.wake_word_listening:
+            self.wake_word_listener.start()
+            self.wake_word_listening = True
+
+    def toggle_voice_input(self) -> None:
+        self.voice_input_enabled = not self.voice_input_enabled
+        self.vision_worker.update_voice_dialogue_enabled(
+            self.voice_input_enabled and bool(self.args.enable_voice_dialogue)
+        )
+        if self.voice_input_enabled:
+            self.start_background_listening()
+            self.status_label.setText("Status: listening for 'hey moss'")
+            self.append_log("voice", "Microphone listening enabled")
+        else:
+            self.stop_all_listening()
+            self.status_label.setText("Status: microphone listening stopped")
+            self.append_log("voice", "Microphone listening stopped")
+        self.update_audio_control_buttons()
+
     def toggle_wake_word_listening(self) -> None:
         """Toggle wake-word listening on/off."""
         if self.wake_word_listener is None:
             return
-        # Wake-word listening runs in background by default. This toggle is a no-op.
-        self.status_label.setText("Status: wake-word listening is always enabled in background")
-        self.append_log("voice", "Wake-word toggle pressed; listener stays on")
+        self.toggle_voice_input()
 
     def on_wake_word_detected(self) -> None:
         """Background-thread callback from the wake-word listener."""
@@ -2195,6 +2324,8 @@ class DriverAssistantWindow(QMainWindow):
 
     @pyqtSlot()
     def _handle_wake_word_detected(self) -> None:
+        if not self.voice_input_enabled:
+            return
         if self.speech_worker is not None:
             return
         self.status_label.setText("Status: wake-word detected! Recording for 5 seconds...")
@@ -2204,6 +2335,8 @@ class DriverAssistantWindow(QMainWindow):
 
     @pyqtSlot()
     def _handle_continued_voice_detected(self) -> None:
+        if not self.voice_input_enabled:
+            return
         if self.speech_worker is not None:
             return
         self.status_label.setText("Status: follow-up voice detected, recording...")
@@ -2213,10 +2346,15 @@ class DriverAssistantWindow(QMainWindow):
     @pyqtSlot()
     def _handle_continued_timeout(self) -> None:
         self._in_continued_mode = False
-        if self.wake_word_listener is not None:
+        if self.voice_input_enabled and self.wake_word_listener is not None:
             self.wake_word_listener.start()
             self.wake_word_listening = True
-        self.status_label.setText("Status: listening for 'hey moss'")
+        self.status_label.setText(
+            "Status: listening for 'hey moss'"
+            if self.voice_input_enabled
+            else "Status: microphone listening stopped"
+        )
+        self.update_audio_control_buttons()
         self.append_log("voice", "Follow-up timeout; returned to wake-word listening")
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:

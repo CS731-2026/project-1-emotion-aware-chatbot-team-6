@@ -29,6 +29,7 @@ class TTSQueue:
     def __init__(self) -> None:
         self._jobs: list[tuple[int, int, _SpeakJob]] = []
         self._seq = 0
+        self._muted = False
         self._cv = threading.Condition()
         self._worker = threading.Thread(
             target=self._run,
@@ -43,6 +44,24 @@ class TTSQueue:
             if cls._instance is None:
                 cls._instance = cls()
             return cls._instance
+
+    def is_muted(self) -> bool:
+        with self._cv:
+            return self._muted
+
+    def set_muted(self, muted: bool, clear_pending: bool = True) -> None:
+        removed_jobs: list[_SpeakJob] = []
+        with self._cv:
+            self._muted = muted
+            if muted and clear_pending and self._jobs:
+                removed_jobs = [job for _, _, job in self._jobs]
+                self._jobs.clear()
+                heapq.heapify(self._jobs)
+            self._cv.notify_all()
+
+        for removed_job in removed_jobs:
+            removed_job.cancelled = True
+            removed_job.done.set()
 
     def submit(
         self,
@@ -63,6 +82,10 @@ class TTSQueue:
             priority=priority,
         )
         with self._cv:
+            if self._muted:
+                job.done.set()
+                return
+
             job.seq = self._seq
             self._seq += 1
 
@@ -119,6 +142,12 @@ class TTSQueue:
                 _, _, job = heapq.heappop(self._jobs)
 
             if job.cancelled:
+                continue
+
+            with self._cv:
+                muted = self._muted
+            if muted:
+                job.done.set()
                 continue
 
             try:

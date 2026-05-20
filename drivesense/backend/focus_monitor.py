@@ -214,6 +214,10 @@ class FocusMonitor:
         self._on_voice_error = on_voice_error
         self._state = _State()
         self._state.chat_model = self.config.chat_model
+        self._voice_dialogue_enabled = True
+
+    def set_voice_dialogue_enabled(self, enabled: bool) -> None:
+        self._voice_dialogue_enabled = enabled
 
     def get_state_snapshot(self) -> dict[str, Any]:
         with self._state.lock:
@@ -469,7 +473,11 @@ class FocusMonitor:
                 trigger_type == "emotion" and normalized_emotion in EMOTION_FULL_DIALOGUE
             )
 
-            if use_dialogue and self._voice_pipeline is not None:
+            if (
+                use_dialogue
+                and self._voice_dialogue_enabled
+                and self._voice_pipeline is not None
+            ):
                 try:
                     result = self._voice_pipeline.process_voice_input(
                         duration_seconds=self.config.record_seconds,
