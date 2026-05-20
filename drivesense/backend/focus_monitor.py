@@ -462,8 +462,9 @@ class FocusMonitor:
                     self._tts.speak(
                         alert_sentence,
                         emotion=emotion,
-                        wait=True,
+                        wait=False,
                         priority=TTS_PRIORITY_ALERT,
+                        drop_pending_below_priority=TTS_PRIORITY_ALERT,
                     )
                 except Exception as exc:
                     logger.exception("TTS speak failed: %s", exc)

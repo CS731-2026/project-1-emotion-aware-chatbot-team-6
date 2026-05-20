@@ -107,6 +107,7 @@ from drivesense.backend.vision import (
 from drivesense.backend.speech import (
     TextToSpeech,
     TTS_PRIORITY_CHAT,
+    VoiceIOGate,
     WhisperTranscriber,
     detect_text_language,
     is_supported_zh_en_text,
@@ -1003,6 +1004,9 @@ class SpeechWorker(QThread):
             )
             if audio.size == 0:
                 raise RuntimeError("No audio was captured from the microphone.")
+            if VoiceIOGate.is_tts_active():
+                self.transcription_ready.emit("")
+                return
 
             transcriber = self.get_transcriber(self.model_size)
             result = transcriber.transcribe_audio(audio, sample_rate=16000)
@@ -1117,10 +1121,7 @@ class DriverAssistantWindow(QMainWindow):
 
         self.title_label = QLabel("Driver Monitoring")
         self.title_label.setStyleSheet("font-size: 48px; font-weight: 800; color: #1a1c1c;")
-        self.subtitle_label = QLabel("System Active")
-        self.subtitle_label.setStyleSheet("font-size: 21px; color: #414753;")
         content_layout.addWidget(self.title_label)
-        content_layout.addWidget(self.subtitle_label)
 
         self.page_stack = QStackedWidget()
         self.page_stack.setStyleSheet("background: transparent; border: none;")
@@ -1471,9 +1472,8 @@ class DriverAssistantWindow(QMainWindow):
             "Models": ("Model Comparison", "LLM benchmark summary and current selection"),
         }
         self.page_stack.setCurrentIndex(page_index)
-        title, subtitle = page_meta.get(page_name, page_meta["Dashboard"])
+        title, _subtitle = page_meta.get(page_name, page_meta["Dashboard"])
         self.title_label.setText(title)
-        self.subtitle_label.setText(subtitle)
         for name, button in self.nav_buttons.items():
             button.setStyleSheet(self.nav_button_style(active=(name == page_name)))
 
@@ -2080,9 +2080,9 @@ class DriverAssistantWindow(QMainWindow):
 
     def _pause_voice_listeners_for_tts(self) -> None:
         if self.continued_listener is not None:
-            self.continued_listener.stop()
+            self.continued_listener.stop(wait=False)
         if self.wake_word_listener is not None and self.wake_word_listening:
-            self.wake_word_listener.stop()
+            self.wake_word_listener.stop(wait=False)
             self.wake_word_listening = False
         self.update_audio_control_buttons()
 
@@ -2153,6 +2153,10 @@ class DriverAssistantWindow(QMainWindow):
         if not self.voice_input_enabled:
             self.status_label.setText("Status: microphone listening is stopped")
             self.append_log("voice", "Recording request ignored because listening is stopped")
+            return
+        if VoiceIOGate.is_tts_active():
+            self.status_label.setText("Status: TTS is speaking; voice input ignored")
+            self.append_log("voice", "Recording request ignored while TTS is active")
             return
         if self.speech_worker is not None:
             return
@@ -2276,9 +2280,9 @@ class DriverAssistantWindow(QMainWindow):
 
     def stop_all_listening(self) -> None:
         if self.continued_listener is not None:
-            self.continued_listener.stop()
+            self.continued_listener.stop(wait=False)
         if self.wake_word_listener is not None and self.wake_word_listening:
-            self.wake_word_listener.stop()
+            self.wake_word_listener.stop(wait=False)
         self.wake_word_listening = False
         self._in_continued_mode = False
         if self.speech_worker is not None:
@@ -2326,6 +2330,9 @@ class DriverAssistantWindow(QMainWindow):
     def _handle_wake_word_detected(self) -> None:
         if not self.voice_input_enabled:
             return
+        if VoiceIOGate.is_tts_active():
+            self.append_log("voice", "Wake-word ignored while TTS is active")
+            return
         if self.speech_worker is not None:
             return
         self.status_label.setText("Status: wake-word detected! Recording for 5 seconds...")
@@ -2336,6 +2343,9 @@ class DriverAssistantWindow(QMainWindow):
     @pyqtSlot()
     def _handle_continued_voice_detected(self) -> None:
         if not self.voice_input_enabled:
+            return
+        if VoiceIOGate.is_tts_active():
+            self.append_log("voice", "Follow-up voice ignored while TTS is active")
             return
         if self.speech_worker is not None:
             return

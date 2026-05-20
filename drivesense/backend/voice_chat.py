@@ -89,6 +89,8 @@ class VoiceChatPipeline:
 
             if audio.size == 0:
                 raise ValueError("No audio was captured. Please try again.")
+            if VoiceIOGate.is_tts_active():
+                raise NoSpeechDetectedError("No speech detected.")
 
             result = self.transcriber.transcribe_audio(audio)
             user_input = result.text.strip()
