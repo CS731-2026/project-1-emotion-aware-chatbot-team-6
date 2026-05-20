@@ -136,6 +136,9 @@ class WakeWordListener:
 
                 while self._running:
                     try:
+                        if VoiceIOGate.is_tts_active():
+                            time.sleep(0.08)
+                            continue
                         # Record a short chunk (e.g., 1 second) to transcribe.
                         # VAD disabled: short fixed chunks, not user speech input.
                         audio = record_microphone_audio(
@@ -271,6 +274,9 @@ class ContinuedConversationListener:
                         break
 
                     try:
+                        if VoiceIOGate.is_tts_active():
+                            time.sleep(0.08)
+                            continue
                         audio = record_microphone_audio(
                             duration_seconds=CHUNK_SECONDS,
                             sample_rate=16000,

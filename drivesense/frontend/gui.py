@@ -1458,7 +1458,7 @@ class DriverAssistantWindow(QMainWindow):
         fg = "#991b1b" if active else "#1a1c1c"
         return (
             f"QPushButton {{ background-color: {bg}; color: {fg}; border: none; "
-            "border-radius: 10px; padding: 9px 12px; font-weight: 700; font-size: 13px; }}"
+            "border-radius: 10px; padding: 9px 12px; font-weight: 700; font-size: 13px; }"
             f"QPushButton:hover {{ background-color: {hover}; }}"
             "QPushButton:disabled { color: #9ca3af; background-color: #f3f4f6; }"
         )
@@ -2194,6 +2194,11 @@ class DriverAssistantWindow(QMainWindow):
             self.append_log("voice", "Recording stop requested")
 
     def handle_transcription(self, text: str) -> None:
+        if VoiceIOGate.is_tts_active():
+            self.input_edit.clear()
+            self.status_label.setText("Status: TTS is speaking; transcription ignored")
+            self.append_log("voice", "Transcription ignored while TTS is active")
+            return
         self.input_edit.setText(text)
         if text.strip():
             detected_language = detect_text_language(text)
