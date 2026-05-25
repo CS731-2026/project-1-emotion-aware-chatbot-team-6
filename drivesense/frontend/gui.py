@@ -151,6 +151,15 @@ EMOTION_TO_RISK = {
     "happy": "OK",
     "neutral": "OK",
 }
+EMOTION_HISTORY_LABELS = [
+    "anger",
+    "fear",
+    "sad",
+    "happy",
+    "surprise",
+    "disgust",
+    "neutral",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -412,6 +421,89 @@ class AttentionHistoryChart(QWidget):
         painter.setPen(QPen(QColor("#1f2937")))
         painter.drawText(rect.left(), rect.bottom() + 18, "Oldest")
         painter.drawText(rect.right() - 42, rect.bottom() + 18, "Now")
+
+
+class EmotionConfidenceHistoryChart(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._points: list[tuple[float, dict[str, float]]] = []
+        self.setMinimumHeight(300)
+
+    def set_points(self, points: list[tuple[float, dict[str, float]]]) -> None:
+        self._points = points[-180:]
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+
+        rect = self.rect().adjusted(44, 18, -22, -52)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        grid_pen = QPen(QColor("#e8e8e8"))
+        grid_pen.setWidth(1)
+        painter.setPen(grid_pen)
+        for idx in range(5):
+            y = rect.top() + int(rect.height() * idx / 4)
+            painter.drawLine(rect.left(), y, rect.right(), y)
+
+        axis_pen = QPen(QColor("#b8b8b8"))
+        axis_pen.setWidth(1)
+        painter.setPen(axis_pen)
+        painter.drawRect(rect)
+
+        painter.setPen(QPen(QColor("#6b7280")))
+        for value in (1.0, 0.75, 0.5, 0.25, 0.0):
+            y = rect.top() + int((1.0 - value) * rect.height())
+            painter.drawText(rect.left() - 38, y + 4, f"{value:.2g}")
+
+        if len(self._points) < 2:
+            painter.setPen(QPen(QColor("#9aa1ad")))
+            painter.drawText(
+                rect.adjusted(0, 0, 0, -8),
+                Qt.AlignmentFlag.AlignCenter,
+                "Waiting for emotion confidence history...",
+            )
+            self._draw_legend(painter, rect)
+            return
+
+        first_ts = self._points[0][0]
+        last_ts = self._points[-1][0]
+        span = max(last_ts - first_ts, 1e-6)
+
+        for emotion in EMOTION_HISTORY_LABELS:
+            line_pen = QPen(QColor(emotion_color_hex(emotion)))
+            line_pen.setWidth(2 if emotion != "neutral" else 3)
+            painter.setPen(line_pen)
+
+            prev_x = 0
+            prev_y = 0
+            for idx, (ts_value, confidences) in enumerate(self._points):
+                confidence = max(0.0, min(1.0, float(confidences.get(emotion, 0.0))))
+                x = rect.left() + int(((ts_value - first_ts) / span) * rect.width())
+                y = rect.bottom() - int(confidence * rect.height())
+                if idx > 0:
+                    painter.drawLine(prev_x, prev_y, x, y)
+                prev_x, prev_y = x, y
+
+        painter.setPen(QPen(QColor("#1f2937")))
+        painter.drawText(rect.left(), rect.bottom() + 18, "Oldest")
+        painter.drawText(rect.right() - 42, rect.bottom() + 18, "Now")
+        self._draw_legend(painter, rect)
+
+    def _draw_legend(self, painter: QPainter, rect) -> None:
+        x = rect.left()
+        y = rect.bottom() + 32
+        item_gap = 86
+        for index, emotion in enumerate(EMOTION_HISTORY_LABELS):
+            item_x = x + (index % 4) * item_gap
+            item_y = y + (index // 4) * 18
+            painter.setPen(QPen(QColor(emotion_color_hex(emotion)), 3))
+            painter.drawLine(item_x, item_y - 5, item_x + 18, item_y - 5)
+            painter.setPen(QPen(QColor("#374151")))
+            painter.drawText(item_x + 24, item_y, normalize_label(emotion))
 
 
 class ChatBubble(QFrame):
@@ -1055,6 +1147,7 @@ class DriverAssistantWindow(QMainWindow):
         self.last_fallback_used = False
         self.runtime_logs: list[str] = []
         self.attention_history: list[tuple[float, float]] = []
+        self.emotion_history: list[tuple[float, dict[str, float]]] = []
         self._history_started_at = time.perf_counter()
         self._last_history_point_at = 0.0
         self._last_logged_snapshot: tuple[bool, str, str, int] | None = None
@@ -1597,20 +1690,29 @@ class DriverAssistantWindow(QMainWindow):
             "QPushButton:hover { background-color: #0071e3; }"
             "QPushButton:pressed { background-color: #00458c; }"
         )
-        self.export_history_button.clicked.connect(self.export_attention_chart)
+        self.export_history_button.clicked.connect(self.export_history_chart)
         header_row.addWidget(title)
         header_row.addStretch()
         header_row.addWidget(self.export_history_button)
-        subtitle = QLabel("Attention score is derived from driver detection, eye state, risk, and focus level.")
+        subtitle = QLabel("Attention and emotion confidence use the filtered driver state shown in the UI.")
         subtitle.setStyleSheet("font-size: 15px; color: #4b5563; border: none;")
         self.history_summary_label = QLabel("Waiting for driver-state samples.")
         self.history_summary_label.setStyleSheet("font-size: 14px; color: #6b7280; border: none;")
+        attention_title = QLabel("Attention Score")
+        attention_title.setStyleSheet("font-size: 16px; font-weight: 800; color: #1f2937; border: none;")
         self.attention_chart = AttentionHistoryChart()
+        emotion_title = QLabel("Emotion Confidence")
+        emotion_title.setStyleSheet("font-size: 16px; font-weight: 800; color: #1f2937; border: none;")
+        self.emotion_chart = EmotionConfidenceHistoryChart()
+        self.history_card = card
 
         card_layout.addLayout(header_row)
         card_layout.addWidget(subtitle)
         card_layout.addWidget(self.history_summary_label)
+        card_layout.addWidget(attention_title)
         card_layout.addWidget(self.attention_chart, 1)
+        card_layout.addWidget(emotion_title)
+        card_layout.addWidget(self.emotion_chart, 1)
         layout.addWidget(card, 1)
         return page
 
@@ -1731,7 +1833,7 @@ class DriverAssistantWindow(QMainWindow):
                 self.logs_list.takeItem(self.logs_list.count() - 1)
             self.logs_summary_label.setText(f"Captured {len(self.runtime_logs)} recent events.")
 
-    def record_attention_history(self, driver_state: dict[str, Any]) -> None:
+    def record_history_sample(self, driver_state: dict[str, Any]) -> None:
         now = time.perf_counter()
         if now - self._last_history_point_at < 0.5:
             return
@@ -1740,25 +1842,40 @@ class DriverAssistantWindow(QMainWindow):
         score = float(compute_attention_score(driver_state))
         self.attention_history.append((elapsed, score))
         self.attention_history = self.attention_history[-180:]
+
+        emotion_confidences = {emotion: 0.0 for emotion in EMOTION_HISTORY_LABELS}
+        driver_detected = bool(driver_state.get("driver_detected", False))
+        emotion = str(driver_state.get("emotion", "neutral")).lower()
+        if driver_detected and emotion in emotion_confidences:
+            emotion_confidences[emotion] = max(
+                0.0,
+                min(1.0, float(driver_state.get("emotion_confidence", 0.0))),
+            )
+        self.emotion_history.append((elapsed, emotion_confidences))
+        self.emotion_history = self.emotion_history[-180:]
+
         if hasattr(self, "attention_chart"):
             self.attention_chart.set_points(self.attention_history)
+        if hasattr(self, "emotion_chart"):
+            self.emotion_chart.set_points(self.emotion_history)
         if hasattr(self, "history_summary_label") and self.attention_history:
-            scores = [point[1] for point in self.attention_history]
+            emotion_label = emotion if driver_detected else "none"
+            emotion_confidence = emotion_confidences.get(emotion, 0.0) if driver_detected else 0.0
             self.history_summary_label.setText(
-                f"Current {scores[-1]:.0f}/100 | Avg {sum(scores)/len(scores):.1f} | Min {min(scores):.0f}"
+                f"Attention {score:.0f}/100 | Emotion {normalize_label(emotion_label)} {emotion_confidence:.2f}"
             )
 
-    def export_attention_chart(self) -> None:
+    def export_history_chart(self) -> None:
         if not self.attention_history:
-            QMessageBox.information(self, "Export Attention Chart", "No attention samples to export yet.")
+            QMessageBox.information(self, "Export History Chart", "No history samples to export yet.")
             return
 
-        export_dir = PROJECT_ROOT / "debug_exports" / "attention_history"
+        export_dir = PROJECT_ROOT / "debug_exports" / "history_charts"
         export_dir.mkdir(parents=True, exist_ok=True)
-        default_path = export_dir / f"attention_history_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        default_path = export_dir / f"history_{time.strftime('%Y%m%d_%H%M%S')}.png"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Export Attention Chart",
+            "Export History Chart",
             str(default_path),
             "PNG images (*.png)",
         )
@@ -1767,14 +1884,23 @@ class DriverAssistantWindow(QMainWindow):
         if not file_path.lower().endswith(".png"):
             file_path = f"{file_path}.png"
 
-        chart_pixmap = self.attention_chart.grab()
-        if not chart_pixmap.save(file_path, "PNG"):
-            QMessageBox.warning(self, "Export Attention Chart", "Failed to save the chart image.")
-            self.append_log("error", f"Failed to export attention chart to {file_path}")
+        selected_path = Path(file_path)
+        attention_path = selected_path.with_name(f"{selected_path.stem}_attention.png")
+        emotion_path = selected_path.with_name(f"{selected_path.stem}_emotion.png")
+
+        attention_saved = self.attention_chart.grab().save(str(attention_path), "PNG")
+        emotion_saved = self.emotion_chart.grab().save(str(emotion_path), "PNG")
+        if not attention_saved or not emotion_saved:
+            QMessageBox.warning(self, "Export History Chart", "Failed to save one or more chart images.")
+            self.append_log(
+                "error",
+                f"Failed to export history charts to {attention_path} and {emotion_path}",
+            )
             return
 
-        self.status_label.setText(f"Status: attention chart exported to {file_path}")
-        self.append_log("history", f"Exported attention chart to {file_path}")
+        self.status_label.setText(f"Status: exported attention and emotion history charts")
+        self.append_log("history", f"Exported attention chart to {attention_path}")
+        self.append_log("history", f"Exported emotion chart to {emotion_path}")
 
     def add_message(self, text: str, is_user: bool) -> None:
         bubble = ChatBubble(text, is_user=is_user)
@@ -1802,7 +1928,7 @@ class DriverAssistantWindow(QMainWindow):
         closed_eye_duration = float(state.get("closed_eye_duration", 0.0))
         eye_warmup_active = bool(state.get("eye_warmup_active", False))
         eye_warmup_remaining = float(state.get("eye_warmup_remaining", 0.0))
-        self.record_attention_history(state)
+        self.record_history_sample(state)
         snapshot = (driver_detected, self.current_emotion, self.current_risk, focus_level)
         if snapshot != self._last_logged_snapshot:
             self._last_logged_snapshot = snapshot

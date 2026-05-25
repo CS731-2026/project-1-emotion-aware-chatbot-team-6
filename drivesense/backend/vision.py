@@ -43,7 +43,7 @@ EMOTION_TO_RISK = {
     "neutral": "OK",
 }
 LOW_CONFIDENCE_NEUTRAL_EMOTIONS = {"sad", "anger"}
-LOW_CONFIDENCE_NEUTRAL_THRESHOLD = 0.80
+LOW_CONFIDENCE_NEUTRAL_THRESHOLD = 0.60
 
 
 class ClassifierDict(TypedDict):
