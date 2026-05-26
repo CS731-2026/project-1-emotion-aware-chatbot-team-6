@@ -1515,7 +1515,7 @@ class DriverAssistantWindow(QMainWindow):
             ),
             on_voice_detected=self.on_continued_voice_detected,
             on_timeout=self.on_continued_timeout,
-            timeout_seconds=10.0,
+            timeout_seconds=5.0,
         )
         self.switch_page("Dashboard")
         self.append_log("system", "DriveSense GUI ready")
@@ -2272,8 +2272,8 @@ class DriverAssistantWindow(QMainWindow):
         self._in_continued_mode = True
         if self.continued_listener is not None:
             self.continued_listener.start()
-            self.status_label.setText("Status: listening for follow-up (10 s)...")
-            self.append_log("voice", "Entered 10-second follow-up listening window")
+            self.status_label.setText("Status: listening for follow-up (5 s)...")
+            self.append_log("voice", "Entered 5-second follow-up listening window")
 
     @pyqtSlot()
     def _on_tts_failed(self) -> None:
@@ -2352,7 +2352,7 @@ class DriverAssistantWindow(QMainWindow):
             if self._in_continued_mode:
                 if self.voice_input_enabled and self.continued_listener is not None:
                     self.continued_listener.start()
-                    self.status_label.setText("Status: listening for follow-up (10 s)...")
+                    self.status_label.setText("Status: listening for follow-up (5 s)...")
             else:
                 if (
                     self.voice_input_enabled
