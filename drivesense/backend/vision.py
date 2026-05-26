@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import time
 import urllib.request
@@ -43,7 +44,8 @@ EMOTION_TO_RISK = {
     "neutral": "OK",
 }
 LOW_CONFIDENCE_NEUTRAL_EMOTIONS = {"sad", "anger"}
-LOW_CONFIDENCE_NEUTRAL_THRESHOLD = 0.80
+LOW_CONFIDENCE_NEUTRAL_THRESHOLD = 0.60
+EMOTION_SMOOTHING_WINDOW_SIZE = 7
 
 
 class ClassifierDict(TypedDict):
@@ -52,6 +54,40 @@ class ClassifierDict(TypedDict):
     class_names: list[str]
     img_size: int
     timm_name: str
+
+
+class EmotionMajorityWindow:
+    def __init__(self, size: int = EMOTION_SMOOTHING_WINDOW_SIZE) -> None:
+        if size <= 0:
+            raise ValueError("Emotion majority window size must be positive.")
+        self._window: deque[tuple[str, float]] = deque(maxlen=size)
+
+    def reset(self) -> None:
+        self._window.clear()
+
+    def update(self, label: str, confidence: float) -> tuple[str, float]:
+        normalized_label = (label or "neutral").strip().lower()
+        normalized_confidence = max(0.0, min(1.0, float(confidence)))
+        self._window.append((normalized_label, normalized_confidence))
+        return self.current()
+
+    def current(self) -> tuple[str, float]:
+        if not self._window:
+            return "neutral", 0.0
+
+        counts: dict[str, int] = {}
+        latest_indices: dict[str, int] = {}
+        latest_confidences: dict[str, float] = {}
+        for index, (label, confidence) in enumerate(self._window):
+            counts[label] = counts.get(label, 0) + 1
+            latest_indices[label] = index
+            latest_confidences[label] = confidence
+
+        winner = max(
+            counts,
+            key=lambda label: (counts[label], latest_indices[label]),
+        )
+        return winner, latest_confidences[winner]
 
 
 def parse_args() -> argparse.Namespace:
