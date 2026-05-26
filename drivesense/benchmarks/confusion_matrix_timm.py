@@ -13,7 +13,11 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 
-from drivesense.backend.vision import apply_emotion_postprocess
+from drivesense.backend.vision import (
+    EMOTION_SMOOTHING_WINDOW_SIZE,
+    EmotionMajorityWindow,
+    apply_emotion_postprocess,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -75,8 +79,8 @@ def parse_args() -> argparse.Namespace:
         "--apply-runtime-postprocess",
         action="store_true",
         help=(
-            "Apply the same runtime post-processing used by the GUI, for example "
-            "downgrading low-confidence sad/anger predictions to neutral."
+            "Apply the same final UI rules used by the GUI: low-confidence "
+            "sad/anger to neutral plus the 7-frame majority window."
         ),
     )
     return parser.parse_args()
@@ -137,6 +141,7 @@ def evaluate_confusion_matrix(
 ) -> np.ndarray:
     class_to_idx = {name: index for index, name in enumerate(class_names)}
     confusion = np.zeros((len(class_names), len(class_names)), dtype=np.int64)
+    emotion_window = EmotionMajorityWindow()
 
     for images, targets in loader:
         images = images.to(device, non_blocking=True)
@@ -157,6 +162,10 @@ def evaluate_confusion_matrix(
             if apply_runtime_postprocess:
                 predicted_label, _ = apply_emotion_postprocess(
                     class_names[final_predicted_index],
+                    float(confidence),
+                )
+                predicted_label, _ = emotion_window.update(
+                    predicted_label,
                     float(confidence),
                 )
                 final_predicted_index = class_to_idx[predicted_label]
@@ -276,6 +285,10 @@ def main() -> None:
     print(f"Test images: {len(dataset)}")
     print(f"Device: {device}")
     print(f"Runtime postprocess: {args.apply_runtime_postprocess}")
+    print(
+        "Emotion smoothing window: "
+        f"{EMOTION_SMOOTHING_WINDOW_SIZE if args.apply_runtime_postprocess else 0}"
+    )
 
     confusion = evaluate_confusion_matrix(
         model=model,

@@ -85,6 +85,7 @@ from drivesense.backend.focus_monitor import (
     FocusMonitorConfig,
 )
 from drivesense.backend.vision import (
+    EmotionMajorityWindow,
     apply_emotion_postprocess,
     build_voice_pipeline,
     classify_crops,
@@ -588,6 +589,7 @@ class VisionWorker(QObject):
                 on_voice_result=lambda result: self.voice_dialogue_ready.emit(asdict(result)),
                 on_voice_error=self.voice_dialogue_error.emit,
             )
+            emotion_window = EmotionMajorityWindow()
 
             cap = cv2.VideoCapture(self.args.camera_index)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.args.capture_width)
@@ -760,6 +762,15 @@ class VisionWorker(QObject):
                         else:
                             px1, _, px2, _ = primary_face  # type: ignore[misc]
                         previous_driver_center_x = ((px1 + px2) / 2.0) / max(frame_w, 1)
+                        if isinstance(primary_face, dict):
+                            smoothed_emotion, smoothed_confidence = emotion_window.update(
+                                str(primary_face.get("emotion", "neutral")),
+                                float(primary_face.get("emotion_confidence", 0.0)),
+                            )
+                            primary_face["emotion"] = smoothed_emotion
+                            primary_face["emotion_confidence"] = smoothed_confidence
+                    else:
+                        emotion_window.reset()
                     for face in faces:
                         x1, y1, x2, y2 = face["bbox"]
                         emotion = face["emotion"]
