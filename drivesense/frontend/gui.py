@@ -541,6 +541,7 @@ class VisionWorker(QObject):
     state_ready = pyqtSignal(object)
     voice_dialogue_ready = pyqtSignal(object)
     voice_dialogue_error = pyqtSignal(str)
+    voice_status_ready = pyqtSignal(str)
     error = pyqtSignal(str)
     finished = pyqtSignal()
 
@@ -588,6 +589,7 @@ class VisionWorker(QObject):
                 voice_pipeline=voice_pipeline,
                 on_voice_result=lambda result: self.voice_dialogue_ready.emit(asdict(result)),
                 on_voice_error=self.voice_dialogue_error.emit,
+                on_voice_status=self.voice_status_ready.emit,
             )
             emotion_window = EmotionMajorityWindow()
 
@@ -1169,6 +1171,11 @@ class DriverAssistantWindow(QMainWindow):
         self.wake_word_listener: WakeWordListener | None = None
         self.continued_listener: ContinuedConversationListener | None = None
         self._in_continued_mode = False
+        self.voice_input_state = "starting..."
+        self.voice_output_state = "idle"
+        self.voice_dialogue_state = (
+            "enabled" if bool(self.args.enable_voice_dialogue) else "disabled"
+        )
         self.reply_tts = TextToSpeech(rate=150, volume=1.0)
         self.llm_benchmark_rows = self.load_llm_benchmark_rows()
 
@@ -1304,18 +1311,18 @@ class DriverAssistantWindow(QMainWindow):
         meta_block = QVBoxLayout()
         meta_block.setContentsMargins(0, 14, 0, 0)
         meta_block.setSpacing(4)
-        self.driver_label = QLabel("Driver heuristic: left")
-        self.model_label = QLabel(f"Selected model: {self.args.default_llm_model}")
-        self.last_model_label = QLabel(f"Last reply model: {self.args.default_llm_model}")
-        self.model_path_label = QLabel("Emotion model: loading...")
-        self.eye_model_path_label = QLabel("Eye model: loading...")
+        self.voice_input_label = QLabel("Voice input: starting...")
+        self.voice_output_label = QLabel("Voice output: idle")
+        self.voice_dialogue_label = QLabel(f"Auto dialogue: {self.voice_dialogue_state}")
+        self.wake_word_status_label = QLabel("Wake word: starting...")
+        self.tts_status_label = QLabel("TTS: unmuted")
         self.status_label = QLabel("Status: ready")
         for label in [
-            self.driver_label,
-            self.model_label,
-            self.last_model_label,
-            self.model_path_label,
-            self.eye_model_path_label,
+            self.voice_input_label,
+            self.voice_output_label,
+            self.voice_dialogue_label,
+            self.wake_word_status_label,
+            self.tts_status_label,
             self.status_label,
         ]:
             label.setWordWrap(True)
@@ -1471,6 +1478,7 @@ class DriverAssistantWindow(QMainWindow):
         self.vision_worker.state_ready.connect(self.update_emotion_state)
         self.vision_worker.voice_dialogue_ready.connect(self.handle_voice_dialogue_result)
         self.vision_worker.voice_dialogue_error.connect(self.handle_voice_dialogue_error)
+        self.vision_worker.voice_status_ready.connect(self.handle_auto_voice_status)
         self.vision_worker.error.connect(self.handle_worker_error)
         self.vision_worker.finished.connect(self.vision_thread.quit)
         self.wake_word_detected_signal.connect(self._handle_wake_word_detected)
@@ -1498,11 +1506,13 @@ class DriverAssistantWindow(QMainWindow):
             self.wake_word_listening = True
             self.mic_button.setText("Wake-word: ON")
             self.mic_button.setEnabled(True)
+            self.set_voice_input_state("listening for 'hey moss'")
             self.status_label.setText("Status: listening for 'hey moss'")
             self.update_audio_control_buttons()
             self.append_log("voice", "Wake-word listener started for 'hey moss'")
         except Exception as exc:
             print(f"Failed to start wake-word listener automatically: {exc}")
+            self.set_voice_input_state("wake-word listener failed")
             self.append_log("error", f"Wake-word listener failed to start: {exc}")
 
         # Initialize continued conversation listener (post-reply).
@@ -1844,6 +1854,37 @@ class DriverAssistantWindow(QMainWindow):
                 self.logs_list.takeItem(self.logs_list.count() - 1)
             self.logs_summary_label.setText(f"Captured {len(self.runtime_logs)} recent events.")
 
+    def set_voice_input_state(self, text: str) -> None:
+        self.voice_input_state = text
+        if hasattr(self, "voice_input_label"):
+            self.voice_input_label.setText(f"Voice input: {text}")
+
+    def set_voice_output_state(self, text: str) -> None:
+        self.voice_output_state = text
+        if hasattr(self, "voice_output_label"):
+            self.voice_output_label.setText(f"Voice output: {text}")
+
+    def set_voice_dialogue_state(self, text: str) -> None:
+        self.voice_dialogue_state = text
+        if hasattr(self, "voice_dialogue_label"):
+            self.voice_dialogue_label.setText(f"Auto dialogue: {text}")
+
+    def refresh_voice_status_labels(self) -> None:
+        if not hasattr(self, "tts_status_label"):
+            return
+        self.tts_status_label.setText(
+            "TTS: muted" if self.tts_muted else "TTS: unmuted"
+        )
+        if not self.voice_input_enabled:
+            wake_word_state = "off"
+        elif self._in_continued_mode:
+            wake_word_state = "follow-up window"
+        elif self.wake_word_listening:
+            wake_word_state = "listening for 'hey moss'"
+        else:
+            wake_word_state = "paused"
+        self.wake_word_status_label.setText(f"Wake word: {wake_word_state}")
+
     def record_history_sample(self, driver_state: dict[str, Any]) -> None:
         now = time.perf_counter()
         if now - self._last_history_point_at < 0.5:
@@ -2044,12 +2085,7 @@ class DriverAssistantWindow(QMainWindow):
             self.emotion_alerts_label.setStyleSheet(
                 "color: #00a86b; font-size: 17px; font-weight: 700; border: none; background: transparent;"
             )
-        self.driver_label.setText(f"Driver heuristic: {state['driver_side']}")
-        self.model_label.setText(f"Selected model: {self.model_combo.currentText()}")
-        fallback_suffix = " (fallback)" if self.last_fallback_used else ""
-        self.last_model_label.setText(f"Last reply model: {self.last_used_model}{fallback_suffix}")
-        self.model_path_label.setText(f"Emotion model: {state['emotion_model_path']}")
-        self.eye_model_path_label.setText(f"Eye model: {state['eye_model_path']}")
+        self.refresh_voice_status_labels()
         self.context_label.setText(build_context_summary(state))
 
     def handle_worker_error(self, message: str) -> None:
@@ -2058,7 +2094,6 @@ class DriverAssistantWindow(QMainWindow):
 
     def handle_model_selection_change(self, model_name: str) -> None:
         self.last_selected_model = model_name
-        self.model_label.setText(f"Selected model: {model_name}")
         message = f"Selected chat model: {model_name}"
         self.status_label.setText(f"Status: {message}")
         print(message)
@@ -2128,10 +2163,6 @@ class DriverAssistantWindow(QMainWindow):
         self.speak_reply_async(payload["text"], payload.get("emotion", self.current_emotion))
         self.last_used_model = str(payload.get("model", self.model_combo.currentText()))
         self.last_fallback_used = bool(payload.get("fallback_used", False))
-        self.last_model_label.setText(
-            f"Last reply model: {self.last_used_model}"
-            + (" (fallback)" if self.last_fallback_used else "")
-        )
         print(
             f"OpenRouter reply received from {payload['model']} "
             f"in {payload['latency_ms']:.0f} ms"
@@ -2142,10 +2173,7 @@ class DriverAssistantWindow(QMainWindow):
             f"Reply via {payload['model']} in {payload['latency_ms']:.0f} ms"
             + (" (fallback)" if self.last_fallback_used else ""),
         )
-        self.status_label.setText(
-            f"Status: OpenRouter reply in {payload['latency_ms']:.0f} ms via {payload['model']}"
-            + (" (fallback)" if self.last_fallback_used else "")
-        )
+        self.status_label.setText("Status: assistant reply queued for speech output")
 
     def handle_chat_error(self, message: str) -> None:
         self.status_label.setText(f"Status: chatbot error - {message}")
@@ -2164,35 +2192,47 @@ class DriverAssistantWindow(QMainWindow):
         model = payload.get("model", self.model_combo.currentText())
         self.last_used_model = str(model)
         self.last_fallback_used = bool(payload.get("fallback_used", False))
-        self.last_model_label.setText(
-            f"Last reply model: {self.last_used_model}"
-            + (" (fallback)" if self.last_fallback_used else "")
-        )
         self.refresh_models_table()
+        self.set_voice_input_state("follow-up speech received")
+        self.set_voice_output_state("reply queued")
+        self.set_voice_dialogue_state("completed")
         latency_ms = payload.get("latency_ms")
         if isinstance(latency_ms, (int, float)):
-            self.status_label.setText(
-                f"Status: voice dialogue reply in {float(latency_ms):.0f} ms via {model}"
-                + (" (fallback)" if self.last_fallback_used else "")
-            )
+            self.status_label.setText("Status: voice dialogue completed; reply queued")
             self.append_log(
                 "voice",
                 f"Voice dialogue reply via {model} in {float(latency_ms):.0f} ms"
                 + (" (fallback)" if self.last_fallback_used else ""),
             )
         else:
-            self.status_label.setText(f"Status: voice dialogue completed via {model}")
+            self.status_label.setText("Status: voice dialogue completed")
             self.append_log("voice", f"Voice dialogue completed via {model}")
 
     def handle_voice_dialogue_error(self, message: str) -> None:
         if message.strip() == "No speech detected.":
+            self.set_voice_input_state("no follow-up speech detected")
+            self.set_voice_output_state("idle")
             self.status_label.setText("Status: no speech detected")
             print("Voice dialogue: no speech detected", flush=True)
             self.append_log("voice", "No follow-up speech detected")
             return
+        self.set_voice_dialogue_state("error")
+        self.set_voice_output_state("idle")
         self.status_label.setText(f"Status: voice dialogue error - {message}")
         print(f"Voice dialogue error: {message}", flush=True)
         self.append_log("error", f"Voice dialogue: {message}")
+
+    @pyqtSlot(str)
+    def handle_auto_voice_status(self, message: str) -> None:
+        lower = message.lower()
+        if "tts" in lower or "beep" in lower:
+            self.set_voice_output_state(message)
+        if "waiting" in lower or "speech" in lower or "record" in lower:
+            self.set_voice_input_state(message)
+        if "dialogue" in lower:
+            self.set_voice_dialogue_state(message)
+        self.status_label.setText(f"Status: {message}")
+        self.refresh_voice_status_labels()
 
     def clear_chat_worker(self) -> None:
         self.send_button.setEnabled(True)
@@ -2214,6 +2254,7 @@ class DriverAssistantWindow(QMainWindow):
             self.mic_button.setText("Wake-word: OFF")
         elif self.wake_word_listening:
             self.mic_button.setText("Wake-word: ON")
+        self.refresh_voice_status_labels()
 
     def _pause_voice_listeners_for_tts(self) -> None:
         if self.continued_listener is not None:
@@ -2229,11 +2270,14 @@ class DriverAssistantWindow(QMainWindow):
             return
 
         if self.tts_muted or TTSQueue.instance().is_muted():
+            self.set_voice_output_state("muted; reply skipped")
             self.status_label.setText("Status: assistant reply audio muted")
             self.append_log("voice", "Assistant reply TTS skipped because mute is enabled")
             return
 
         self._pause_voice_listeners_for_tts()
+        self.set_voice_input_state("paused while TTS is speaking")
+        self.set_voice_output_state("speaking assistant reply")
         self.status_label.setText("Status: speaking assistant reply...")
         self.append_log("voice", f"Speaking assistant reply: {text[:80]}")
 
@@ -2265,6 +2309,8 @@ class DriverAssistantWindow(QMainWindow):
     def _on_tts_finished(self) -> None:
         if not self.voice_input_enabled:
             self._in_continued_mode = False
+            self.set_voice_output_state("idle")
+            self.set_voice_input_state("listening stopped")
             self.status_label.setText("Status: speech finished; listening is stopped")
             self.append_log("voice", "TTS finished; follow-up listening skipped because listening is stopped")
             self.update_audio_control_buttons()
@@ -2272,11 +2318,14 @@ class DriverAssistantWindow(QMainWindow):
         self._in_continued_mode = True
         if self.continued_listener is not None:
             self.continued_listener.start()
+            self.set_voice_output_state("idle")
+            self.set_voice_input_state("listening for follow-up (5 s)")
             self.status_label.setText("Status: listening for follow-up (5 s)...")
             self.append_log("voice", "Entered 5-second follow-up listening window")
 
     @pyqtSlot()
     def _on_tts_failed(self) -> None:
+        self.set_voice_output_state("failed")
         self.status_label.setText("Status: assistant reply audio failed")
         self.append_log("error", "Assistant reply TTS failed")
         self._on_tts_finished()
@@ -2288,16 +2337,19 @@ class DriverAssistantWindow(QMainWindow):
         Otherwise use VAD with configured silence threshold.
         """
         if not self.voice_input_enabled:
+            self.set_voice_input_state("listening stopped")
             self.status_label.setText("Status: microphone listening is stopped")
             self.append_log("voice", "Recording request ignored because listening is stopped")
             return
         if VoiceIOGate.is_tts_active():
+            self.set_voice_input_state("blocked while TTS is speaking")
             self.status_label.setText("Status: TTS is speaking; voice input ignored")
             self.append_log("voice", "Recording request ignored while TTS is active")
             return
         if self.speech_worker is not None:
             return
         if push_to_talk:
+            self.set_voice_input_state("recording push-to-talk")
             self.status_label.setText("Status: recording (push-to-talk)...")
             self.mic_button.setText("Recording...")
             self.append_log("voice", "Push-to-talk recording started")
@@ -2308,6 +2360,7 @@ class DriverAssistantWindow(QMainWindow):
                 vad_enabled=False,
             )
         else:
+            self.set_voice_input_state("recording with auto-stop")
             self.status_label.setText("Status: recording audio (auto-stop on silence)...")
             self.mic_button.setText("Recording...")
             self.append_log("voice", "Voice recording started with VAD")
@@ -2328,11 +2381,13 @@ class DriverAssistantWindow(QMainWindow):
     def stop_recording(self) -> None:
         if self.speech_worker is not None:
             self.speech_worker.stop_recording()
+            self.set_voice_input_state("recording stop requested")
             self.append_log("voice", "Recording stop requested")
 
     def handle_transcription(self, text: str) -> None:
         if VoiceIOGate.is_tts_active():
             self.input_edit.clear()
+            self.set_voice_input_state("transcription ignored during TTS")
             self.status_label.setText("Status: TTS is speaking; transcription ignored")
             self.append_log("voice", "Transcription ignored while TTS is active")
             return
@@ -2344,6 +2399,7 @@ class DriverAssistantWindow(QMainWindow):
                 self.append_log("error", "Rejected unsupported voice transcription")
                 self.input_edit.clear()
                 return
+            self.set_voice_input_state("transcription ready")
             self.status_label.setText("Status: transcription ready")
             self.append_log("voice", f"Transcription ready: {text[:80]}")
             self.send_text_message()
@@ -2352,6 +2408,7 @@ class DriverAssistantWindow(QMainWindow):
             if self._in_continued_mode:
                 if self.voice_input_enabled and self.continued_listener is not None:
                     self.continued_listener.start()
+                    self.set_voice_input_state("listening for follow-up (5 s)")
                     self.status_label.setText("Status: listening for follow-up (5 s)...")
             else:
                 if (
@@ -2366,6 +2423,11 @@ class DriverAssistantWindow(QMainWindow):
                     if self.voice_input_enabled
                     else "Status: microphone listening stopped"
                 )
+                self.set_voice_input_state(
+                    "listening for 'hey moss'"
+                    if self.voice_input_enabled
+                    else "listening stopped"
+                )
             self.update_audio_control_buttons()
             self.append_log("voice", "Empty transcription result")
 
@@ -2373,13 +2435,16 @@ class DriverAssistantWindow(QMainWindow):
         if not self.voice_input_enabled and (
             "No audio was captured" in message or "microphone" in message.lower()
         ):
+            self.set_voice_input_state("listening stopped")
             self.status_label.setText("Status: microphone listening stopped")
             self.append_log("voice", "Speech worker stopped after listening was disabled")
             return
         if message.strip() == "Only Chinese and English voice input is supported.":
+            self.set_voice_input_state("unsupported speech language")
             self.status_label.setText("Status: only Chinese and English voice input is supported")
             self.append_log("error", "Speech: unsupported language")
             return
+        self.set_voice_input_state("speech error")
         self.status_label.setText(f"Status: speech error - {message}")
         self.append_log("error", f"Speech: {message}")
 
@@ -2406,6 +2471,11 @@ class DriverAssistantWindow(QMainWindow):
                 if self.voice_input_enabled
                 else "Status: microphone listening stopped"
             )
+            self.set_voice_input_state(
+                "listening for 'hey moss'"
+                if self.voice_input_enabled
+                else "listening stopped"
+            )
         self.update_audio_control_buttons()
         self.append_log("voice", "Speech worker cleared")
     
@@ -2413,9 +2483,11 @@ class DriverAssistantWindow(QMainWindow):
         self.tts_muted = not self.tts_muted
         TTSQueue.instance().set_muted(self.tts_muted)
         if self.tts_muted:
+            self.set_voice_output_state("muted")
             self.status_label.setText("Status: TTS muted")
             self.append_log("voice", "TTS muted; pending speech jobs cleared")
         else:
+            self.set_voice_output_state("idle")
             self.status_label.setText("Status: TTS unmuted")
             self.append_log("voice", "TTS unmuted")
         self.update_audio_control_buttons()
@@ -2442,10 +2514,16 @@ class DriverAssistantWindow(QMainWindow):
         )
         if self.voice_input_enabled:
             self.start_background_listening()
+            self.set_voice_input_state("listening for 'hey moss'")
+            self.set_voice_dialogue_state(
+                "enabled" if bool(self.args.enable_voice_dialogue) else "disabled"
+            )
             self.status_label.setText("Status: listening for 'hey moss'")
             self.append_log("voice", "Microphone listening enabled")
         else:
             self.stop_all_listening()
+            self.set_voice_input_state("listening stopped")
+            self.set_voice_dialogue_state("disabled while listening is stopped")
             self.status_label.setText("Status: microphone listening stopped")
             self.append_log("voice", "Microphone listening stopped")
         self.update_audio_control_buttons()
@@ -2473,10 +2551,12 @@ class DriverAssistantWindow(QMainWindow):
         if not self.voice_input_enabled:
             return
         if VoiceIOGate.is_tts_active():
+            self.set_voice_input_state("wake-word ignored during TTS")
             self.append_log("voice", "Wake-word ignored while TTS is active")
             return
         if self.speech_worker is not None:
             return
+        self.set_voice_input_state("wake-word detected; recording")
         self.status_label.setText("Status: wake-word detected! Recording for 5 seconds...")
         print("[Wake-word] Triggered speech recording.")
         self.append_log("voice", "Wake-word detected")
@@ -2487,10 +2567,12 @@ class DriverAssistantWindow(QMainWindow):
         if not self.voice_input_enabled:
             return
         if VoiceIOGate.is_tts_active():
+            self.set_voice_input_state("follow-up ignored during TTS")
             self.append_log("voice", "Follow-up voice ignored while TTS is active")
             return
         if self.speech_worker is not None:
             return
+        self.set_voice_input_state("follow-up detected; recording")
         self.status_label.setText("Status: follow-up voice detected, recording...")
         self.append_log("voice", "Follow-up speech detected")
         self.start_recording(push_to_talk=False)
@@ -2501,6 +2583,11 @@ class DriverAssistantWindow(QMainWindow):
         if self.voice_input_enabled and self.wake_word_listener is not None:
             self.wake_word_listener.start()
             self.wake_word_listening = True
+        self.set_voice_input_state(
+            "listening for 'hey moss'"
+            if self.voice_input_enabled
+            else "listening stopped"
+        )
         self.status_label.setText(
             "Status: listening for 'hey moss'"
             if self.voice_input_enabled

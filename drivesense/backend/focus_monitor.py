@@ -206,6 +206,7 @@ class FocusMonitor:
         alert_chatbot: Optional[DriverAssistantChatbot] = None,
         on_voice_result: Optional[Callable[[Any], None]] = None,
         on_voice_error: Optional[Callable[[str], None]] = None,
+        on_voice_status: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.config = config or FocusMonitorConfig()
         self._tts = tts
@@ -213,12 +214,21 @@ class FocusMonitor:
         self._alert_chatbot = alert_chatbot or getattr(voice_pipeline, "chatbot", None)
         self._on_voice_result = on_voice_result
         self._on_voice_error = on_voice_error
+        self._on_voice_status = on_voice_status
         self._state = _State()
         self._state.chat_model = self.config.chat_model
         self._voice_dialogue_enabled = True
 
     def set_voice_dialogue_enabled(self, enabled: bool) -> None:
         self._voice_dialogue_enabled = enabled
+
+    def _emit_voice_status(self, message: str) -> None:
+        if self._on_voice_status is None:
+            return
+        try:
+            self._on_voice_status(message)
+        except Exception:
+            logger.exception("Voice status callback failed")
 
     def get_state_snapshot(self) -> dict[str, Any]:
         with self._state.lock:
@@ -434,6 +444,7 @@ class FocusMonitor:
         emotion_duration: float = 0.0,
     ) -> None:
         try:
+            self._emit_voice_status("Playing alert beep...")
             _play_beep(
                 self.config.beep_frequency_hz,
                 self.config.beep_duration_ms,
@@ -464,6 +475,7 @@ class FocusMonitor:
                             temperature,
                             driver_state,
                         )
+                    self._emit_voice_status("Playing alert TTS...")
                     self._tts.speak(
                         alert_sentence,
                         emotion=emotion,
@@ -471,6 +483,8 @@ class FocusMonitor:
                         priority=TTS_PRIORITY_ALERT,
                         drop_pending_below_priority=TTS_PRIORITY_ALERT,
                     )
+                    if not use_dialogue:
+                        self._emit_voice_status("Alert TTS queued; no follow-up recording")
                 except Exception as exc:
                     logger.exception("TTS speak failed: %s", exc)
 
@@ -480,6 +494,9 @@ class FocusMonitor:
                 and self._voice_pipeline is not None
             ):
                 try:
+                    self._emit_voice_status(
+                        f"Waiting for driver speech ({self.config.record_seconds:.0f} s)..."
+                    )
                     result = self._voice_pipeline.process_voice_input(
                         duration_seconds=self.config.record_seconds,
                         emotion=emotion,
@@ -488,6 +505,7 @@ class FocusMonitor:
                         temperature=temperature,
                         driver_state=driver_state,
                     )
+                    self._emit_voice_status("Voice dialogue completed")
                     logger.info(
                         "[%s trigger] Driver said: %r | Assistant: %r",
                         trigger_type,
@@ -498,10 +516,12 @@ class FocusMonitor:
                         self._on_voice_result(result)
                 except NoSpeechDetectedError as exc:
                     logger.info("Voice pipeline skipped: %s", exc)
+                    self._emit_voice_status("No follow-up speech detected")
                     if self._on_voice_error is not None:
                         self._on_voice_error(str(exc))
                 except Exception as exc:
                     logger.exception("Voice pipeline failed: %s", exc)
+                    self._emit_voice_status(f"Voice dialogue error: {exc}")
                     if self._on_voice_error is not None:
                         self._on_voice_error(str(exc))
 
