@@ -765,7 +765,7 @@ class VisionWorker(QObject):
                         if isinstance(primary_face, dict):
                             smoothed_emotion, smoothed_confidence = emotion_window.update(
                                 str(primary_face.get("emotion", "neutral")),
-                                float(primary_face.get("emotion_confidence", 0.0)),
+                                cast(float, primary_face.get("emotion_confidence", 0.0)),
                             )
                             primary_face["emotion"] = smoothed_emotion
                             primary_face["emotion_confidence"] = smoothed_confidence
