@@ -84,8 +84,8 @@ class VoiceChatPipeline:
             raise RuntimeError("Another voice session is already active.")
 
         try:
-            if VoiceIOGate.is_tts_active():
-                raise NoSpeechDetectedError("No speech detected.")
+            if not VoiceIOGate.wait_until_tts_idle(timeout=3.0):
+                raise NoSpeechDetectedError("Voice input skipped while TTS is active.")
             print(f"Recording for {duration_seconds} seconds...")
             audio = record_microphone_audio(duration_seconds=duration_seconds)
 

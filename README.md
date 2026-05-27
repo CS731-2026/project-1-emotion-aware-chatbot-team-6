@@ -178,7 +178,7 @@ The selected face crop is sent to a timm classifier trained on 7 classes:
 - `sad`
 - `surprise`
 
-The runtime also tracks the top predictions and confidence. The first two emotion candidates are passed into the LLM context, and low-confidence `sad` / `anger` predictions below 80% are downgraded to `neutral` before risk logic uses them.
+The runtime also tracks the top predictions and confidence. The first two emotion candidates are passed into the LLM context, and low-confidence `sad` / `anger` predictions below 60% are downgraded to `neutral` before risk logic uses them.
 
 ### 5. Eye-state classification
 
@@ -204,9 +204,10 @@ Current trigger paths:
 
 - **Emotion path**
   - track sustained negative emotion streaks
-  - `anger` / `fear`: 3 seconds, HIGH risk, beep + TTS + voice dialogue
+  - `fear`: 3 seconds, HIGH risk, beep + TTS + voice dialogue
   - `sad`: 3 seconds, MED risk, beep + TTS + voice dialogue
-  - `disgust`: 3 seconds, LOW risk, beep + short TTS only
+  - `disgust`: 3 seconds, LOW risk, beep + TTS + voice dialogue
+  - `anger`: 3 seconds, HIGH risk, beep + short TTS only
   - `surprise`: 3 seconds, MED risk, beep + short TTS only
   - `happy` / `neutral`: no emotion alert
   - eye and emotion alerts share a default 10-second cooldown

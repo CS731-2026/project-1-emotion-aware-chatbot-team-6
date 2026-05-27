@@ -3,14 +3,15 @@
 Tracks two trigger paths for multi-modal intervention:
 
   PATH A - Drowsiness:
-    Driver eyes closed >= threshold (default 2 s) -> beep + LLM TTS + dialogue.
+    Driver eyes closed >= threshold (default 2 s) -> beep + LLM TTS.
 
   PATH B - Emotion:
     Dangerous emotion sustained >= threshold -> beep + LLM TTS/dialogue.
     Thresholds per emotion:
-      anger / fear  -> 3 s  (HIGH risk, full dialogue)
+      fear          -> 3 s  (HIGH risk, full dialogue)
       sad           -> 3 s  (MED risk, full dialogue)
-      disgust       -> 3 s  (LOW risk, TTS only, no dialogue)
+      disgust       -> 3 s  (LOW risk, full dialogue)
+      anger         -> 3 s  (HIGH risk, TTS only, no dialogue)
       surprise      -> 3 s  (MED risk, TTS only, no dialogue)
       happy/neutral -> never triggered
 
@@ -48,10 +49,10 @@ EMOTION_TRIGGER_THRESHOLDS: dict[str, float] = {
 }
 """Seconds of sustained emotion before the system intervenes."""
 
-EMOTION_FULL_DIALOGUE: set[str] = {"anger", "fear", "sad"}
+EMOTION_FULL_DIALOGUE: set[str] = {"disgust", "fear", "sad"}
 """Emotions that get the complete beep -> LLM TTS -> record -> dialogue loop."""
 
-EMOTION_TTS_ONLY: set[str] = {"disgust", "surprise"}
+EMOTION_TTS_ONLY: set[str] = {"anger", "surprise"}
 """Emotions that get beep -> TTS only (no microphone recording / dialogue)."""
 
 EMOTION_CHECK_IN_SENTENCES: dict[str, str] = {
@@ -439,6 +440,10 @@ class FocusMonitor:
             )
 
             normalized_emotion = (emotion or "neutral").strip().lower()
+            use_dialogue = (
+                trigger_type == "emotion"
+                and normalized_emotion in EMOTION_FULL_DIALOGUE
+            )
 
             # TTS alert sentence
             if self._tts is not None:
@@ -462,17 +467,12 @@ class FocusMonitor:
                     self._tts.speak(
                         alert_sentence,
                         emotion=emotion,
-                        wait=False,
+                        wait=use_dialogue,
                         priority=TTS_PRIORITY_ALERT,
                         drop_pending_below_priority=TTS_PRIORITY_ALERT,
                     )
                 except Exception as exc:
                     logger.exception("TTS speak failed: %s", exc)
-
-            # Voice dialogue (only for full-dialogue triggers)
-            use_dialogue = (trigger_type == "eye") or (
-                trigger_type == "emotion" and normalized_emotion in EMOTION_FULL_DIALOGUE
-            )
 
             if (
                 use_dialogue

@@ -180,7 +180,7 @@ flowchart LR
 
 ### 4. 表情分类
 
-选中的 driver 人脸裁剪后送入 timm 表情分类器。当前会保留前两名表情及置信度，并把它们传给 LLM prompt。运行时还有一个后处理规则：低于 80% 置信度的 `sad` 和 `anger` 会被降级为 `neutral`。
+选中的 driver 人脸裁剪后送入 timm 表情分类器。当前会保留前两名表情及置信度，并把它们传给 LLM prompt。运行时还有一个后处理规则：低于 60% 置信度的 `sad` 和 `anger` 会被降级为 `neutral`。
 
 ### 5. 眼睛状态分类
 
@@ -202,15 +202,16 @@ flowchart LR
 - GUI 启动后默认先等待 5 秒眼睛状态 warm-up
 - 只统计 driver 的闭眼状态，不看其他人脸
 - driver 连续闭眼达到默认 2 秒后触发专注提醒
-- 触发后会播放 beep、短句 TTS，并可进入语音对话流程
+- 触发后会播放 beep 和短句 TTS；只有部分情绪会进入后续录音对话流程
 
 ### 情绪路径
 
 持续负面情绪会触发分层提醒：
 
-- `anger` / `fear`：持续 3 秒，HIGH risk，beep + TTS + 语音对话
+- `fear`：持续 3 秒，HIGH risk，beep + TTS + 语音对话
 - `sad`：持续 3 秒，MED risk，beep + TTS + 语音对话
-- `disgust`：持续 3 秒，LOW risk，beep + 短句 TTS，不启动录音对话
+- `disgust`：持续 3 秒，LOW risk，beep + TTS + 语音对话
+- `anger`：持续 3 秒，HIGH risk，beep + 短句 TTS，不启动录音对话
 - `surprise`：持续 3 秒，MED risk，beep + 短句 TTS，不启动录音对话
 - `happy` / `neutral`：不触发表情告警
 - 闭眼告警和情绪告警共享默认 10 秒 cooldown
