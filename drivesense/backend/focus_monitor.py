@@ -218,9 +218,22 @@ class FocusMonitor:
         self._state = _State()
         self._state.chat_model = self.config.chat_model
         self._voice_dialogue_enabled = True
+        self._eye_monitoring_enabled = True
 
     def set_voice_dialogue_enabled(self, enabled: bool) -> None:
         self._voice_dialogue_enabled = enabled
+
+    def set_eye_monitoring_enabled(self, enabled: bool) -> None:
+        self._eye_monitoring_enabled = enabled
+        if enabled:
+            return
+        with self._state.lock:
+            self._state.closed_eye_started_at = None
+            self._state.closed_eye_duration = 0.0
+            self._state.last_warning_active = False
+            if self._state.trigger_reason.startswith("Eyes closed"):
+                self._state.trigger_reason = ""
+                self._state.current_level = 0
 
     def _emit_voice_status(self, message: str) -> None:
         if self._on_voice_status is None:
@@ -283,7 +296,7 @@ class FocusMonitor:
             # ---------------------------------------------------------------
             # PATH A: Eye-closure tracking
             # ---------------------------------------------------------------
-            if eyes_closed:
+            if self._eye_monitoring_enabled and eyes_closed:
                 if self._state.closed_eye_started_at is None:
                     self._state.closed_eye_started_at = now
                 eye_duration = now - self._state.closed_eye_started_at
@@ -315,7 +328,10 @@ class FocusMonitor:
 
             if self.config.enable_emotion_trigger:
                 if normalized_emotion == self._state.emotion_streak_label:
-                    if self._state.emotion_streak_started_at is not None:
+                    if self._state.emotion_streak_started_at is None:
+                        self._state.emotion_streak_started_at = now
+                        self._state.emotion_streak_duration = 0.0
+                    else:
                         self._state.emotion_streak_duration = now - self._state.emotion_streak_started_at
                 else:
                     self._state.emotion_streak_label = normalized_emotion
@@ -376,6 +392,7 @@ class FocusMonitor:
 
             if driver_state is not None:
                 synced_driver_state = dict(driver_state)
+                synced_driver_state["eye_monitoring_enabled"] = self._eye_monitoring_enabled
                 synced_driver_state["focus_alert"] = eye_warning_active or emotion_warning_active
                 synced_driver_state["closed_eye_duration"] = eye_duration
                 synced_driver_state["focus_level"] = self._state.current_level
@@ -529,6 +546,7 @@ class FocusMonitor:
             with self._state.lock:
                 self._state.is_handling_event = False
                 if trigger_type == "emotion":
+                    self._state.emotion_streak_label = "neutral"
                     self._state.emotion_streak_started_at = None
                     self._state.emotion_streak_duration = 0.0
 

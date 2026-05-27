@@ -552,6 +552,7 @@ class VisionWorker(QObject):
         self.current_chat_model = args.default_llm_model
         self.current_temperature = float(args.default_temperature)
         self.voice_dialogue_enabled = bool(args.enable_voice_dialogue)
+        self.eye_monitoring_enabled = True
 
     def update_chat_settings(self, model: str, temperature: float) -> None:
         self.current_chat_model = model
@@ -559,6 +560,9 @@ class VisionWorker(QObject):
 
     def update_voice_dialogue_enabled(self, enabled: bool) -> None:
         self.voice_dialogue_enabled = enabled
+
+    def update_eye_monitoring_enabled(self, enabled: bool) -> None:
+        self.eye_monitoring_enabled = enabled
 
     def stop(self) -> None:
         self._running = False
@@ -613,6 +617,7 @@ class VisionWorker(QObject):
                 "focus_alert": False,
                 "focus_level": 0,
                 "closed_eye_duration": 0.0,
+                "eye_monitoring_enabled": True,
                 "trigger_reason": "",
                 "driver_side": self.args.driver_side,
                 "emotion_model_path": str(emotion_model_path),
@@ -879,11 +884,13 @@ class VisionWorker(QObject):
                     "eye_confidence": eye_confidence,
                     "eye_warmup_active": eye_warmup_active,
                     "eye_warmup_remaining": eye_warmup_remaining,
+                    "eye_monitoring_enabled": self.eye_monitoring_enabled,
                     "risk": risk,
                     "focus_alert": False,
                     "driver_side": self.args.driver_side,
                 }
                 focus_monitor.set_voice_dialogue_enabled(self.voice_dialogue_enabled)
+                focus_monitor.set_eye_monitoring_enabled(self.eye_monitoring_enabled)
                 focus_monitor.set_runtime_context(
                     chat_model=self.current_chat_model,
                     temperature=self.current_temperature,
@@ -1167,6 +1174,7 @@ class DriverAssistantWindow(QMainWindow):
         self.nav_buttons: dict[str, QPushButton] = {}
         self.wake_word_listening = False
         self.voice_input_enabled = True
+        self.eye_monitoring_enabled = True
         self.tts_muted = TTSQueue.instance().is_muted()
         self.wake_word_listener: WakeWordListener | None = None
         self.continued_listener: ContinuedConversationListener | None = None
@@ -1386,8 +1394,13 @@ class DriverAssistantWindow(QMainWindow):
         self.stop_listening_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.stop_listening_button.clicked.connect(self.toggle_voice_input)
         self.stop_listening_button.setStyleSheet(self.secondary_control_button_style(active=False))
+        self.eye_monitor_button = QPushButton("Disable Eye Monitor")
+        self.eye_monitor_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.eye_monitor_button.clicked.connect(self.toggle_eye_monitoring)
+        self.eye_monitor_button.setStyleSheet(self.secondary_control_button_style(active=False))
         audio_controls_row.addWidget(self.mute_button)
         audio_controls_row.addWidget(self.stop_listening_button)
+        audio_controls_row.addWidget(self.eye_monitor_button)
         settings_layout.addLayout(audio_controls_row)
         right_panel.addWidget(settings_card)
         right_panel.addWidget(self.build_emotion_alert_rules_card())
@@ -1980,6 +1993,9 @@ class DriverAssistantWindow(QMainWindow):
         closed_eye_duration = float(state.get("closed_eye_duration", 0.0))
         eye_warmup_active = bool(state.get("eye_warmup_active", False))
         eye_warmup_remaining = float(state.get("eye_warmup_remaining", 0.0))
+        self.eye_monitoring_enabled = bool(
+            state.get("eye_monitoring_enabled", self.eye_monitoring_enabled)
+        )
         self.record_history_sample(state)
         snapshot = (driver_detected, self.current_emotion, self.current_risk, focus_level)
         if snapshot != self._last_logged_snapshot:
@@ -2001,11 +2017,12 @@ class DriverAssistantWindow(QMainWindow):
             f"color: {color}; font-size: 17px; font-weight: 700; border: none; background: transparent;"
         )
         if eye_warmup_active:
-            self.eye_label.setText(f"warming up ({eye_warmup_remaining:.1f}s)")
+            eye_text = f"warming up ({eye_warmup_remaining:.1f}s)"
         else:
-            self.eye_label.setText(
-                f"{normalize_label(state['eye_label'])} ({state['eye_confidence']:.2f})"
-            )
+            eye_text = f"{normalize_label(state['eye_label'])} ({state['eye_confidence']:.2f})"
+        if not self.eye_monitoring_enabled:
+            eye_text = f"{eye_text} - monitor off"
+        self.eye_label.setText(eye_text)
         self.eye_label.setStyleSheet(
             "color: #ff9500; font-size: 17px; font-weight: 700; border: none; background: transparent;"
             if eye_warmup_active
@@ -2248,6 +2265,12 @@ class DriverAssistantWindow(QMainWindow):
         self.stop_listening_button.setStyleSheet(
             self.secondary_control_button_style(active=not self.voice_input_enabled)
         )
+        self.eye_monitor_button.setText(
+            "Disable Eye Monitor" if self.eye_monitoring_enabled else "Enable Eye Monitor"
+        )
+        self.eye_monitor_button.setStyleSheet(
+            self.secondary_control_button_style(active=not self.eye_monitoring_enabled)
+        )
         self.ptt_button.setEnabled(self.voice_input_enabled)
         self.mic_button.setEnabled(self.voice_input_enabled)
         if not self.voice_input_enabled:
@@ -2262,6 +2285,19 @@ class DriverAssistantWindow(QMainWindow):
         if self.wake_word_listener is not None and self.wake_word_listening:
             self.wake_word_listener.stop(wait=False)
             self.wake_word_listening = False
+        self.update_audio_control_buttons()
+
+    def interrupt_tts_for_manual_recording(self) -> None:
+        TextToSpeech.interrupt_all()
+        if self.continued_listener is not None:
+            self.continued_listener.stop(wait=False)
+        if self.wake_word_listener is not None and self.wake_word_listening:
+            self.wake_word_listener.stop(wait=False)
+            self.wake_word_listening = False
+        self._in_continued_mode = False
+        self.set_voice_output_state("interrupted by Hold to Talk")
+        self.set_voice_input_state("manual recording starting")
+        self.append_log("voice", "Hold to Talk interrupted TTS and pending speech")
         self.update_audio_control_buttons()
 
     def speak_reply_async(self, text: str, emotion: str | None = None) -> None:
@@ -2307,6 +2343,11 @@ class DriverAssistantWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_tts_finished(self) -> None:
+        if self.speech_worker is not None:
+            self.set_voice_output_state("idle")
+            self.append_log("voice", "TTS callback ignored during manual recording")
+            self.update_audio_control_buttons()
+            return
         if not self.voice_input_enabled:
             self._in_continued_mode = False
             self.set_voice_output_state("idle")
@@ -2336,12 +2377,14 @@ class DriverAssistantWindow(QMainWindow):
         If `push_to_talk` is True, disable VAD and record until user releases button.
         Otherwise use VAD with configured silence threshold.
         """
+        if push_to_talk:
+            self.interrupt_tts_for_manual_recording()
         if not self.voice_input_enabled:
             self.set_voice_input_state("listening stopped")
             self.status_label.setText("Status: microphone listening is stopped")
             self.append_log("voice", "Recording request ignored because listening is stopped")
             return
-        if VoiceIOGate.is_tts_active():
+        if not push_to_talk and VoiceIOGate.is_tts_active():
             self.set_voice_input_state("blocked while TTS is speaking")
             self.status_label.setText("Status: TTS is speaking; voice input ignored")
             self.append_log("voice", "Recording request ignored while TTS is active")
@@ -2490,6 +2533,17 @@ class DriverAssistantWindow(QMainWindow):
             self.set_voice_output_state("idle")
             self.status_label.setText("Status: TTS unmuted")
             self.append_log("voice", "TTS unmuted")
+        self.update_audio_control_buttons()
+
+    def toggle_eye_monitoring(self) -> None:
+        self.eye_monitoring_enabled = not self.eye_monitoring_enabled
+        self.vision_worker.update_eye_monitoring_enabled(self.eye_monitoring_enabled)
+        if self.eye_monitoring_enabled:
+            self.status_label.setText("Status: eye monitoring enabled")
+            self.append_log("system", "Eye monitoring enabled")
+        else:
+            self.status_label.setText("Status: eye monitoring disabled")
+            self.append_log("system", "Eye monitoring disabled; closed-eye alerts suppressed")
         self.update_audio_control_buttons()
 
     def stop_all_listening(self) -> None:

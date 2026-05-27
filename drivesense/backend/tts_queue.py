@@ -63,6 +63,21 @@ class TTSQueue:
             removed_job.cancelled = True
             removed_job.done.set()
 
+    def clear_pending(self) -> None:
+        removed_jobs: list[_SpeakJob] = []
+        with self._cv:
+            if self._jobs:
+                removed_jobs = [job for _, _, job in self._jobs]
+                self._jobs.clear()
+                heapq.heapify(self._jobs)
+            self._cv.notify_all()
+
+        for removed_job in removed_jobs:
+            self._cancel_job(
+                removed_job,
+                RuntimeError("TTS job was interrupted by user voice input."),
+            )
+
     def submit(
         self,
         task: Callable[[], None],
