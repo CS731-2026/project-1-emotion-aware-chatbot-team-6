@@ -3,14 +3,15 @@
 Tracks two trigger paths for multi-modal intervention:
 
   PATH A - Drowsiness:
-    Driver eyes closed >= threshold (default 2 s) -> beep + LLM TTS + dialogue.
+    Driver eyes closed >= threshold (default 2 s) -> beep + LLM TTS.
 
   PATH B - Emotion:
     Dangerous emotion sustained >= threshold -> beep + LLM TTS/dialogue.
     Thresholds per emotion:
-      anger / fear  -> 3 s  (HIGH risk, full dialogue)
+      fear          -> 3 s  (HIGH risk, full dialogue)
       sad           -> 3 s  (MED risk, full dialogue)
-      disgust       -> 3 s  (LOW risk, TTS only, no dialogue)
+      disgust       -> 3 s  (LOW risk, full dialogue)
+      anger         -> 3 s  (HIGH risk, TTS only, no dialogue)
       surprise      -> 3 s  (MED risk, TTS only, no dialogue)
       happy/neutral -> never triggered
 
@@ -29,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from drivesense.backend.chatbot import DEFAULT_MODEL, ChatbotResponse, DriverAssistantChatbot
-from drivesense.backend.speech import TTS_PRIORITY_ALERT, TextToSpeech
+from drivesense.backend.speech import TTS_PRIORITY_ALERT, TextToSpeech, VoiceIOGate
 from drivesense.backend.voice_chat import NoSpeechDetectedError, VoiceChatPipeline
 
 logger = logging.getLogger(__name__)
@@ -48,10 +49,10 @@ EMOTION_TRIGGER_THRESHOLDS: dict[str, float] = {
 }
 """Seconds of sustained emotion before the system intervenes."""
 
-EMOTION_FULL_DIALOGUE: set[str] = {"anger", "fear", "sad"}
+EMOTION_FULL_DIALOGUE: set[str] = {"disgust", "fear", "sad"}
 """Emotions that get the complete beep -> LLM TTS -> record -> dialogue loop."""
 
-EMOTION_TTS_ONLY: set[str] = {"disgust", "surprise"}
+EMOTION_TTS_ONLY: set[str] = {"anger", "surprise"}
 """Emotions that get beep -> TTS only (no microphone recording / dialogue)."""
 
 EMOTION_CHECK_IN_SENTENCES: dict[str, str] = {
@@ -205,6 +206,8 @@ class FocusMonitor:
         alert_chatbot: Optional[DriverAssistantChatbot] = None,
         on_voice_result: Optional[Callable[[Any], None]] = None,
         on_voice_error: Optional[Callable[[str], None]] = None,
+        on_voice_user_input: Optional[Callable[[str], None]] = None,
+        on_voice_status: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.config = config or FocusMonitorConfig()
         self._tts = tts
@@ -212,12 +215,35 @@ class FocusMonitor:
         self._alert_chatbot = alert_chatbot or getattr(voice_pipeline, "chatbot", None)
         self._on_voice_result = on_voice_result
         self._on_voice_error = on_voice_error
+        self._on_voice_user_input = on_voice_user_input
+        self._on_voice_status = on_voice_status
         self._state = _State()
         self._state.chat_model = self.config.chat_model
         self._voice_dialogue_enabled = True
+        self._eye_monitoring_enabled = True
 
     def set_voice_dialogue_enabled(self, enabled: bool) -> None:
         self._voice_dialogue_enabled = enabled
+
+    def set_eye_monitoring_enabled(self, enabled: bool) -> None:
+        self._eye_monitoring_enabled = enabled
+        if enabled:
+            return
+        with self._state.lock:
+            self._state.closed_eye_started_at = None
+            self._state.closed_eye_duration = 0.0
+            self._state.last_warning_active = False
+            if self._state.trigger_reason.startswith("Eyes closed"):
+                self._state.trigger_reason = ""
+                self._state.current_level = 0
+
+    def _emit_voice_status(self, message: str) -> None:
+        if self._on_voice_status is None:
+            return
+        try:
+            self._on_voice_status(message)
+        except Exception:
+            logger.exception("Voice status callback failed")
 
     def get_state_snapshot(self) -> dict[str, Any]:
         with self._state.lock:
@@ -272,7 +298,7 @@ class FocusMonitor:
             # ---------------------------------------------------------------
             # PATH A: Eye-closure tracking
             # ---------------------------------------------------------------
-            if eyes_closed:
+            if self._eye_monitoring_enabled and eyes_closed:
                 if self._state.closed_eye_started_at is None:
                     self._state.closed_eye_started_at = now
                 eye_duration = now - self._state.closed_eye_started_at
@@ -304,7 +330,10 @@ class FocusMonitor:
 
             if self.config.enable_emotion_trigger:
                 if normalized_emotion == self._state.emotion_streak_label:
-                    if self._state.emotion_streak_started_at is not None:
+                    if self._state.emotion_streak_started_at is None:
+                        self._state.emotion_streak_started_at = now
+                        self._state.emotion_streak_duration = 0.0
+                    else:
                         self._state.emotion_streak_duration = now - self._state.emotion_streak_started_at
                 else:
                     self._state.emotion_streak_label = normalized_emotion
@@ -365,6 +394,7 @@ class FocusMonitor:
 
             if driver_state is not None:
                 synced_driver_state = dict(driver_state)
+                synced_driver_state["eye_monitoring_enabled"] = self._eye_monitoring_enabled
                 synced_driver_state["focus_alert"] = eye_warning_active or emotion_warning_active
                 synced_driver_state["closed_eye_duration"] = eye_duration
                 synced_driver_state["focus_level"] = self._state.current_level
@@ -433,12 +463,17 @@ class FocusMonitor:
         emotion_duration: float = 0.0,
     ) -> None:
         try:
+            self._emit_voice_status("Playing alert beep...")
             _play_beep(
                 self.config.beep_frequency_hz,
                 self.config.beep_duration_ms,
             )
 
             normalized_emotion = (emotion or "neutral").strip().lower()
+            use_dialogue = (
+                trigger_type == "emotion"
+                and normalized_emotion in EMOTION_FULL_DIALOGUE
+            )
 
             # TTS alert sentence
             if self._tts is not None:
@@ -459,20 +494,20 @@ class FocusMonitor:
                             temperature,
                             driver_state,
                         )
+                    self._emit_voice_status("Playing alert TTS...")
                     self._tts.speak(
                         alert_sentence,
                         emotion=emotion,
-                        wait=False,
+                        wait=use_dialogue,
                         priority=TTS_PRIORITY_ALERT,
                         drop_pending_below_priority=TTS_PRIORITY_ALERT,
                     )
+                    if use_dialogue:
+                        VoiceIOGate.clear_tts_active()
+                    if not use_dialogue:
+                        self._emit_voice_status("Alert TTS queued; no follow-up recording")
                 except Exception as exc:
                     logger.exception("TTS speak failed: %s", exc)
-
-            # Voice dialogue (only for full-dialogue triggers)
-            use_dialogue = (trigger_type == "eye") or (
-                trigger_type == "emotion" and normalized_emotion in EMOTION_FULL_DIALOGUE
-            )
 
             if (
                 use_dialogue
@@ -480,28 +515,37 @@ class FocusMonitor:
                 and self._voice_pipeline is not None
             ):
                 try:
+                    self._emit_voice_status(
+                        f"Waiting for driver speech ({self.config.record_seconds:.0f} s)..."
+                    )
                     result = self._voice_pipeline.process_voice_input(
                         duration_seconds=self.config.record_seconds,
+                        follow_up_seconds=3.0,
                         emotion=emotion,
                         auto_trigger=(trigger_type == "emotion"),
                         model=chat_model,
                         temperature=temperature,
                         driver_state=driver_state,
+                        on_user_input=self._on_voice_user_input,
+                        on_turn=self._on_voice_result,
+                        on_status=self._emit_voice_status,
+                        wait_for_tts_idle=False,
                     )
+                    self._emit_voice_status("Voice dialogue completed")
                     logger.info(
                         "[%s trigger] Driver said: %r | Assistant: %r",
                         trigger_type,
                         result.user_input,
                         result.bot_reply,
                     )
-                    if self._on_voice_result is not None:
-                        self._on_voice_result(result)
                 except NoSpeechDetectedError as exc:
                     logger.info("Voice pipeline skipped: %s", exc)
+                    self._emit_voice_status("No follow-up speech detected")
                     if self._on_voice_error is not None:
                         self._on_voice_error(str(exc))
                 except Exception as exc:
                     logger.exception("Voice pipeline failed: %s", exc)
+                    self._emit_voice_status(f"Voice dialogue error: {exc}")
                     if self._on_voice_error is not None:
                         self._on_voice_error(str(exc))
 
@@ -509,6 +553,7 @@ class FocusMonitor:
             with self._state.lock:
                 self._state.is_handling_event = False
                 if trigger_type == "emotion":
+                    self._state.emotion_streak_label = "neutral"
                     self._state.emotion_streak_started_at = None
                     self._state.emotion_streak_duration = 0.0
 
@@ -521,36 +566,7 @@ class FocusMonitor:
         driver_state: dict[str, Any] | None,
     ) -> str:
         """Build TTS sentence for eye-closure (drowsiness) alerts."""
-        fallback_sentence = _build_check_in_question(
-            default_question, emotion, driver_state,
-        )
-        if self._alert_chatbot is None:
-            return fallback_sentence
-        try:
-            logger.info(
-                "Generating dynamic focus alert via LLM | model=%s emotion=%s",
-                chat_model, emotion,
-            )
-            response = self._alert_chatbot.generate_reply(
-                emotion=emotion,
-                user_message=_build_alert_prompt(driver_state),
-                model=chat_model,
-                temperature=temperature,
-                conversation_history=[],
-                max_output_tokens=self.config.alert_max_output_tokens,
-                auto_trigger=True,
-                driver_state=driver_state,
-            )
-            text = response.text.strip()
-            if text:
-                logger.info(
-                    "Dynamic focus alert generated | model=%s fallback=%s text=%r",
-                    response.model, response.fallback_used, text,
-                )
-                return text
-        except Exception as exc:
-            logger.exception("Dynamic focus alert failed, using fallback: %s", exc)
-        return fallback_sentence
+        return "Hey, Eye closed detected. Are you feeling tired?"
 
     def _build_emotion_alert_sentence(
         self,

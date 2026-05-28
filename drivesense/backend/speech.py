@@ -41,6 +41,7 @@ class VoiceIOGate:
     _session_lock = threading.Lock()
     _tts_state_lock = threading.Lock()
     _tts_active_until = 0.0
+    _tts_interrupted = False
 
     @classmethod
     def acquire_microphone(
@@ -79,12 +80,23 @@ class VoiceIOGate:
     @classmethod
     def mark_tts_started(cls) -> None:
         with cls._tts_state_lock:
+            cls._tts_interrupted = False
             cls._tts_active_until = float("inf")
 
     @classmethod
     def mark_tts_finished(cls, guard_seconds: float = TTS_CAPTURE_GUARD_SECONDS) -> None:
         with cls._tts_state_lock:
-            cls._tts_active_until = time.monotonic() + guard_seconds
+            if cls._tts_interrupted:
+                cls._tts_active_until = 0.0
+                cls._tts_interrupted = False
+            else:
+                cls._tts_active_until = time.monotonic() + guard_seconds
+
+    @classmethod
+    def clear_tts_active(cls) -> None:
+        with cls._tts_state_lock:
+            cls._tts_interrupted = True
+            cls._tts_active_until = 0.0
 
     @classmethod
     def is_tts_active(cls) -> bool:
@@ -294,6 +306,7 @@ class TextToSpeech:
     _engine_lock = threading.RLock()
     _shared_engine: Any = None
     _shared_voices: list[Any] | None = None
+    _sapi_process: subprocess.Popen | None = None
 
     EMOTION_RATE_OFFSETS = {
         "anger": 0,
@@ -353,6 +366,27 @@ class TextToSpeech:
                     engine.stop()
                 except Exception:
                     pass
+
+    @classmethod
+    def interrupt_all(cls) -> None:
+        TTSQueue.instance().clear_pending()
+        with cls._engine_lock:
+            process = cls._sapi_process
+            cls._sapi_process = None
+            if process is not None and process.poll() is None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            engine = cls._shared_engine
+            cls._shared_engine = None
+            cls._shared_voices = None
+            if engine is not None:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+        VoiceIOGate.clear_tts_active()
 
     def _get_voices(self) -> list[Any]:
         cls = type(self)
@@ -425,7 +459,7 @@ class TextToSpeech:
                 "$synth.Dispose()",
             ]
         )
-        subprocess.run(
+        process = subprocess.Popen(
             [
                 "powershell",
                 "-NoProfile",
@@ -434,11 +468,27 @@ class TextToSpeech:
                 "-Command",
                 script,
             ],
-            check=True,
-            timeout=max(15, min(60, len(text) // 8 + 8)),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
+        with type(self)._engine_lock:
+            type(self)._sapi_process = process
+        try:
+            stdout, stderr = process.communicate(
+                timeout=max(15, min(60, len(text) // 8 + 8))
+            )
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    process.returncode,
+                    process.args,
+                    output=stdout,
+                    stderr=stderr,
+                )
+        finally:
+            with type(self)._engine_lock:
+                if type(self)._sapi_process is process:
+                    type(self)._sapi_process = None
 
     def _speak_now(self, text: str, emotion: str | None = None) -> None:
         spoken_text = self.prepare_spoken_text(text)

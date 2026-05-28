@@ -178,7 +178,7 @@ The selected face crop is sent to a timm classifier trained on 7 classes:
 - `sad`
 - `surprise`
 
-The runtime also tracks the top predictions and confidence. The first two emotion candidates are passed into the LLM context, and low-confidence `sad` / `anger` predictions below 80% are downgraded to `neutral` before risk logic uses them.
+The runtime also tracks the top predictions and confidence. The first two emotion candidates are passed into the LLM context, and low-confidence `sad` / `anger` predictions below 60% are downgraded to `neutral` before risk logic uses them.
 
 ### 5. Eye-state classification
 
@@ -200,16 +200,22 @@ Current trigger paths:
 - **Eye-closure path**
   - ignore eye-state decisions during the GUI warm-up period, default 5 seconds
   - track continuous closed-eye duration for the selected driver only
-  - raise a focus warning after the configured threshold, default 2 seconds
+  - after the configured threshold, default 2 seconds, trigger beep + fixed TTS only
+  - fixed TTS sentence: `Hey, Eye closed detected. Are you feeling tired?`
+  - no follow-up recording or voice dialogue is started from the eye-closure path
+  - the `Eye Monitoring` button can disable closed-eye interventions while still showing eye classification results
 
 - **Emotion path**
   - track sustained negative emotion streaks
-  - `anger` / `fear`: 3 seconds, HIGH risk, beep + TTS + voice dialogue
-  - `sad`: 3 seconds, MED risk, beep + TTS + voice dialogue
-  - `disgust`: 3 seconds, LOW risk, beep + short TTS only
+  - `fear`: 3 seconds, HIGH risk, beep + TTS + 5-second voice dialogue
+  - `sad`: 3 seconds, MED risk, beep + TTS + 5-second voice dialogue
+  - `disgust`: 3 seconds, LOW risk, beep + TTS + 5-second voice dialogue
+  - `anger`: 3 seconds, HIGH risk, beep + short TTS only
   - `surprise`: 3 seconds, MED risk, beep + short TTS only
   - `happy` / `neutral`: no emotion alert
   - eye and emotion alerts share a default 10-second cooldown
+  - emotion voice dialogue is serialized; new emotion triggers are dropped while the current dialogue is active
+  - after each assistant reply, the system listens for 3 seconds for follow-up speech and continues until no follow-up speech is detected
 
 Outputs from `FocusMonitor`:
 
@@ -218,7 +224,7 @@ Outputs from `FocusMonitor`:
 - trigger reason
 - beep
 - short TTS alert
-- optional voice dialogue
+- emotion-triggered voice dialogue
 
 Design logic:
 
@@ -246,10 +252,12 @@ flowchart LR
 
 - text input produces **text output + spoken output**
 - manual voice input produces **transcribed text + assistant text + spoken reply**
-- focus-triggered voice dialogue also writes its text results into the GUI chat log
+- all user input is shown in the chat panel as soon as text is available
+- after user input appears, the GUI inserts a `...` assistant placeholder and replaces it with the model reply
+- focus-triggered emotion dialogue also writes each transcription and model reply into the GUI chat log
 - input and output are restricted to **Chinese and English**
 - wake-word listening starts automatically in the GUI and listens for `hey moss`, `hey`, or `moss`
-- the push-to-talk button records while pressed
+- the `Hold to Talk` button records while pressed and has the highest audio priority
 
 ### Concurrency control
 
@@ -262,11 +270,9 @@ Current controls:
 - **single-consumer TTS queue**: serializes all speech playback
 - **priority-based TTS dispatch**:
   - focus alerts > voice-dialogue replies > normal chat replies
-
-Important limitation:
-
 - queued lower-priority jobs can be dropped before playback
-- an audio job that has already started playback is not forcefully interrupted
+- `Hold to Talk` clears pending TTS, interrupts current TTS playback, and starts recording immediately
+- wake-word and automatic follow-up listening do not interrupt TTS, so the app does not record its own speech output
 
 ## LLM Prompt Design
 
@@ -498,11 +504,11 @@ python -m drivesense.frontend.gui --device cuda --default-llm-model anthropic/cl
 Useful GUI options:
 
 ```powershell
-python -m drivesense.frontend.gui --device cuda --save-eye-crops
+python -m drivesense.frontend.gui --device cuda --save-eye-crops --save-eye-crops-interval-seconds 1 --save-eye-crops-limit 100 --save-eye-crops-dir debug_exports\eye_crops
 python -m drivesense.frontend.gui --device cpu --no-enable-voice-dialogue
 ```
 
-`--save-eye-crops` overwrites debug eye crops under `debug_exports/eye_crops/` for inspection. It is disabled by default.
+`--save-eye-crops` overwrites debug eye crops under `debug_exports/eye_crops/` for inspection. The example above saves one driver-eye crop sample per second and stops at 100 images.
 
 ### CLI vision mode
 
