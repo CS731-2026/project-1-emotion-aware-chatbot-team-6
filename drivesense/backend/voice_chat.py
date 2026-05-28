@@ -64,12 +64,17 @@ class VoiceChatPipeline:
     def process_voice_input(
         self,
         duration_seconds: float = 5.0,
+        follow_up_seconds: float = 0.0,
         emotion: str = "neutral",
         temperature: float = 1.0,
         conversation_history: list[dict[str, str]] | None = None,
         auto_trigger: bool = False,
         model: str | None = None,
         driver_state: dict[str, Any] | None = None,
+        on_user_input: Callable[[str], None] | None = None,
+        on_turn: Callable[[VoiceChatResult], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
+        wait_for_tts_idle: bool = True,
     ) -> VoiceChatResult:
         """
         Record voice, transcribe, get LLM reply, and speak it aloud.
@@ -84,57 +89,98 @@ class VoiceChatPipeline:
             raise RuntimeError("Another voice session is already active.")
 
         try:
-            if not VoiceIOGate.wait_until_tts_idle(timeout=3.0):
-                raise NoSpeechDetectedError("Voice input skipped while TTS is active.")
-            print(f"Recording for {duration_seconds} seconds...")
-            audio = record_microphone_audio(duration_seconds=duration_seconds)
+            turn_results: list[VoiceChatResult] = []
+            current_duration = duration_seconds
+            current_history = list(conversation_history or [])
 
-            if audio.size == 0:
-                raise ValueError("No audio was captured. Please try again.")
-            if VoiceIOGate.is_tts_active():
+            while True:
+                if wait_for_tts_idle and not VoiceIOGate.wait_until_tts_idle(timeout=3.0):
+                    raise NoSpeechDetectedError("Voice input skipped while TTS is active.")
+                if on_status is not None:
+                    on_status(f"Recording for {current_duration:.0f} s...")
+                print(f"Recording for {current_duration} seconds...")
+                audio = record_microphone_audio(
+                    duration_seconds=current_duration,
+                    vad_enabled=not auto_trigger,
+                )
+
+                if audio.size == 0:
+                    if turn_results:
+                        if on_status is not None:
+                            on_status("No follow-up speech detected")
+                        break
+                    raise ValueError("No audio was captured. Please try again.")
+                if VoiceIOGate.is_tts_active():
+                    if turn_results:
+                        if on_status is not None:
+                            on_status("No follow-up speech detected")
+                        break
+                    raise NoSpeechDetectedError("No speech detected.")
+
+                result = self.transcriber.transcribe_audio(audio)
+                user_input = result.text.strip()
+                print(f"Transcribed: {user_input}")
+                if not user_input:
+                    if turn_results:
+                        if on_status is not None:
+                            on_status("No follow-up speech detected")
+                        break
+                    raise NoSpeechDetectedError("No speech detected.")
+                if not is_supported_zh_en_text(user_input):
+                    raise ValueError("Only Chinese and English voice input is supported.")
+                if on_user_input is not None:
+                    on_user_input(user_input)
+
+                print("Generating response...")
+                bot_response: ChatbotResponse = self.chatbot.generate_reply(
+                    emotion=emotion,
+                    user_message=user_input,
+                    model=model or DEFAULT_MODEL,
+                    temperature=temperature,
+                    conversation_history=current_history,
+                    auto_trigger=auto_trigger,
+                    driver_state=driver_state,
+                )
+
+                current_history.append({"role": "user", "content": user_input})
+                current_history.append({"role": "assistant", "content": bot_response.text})
+
+                turn_result = VoiceChatResult(
+                    user_input=user_input,
+                    bot_reply=bot_response.text,
+                    emotion=bot_response.emotion,
+                    model=bot_response.model,
+                    selected_model=bot_response.selected_model,
+                    latency_ms=bot_response.latency_ms,
+                    prompt_tokens=bot_response.prompt_tokens,
+                    completion_tokens=bot_response.completion_tokens,
+                    total_tokens=bot_response.total_tokens,
+                    fallback_used=bot_response.fallback_used,
+                )
+                turn_results.append(turn_result)
+                if on_turn is not None:
+                    on_turn(turn_result)
+
+                print("Queueing reply TTS...")
+                self.tts.speak(
+                    bot_response.text,
+                    emotion=emotion,
+                    wait=auto_trigger,
+                    priority=TTS_PRIORITY_VOICE_REPLY,
+                )
+                if auto_trigger:
+                    VoiceIOGate.clear_tts_active()
+
+                if not auto_trigger or follow_up_seconds <= 0:
+                    break
+                current_duration = follow_up_seconds
+                wait_for_tts_idle = False
+                if on_status is not None:
+                    on_status(f"Listening for follow-up ({follow_up_seconds:.0f} s)...")
+
+            if not turn_results:
                 raise NoSpeechDetectedError("No speech detected.")
-
-            # Do not transcribe audio captured around local playback. This avoids
-            # feeding the assistant's own TTS output back into Whisper.
-            result = self.transcriber.transcribe_audio(audio)
-            user_input = result.text.strip()
-            print(f"Transcribed: {user_input}")
-            if not user_input:
-                raise NoSpeechDetectedError("No speech detected.")
-            if not is_supported_zh_en_text(user_input):
-                raise ValueError("Only Chinese and English voice input is supported.")
-
-            print("Generating response...")
-            bot_response: ChatbotResponse = self.chatbot.generate_reply(
-                emotion=emotion,
-                user_message=user_input,
-                model=model or DEFAULT_MODEL,
-                temperature=temperature,
-                conversation_history=conversation_history,
-                auto_trigger=auto_trigger,
-                driver_state=driver_state,
-            )
-
-            print("Queueing reply TTS...")
-            self.tts.speak(
-                bot_response.text,
-                emotion=emotion,
-                wait=False,
-                priority=TTS_PRIORITY_VOICE_REPLY,
-            )
-
-            return VoiceChatResult(
-                user_input=user_input,
-                bot_reply=bot_response.text,
-                emotion=bot_response.emotion,
-                model=bot_response.model,
-                selected_model=bot_response.selected_model,
-                latency_ms=bot_response.latency_ms,
-                prompt_tokens=bot_response.prompt_tokens,
-                completion_tokens=bot_response.completion_tokens,
-                total_tokens=bot_response.total_tokens,
-                fallback_used=bot_response.fallback_used,
-            )
+            return turn_results[-1]
         finally:
             VoiceIOGate.release_session()
             type(self)._pipeline_lock.release()

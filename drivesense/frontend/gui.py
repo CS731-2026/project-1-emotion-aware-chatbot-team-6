@@ -43,7 +43,7 @@ def configure_frozen_dll_search_paths() -> None:
 configure_frozen_dll_search_paths()
 
 import torch
-from PyQt5.QtCore import QObject, QMetaObject, Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QObject, QMetaObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QColor, QCloseEvent, QCursor, QGuiApplication, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -287,6 +287,12 @@ def parse_args() -> argparse.Namespace:
         default=200,
         help="Maximum number of eye crops to save per run.",
     )
+    parser.add_argument(
+        "--save-eye-crops-interval-seconds",
+        type=float,
+        default=0.0,
+        help="Minimum seconds between saved driver eye-crop samples. 0 saves every processed frame.",
+    )
     return parser.parse_args()
 
 
@@ -510,10 +516,10 @@ class EmotionConfidenceHistoryChart(QWidget):
 class ChatBubble(QFrame):
     def __init__(self, text: str, is_user: bool) -> None:
         super().__init__()
-        bubble = QLabel(text)
-        bubble.setWordWrap(True)
-        bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        bubble.setStyleSheet(
+        self.bubble = QLabel(text)
+        self.bubble.setWordWrap(True)
+        self.bubble.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.bubble.setStyleSheet(
             (
                 "background-color: #0059b5; color: white; border-radius: 18px; "
                 "padding: 14px 18px; font-size: 15px; line-height: 1.4;"
@@ -524,16 +530,19 @@ class ChatBubble(QFrame):
                 "padding: 14px 18px; font-size: 15px; line-height: 1.4;"
             )
         )
-        bubble.setMaximumWidth(360)
+        self.bubble.setMaximumWidth(360)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 8)
         if is_user:
             layout.addStretch()
-            layout.addWidget(bubble)
+            layout.addWidget(self.bubble)
         else:
-            layout.addWidget(bubble)
+            layout.addWidget(self.bubble)
             layout.addStretch()
+
+    def set_text(self, text: str) -> None:
+        self.bubble.setText(text)
 
 
 class VisionWorker(QObject):
@@ -541,6 +550,7 @@ class VisionWorker(QObject):
     state_ready = pyqtSignal(object)
     voice_dialogue_ready = pyqtSignal(object)
     voice_dialogue_error = pyqtSignal(str)
+    voice_user_input_ready = pyqtSignal(str)
     voice_status_ready = pyqtSignal(str)
     error = pyqtSignal(str)
     finished = pyqtSignal()
@@ -593,6 +603,7 @@ class VisionWorker(QObject):
                 voice_pipeline=voice_pipeline,
                 on_voice_result=lambda result: self.voice_dialogue_ready.emit(asdict(result)),
                 on_voice_error=self.voice_dialogue_error.emit,
+                on_voice_user_input=self.voice_user_input_ready.emit,
                 on_voice_status=self.voice_status_ready.emit,
             )
             emotion_window = EmotionMajorityWindow()
@@ -627,6 +638,7 @@ class VisionWorker(QObject):
             vision_started_at = previous_time
             previous_driver_center_x: float | None = None
             saved_eye_crop_count = 0
+            last_eye_crop_saved_at = 0.0
             frame_index = 0
             run_prefix = time.strftime("%Y%m%d_%H%M%S")
             if self.args.save_eye_crops:
@@ -812,8 +824,16 @@ class VisionWorker(QObject):
                             and self.args.save_eye_crops
                             and saved_eye_crop_count < self.args.save_eye_crops_limit
                         ):
+                            save_interval = max(0.0, float(self.args.save_eye_crops_interval_seconds))
+                            crop_sample_now = time.perf_counter()
+                            if (
+                                save_interval > 0.0
+                                and crop_sample_now - last_eye_crop_saved_at < save_interval
+                            ):
+                                continue
                             eye_boxes = cast(tuple[tuple[int, int, int, int], tuple[int, int, int, int]], face["eye_boxes"])
                             per_face_eye_predictions = cast(list[tuple[str, float]], face["eye_predictions"])
+                            saved_this_sample = False
                             for eye_offset, (eye_box, eye_prediction) in enumerate(
                                 zip(eye_boxes, per_face_eye_predictions)
                             ):
@@ -832,6 +852,9 @@ class VisionWorker(QObject):
                                 )
                                 if saved_path is not None:
                                     saved_eye_crop_count += 1
+                                    saved_this_sample = True
+                            if saved_this_sample:
+                                last_eye_crop_saved_at = crop_sample_now
 
                 driver_detected = primary_face is not None
                 if primary_face is not None and isinstance(primary_face, dict):
@@ -1160,6 +1183,7 @@ class DriverAssistantWindow(QMainWindow):
             "driver_side": self.args.driver_side,
         }
         self.conversation_history: list[dict[str, str]] = []
+        self.pending_assistant_bubbles: list[ChatBubble] = []
         self.chat_worker: ChatWorker | None = None
         self.speech_worker: SpeechWorker | None = None
         self.last_used_model = self.args.default_llm_model
@@ -1491,6 +1515,7 @@ class DriverAssistantWindow(QMainWindow):
         self.vision_worker.state_ready.connect(self.update_emotion_state)
         self.vision_worker.voice_dialogue_ready.connect(self.handle_voice_dialogue_result)
         self.vision_worker.voice_dialogue_error.connect(self.handle_voice_dialogue_error)
+        self.vision_worker.voice_user_input_ready.connect(self.handle_voice_user_input)
         self.vision_worker.voice_status_ready.connect(self.handle_auto_voice_status)
         self.vision_worker.error.connect(self.handle_worker_error)
         self.vision_worker.finished.connect(self.vision_thread.quit)
@@ -1538,7 +1563,7 @@ class DriverAssistantWindow(QMainWindow):
             ),
             on_voice_detected=self.on_continued_voice_detected,
             on_timeout=self.on_continued_timeout,
-            timeout_seconds=5.0,
+            timeout_seconds=3.0,
         )
         self.switch_page("Dashboard")
         self.append_log("system", "DriveSense GUI ready")
@@ -1967,9 +1992,24 @@ class DriverAssistantWindow(QMainWindow):
         self.append_log("history", f"Exported attention chart to {attention_path}")
         self.append_log("history", f"Exported emotion chart to {emotion_path}")
 
-    def add_message(self, text: str, is_user: bool) -> None:
+    def add_message(self, text: str, is_user: bool) -> ChatBubble:
         bubble = ChatBubble(text, is_user=is_user)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
+        QTimer.singleShot(0, self.scroll_chat_to_bottom)
+        return bubble
+
+    def show_processing_placeholder(self) -> None:
+        self.pending_assistant_bubbles.append(self.add_message("...", is_user=False))
+
+    def replace_processing_placeholder(self, text: str) -> None:
+        if self.pending_assistant_bubbles:
+            bubble = self.pending_assistant_bubbles.pop(0)
+            bubble.set_text(text)
+            QTimer.singleShot(0, self.scroll_chat_to_bottom)
+            return
+        self.add_message(text, is_user=False)
+
+    def scroll_chat_to_bottom(self) -> None:
         scrollbar = self.chat_scroll.verticalScrollBar()
         if scrollbar is not None:
             scrollbar.setValue(scrollbar.maximum())
@@ -2134,6 +2174,7 @@ class DriverAssistantWindow(QMainWindow):
 
         self.input_edit.clear()
         self.add_message(text, is_user=True)
+        self.show_processing_placeholder()
         history_snapshot = list(self.conversation_history)
         self.conversation_history.append({"role": "user", "content": text})
         self.append_log("chat", f"Manual text input: {text[:80]}")
@@ -2175,7 +2216,7 @@ class DriverAssistantWindow(QMainWindow):
         self.chat_worker.start()
 
     def handle_chat_response(self, payload: dict) -> None:
-        self.add_message(payload["text"], is_user=False)
+        self.replace_processing_placeholder(payload["text"])
         self.conversation_history.append({"role": "assistant", "content": payload["text"]})
         self.speak_reply_async(payload["text"], payload.get("emotion", self.current_emotion))
         self.last_used_model = str(payload.get("model", self.model_combo.currentText()))
@@ -2193,19 +2234,31 @@ class DriverAssistantWindow(QMainWindow):
         self.status_label.setText("Status: assistant reply queued for speech output")
 
     def handle_chat_error(self, message: str) -> None:
+        self.replace_processing_placeholder(f"Request failed: {message}")
         self.status_label.setText(f"Status: chatbot error - {message}")
         print(f"Chat error: {message}", flush=True)
         self.append_log("error", f"Chatbot: {message}")
 
+    @pyqtSlot(str)
+    def handle_voice_user_input(self, text: str) -> None:
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        self.add_message(cleaned, is_user=True)
+        self.show_processing_placeholder()
+        self.conversation_history.append({"role": "user", "content": cleaned})
+        self.set_voice_input_state("transcription ready")
+        self.set_voice_dialogue_state("generating reply")
+        self.status_label.setText("Status: voice input transcribed; generating reply...")
+        self.append_log("voice", f"Auto voice transcription: {cleaned[:80]}")
+
     def handle_voice_dialogue_result(self, payload: dict[str, Any]) -> None:
-        user_input = str(payload.get("user_input", "")).strip()
         bot_reply = str(payload.get("bot_reply", "")).strip()
-        if user_input:
-            self.add_message(user_input, is_user=True)
-            self.conversation_history.append({"role": "user", "content": user_input})
         if bot_reply:
-            self.add_message(bot_reply, is_user=False)
+            self.replace_processing_placeholder(bot_reply)
             self.conversation_history.append({"role": "assistant", "content": bot_reply})
+        elif self.pending_assistant_bubbles:
+            self.replace_processing_placeholder("No response generated.")
         model = payload.get("model", self.model_combo.currentText())
         self.last_used_model = str(model)
         self.last_fallback_used = bool(payload.get("fallback_used", False))
@@ -2226,6 +2279,8 @@ class DriverAssistantWindow(QMainWindow):
             self.append_log("voice", f"Voice dialogue completed via {model}")
 
     def handle_voice_dialogue_error(self, message: str) -> None:
+        if self.pending_assistant_bubbles:
+            self.replace_processing_placeholder(f"Voice dialogue failed: {message}")
         if message.strip() == "No speech detected.":
             self.set_voice_input_state("no follow-up speech detected")
             self.set_voice_output_state("idle")
@@ -2244,7 +2299,7 @@ class DriverAssistantWindow(QMainWindow):
         lower = message.lower()
         if "tts" in lower or "beep" in lower:
             self.set_voice_output_state(message)
-        if "waiting" in lower or "speech" in lower or "record" in lower:
+        if "waiting" in lower or "listening" in lower or "speech" in lower or "record" in lower:
             self.set_voice_input_state(message)
         if "dialogue" in lower:
             self.set_voice_dialogue_state(message)
@@ -2360,9 +2415,9 @@ class DriverAssistantWindow(QMainWindow):
         if self.continued_listener is not None:
             self.continued_listener.start()
             self.set_voice_output_state("idle")
-            self.set_voice_input_state("listening for follow-up (5 s)")
-            self.status_label.setText("Status: listening for follow-up (5 s)...")
-            self.append_log("voice", "Entered 5-second follow-up listening window")
+            self.set_voice_input_state("listening for follow-up (3 s)")
+            self.status_label.setText("Status: listening for follow-up (3 s)...")
+            self.append_log("voice", "Entered 3-second follow-up listening window")
 
     @pyqtSlot()
     def _on_tts_failed(self) -> None:
@@ -2451,8 +2506,8 @@ class DriverAssistantWindow(QMainWindow):
             if self._in_continued_mode:
                 if self.voice_input_enabled and self.continued_listener is not None:
                     self.continued_listener.start()
-                    self.set_voice_input_state("listening for follow-up (5 s)")
-                    self.status_label.setText("Status: listening for follow-up (5 s)...")
+                    self.set_voice_input_state("listening for follow-up (3 s)")
+                    self.status_label.setText("Status: listening for follow-up (3 s)...")
             else:
                 if (
                     self.voice_input_enabled

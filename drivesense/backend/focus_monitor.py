@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from drivesense.backend.chatbot import DEFAULT_MODEL, ChatbotResponse, DriverAssistantChatbot
-from drivesense.backend.speech import TTS_PRIORITY_ALERT, TextToSpeech
+from drivesense.backend.speech import TTS_PRIORITY_ALERT, TextToSpeech, VoiceIOGate
 from drivesense.backend.voice_chat import NoSpeechDetectedError, VoiceChatPipeline
 
 logger = logging.getLogger(__name__)
@@ -206,6 +206,7 @@ class FocusMonitor:
         alert_chatbot: Optional[DriverAssistantChatbot] = None,
         on_voice_result: Optional[Callable[[Any], None]] = None,
         on_voice_error: Optional[Callable[[str], None]] = None,
+        on_voice_user_input: Optional[Callable[[str], None]] = None,
         on_voice_status: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.config = config or FocusMonitorConfig()
@@ -214,6 +215,7 @@ class FocusMonitor:
         self._alert_chatbot = alert_chatbot or getattr(voice_pipeline, "chatbot", None)
         self._on_voice_result = on_voice_result
         self._on_voice_error = on_voice_error
+        self._on_voice_user_input = on_voice_user_input
         self._on_voice_status = on_voice_status
         self._state = _State()
         self._state.chat_model = self.config.chat_model
@@ -500,6 +502,8 @@ class FocusMonitor:
                         priority=TTS_PRIORITY_ALERT,
                         drop_pending_below_priority=TTS_PRIORITY_ALERT,
                     )
+                    if use_dialogue:
+                        VoiceIOGate.clear_tts_active()
                     if not use_dialogue:
                         self._emit_voice_status("Alert TTS queued; no follow-up recording")
                 except Exception as exc:
@@ -516,11 +520,16 @@ class FocusMonitor:
                     )
                     result = self._voice_pipeline.process_voice_input(
                         duration_seconds=self.config.record_seconds,
+                        follow_up_seconds=3.0,
                         emotion=emotion,
                         auto_trigger=(trigger_type == "emotion"),
                         model=chat_model,
                         temperature=temperature,
                         driver_state=driver_state,
+                        on_user_input=self._on_voice_user_input,
+                        on_turn=self._on_voice_result,
+                        on_status=self._emit_voice_status,
+                        wait_for_tts_idle=False,
                     )
                     self._emit_voice_status("Voice dialogue completed")
                     logger.info(
@@ -529,8 +538,6 @@ class FocusMonitor:
                         result.user_input,
                         result.bot_reply,
                     )
-                    if self._on_voice_result is not None:
-                        self._on_voice_result(result)
                 except NoSpeechDetectedError as exc:
                     logger.info("Voice pipeline skipped: %s", exc)
                     self._emit_voice_status("No follow-up speech detected")
@@ -559,36 +566,7 @@ class FocusMonitor:
         driver_state: dict[str, Any] | None,
     ) -> str:
         """Build TTS sentence for eye-closure (drowsiness) alerts."""
-        fallback_sentence = _build_check_in_question(
-            default_question, emotion, driver_state,
-        )
-        if self._alert_chatbot is None:
-            return fallback_sentence
-        try:
-            logger.info(
-                "Generating dynamic focus alert via LLM | model=%s emotion=%s",
-                chat_model, emotion,
-            )
-            response = self._alert_chatbot.generate_reply(
-                emotion=emotion,
-                user_message=_build_alert_prompt(driver_state),
-                model=chat_model,
-                temperature=temperature,
-                conversation_history=[],
-                max_output_tokens=self.config.alert_max_output_tokens,
-                auto_trigger=True,
-                driver_state=driver_state,
-            )
-            text = response.text.strip()
-            if text:
-                logger.info(
-                    "Dynamic focus alert generated | model=%s fallback=%s text=%r",
-                    response.model, response.fallback_used, text,
-                )
-                return text
-        except Exception as exc:
-            logger.exception("Dynamic focus alert failed, using fallback: %s", exc)
-        return fallback_sentence
+        return "Hey, Eye closed detected. Are you feeling tired?"
 
     def _build_emotion_alert_sentence(
         self,
