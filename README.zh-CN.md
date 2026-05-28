@@ -201,20 +201,24 @@ flowchart LR
 
 - GUI 启动后默认先等待 5 秒眼睛状态 warm-up
 - 只统计 driver 的闭眼状态，不看其他人脸
-- driver 连续闭眼达到默认 2 秒后触发专注提醒
-- 触发后会播放 beep 和短句 TTS；只有部分情绪会进入后续录音对话流程
+- driver 连续闭眼达到默认 2 秒后触发 `beep + 固定 TTS`
+- 固定闭眼播报内容为：`Hey, Eye closed detected. Are you feeling tired?`
+- 闭眼路径不启动后续录音，也不进入语音对话
+- `Eye Monitoring` 按钮可以关闭闭眼干预；关闭后仍显示眼睛分类结果，但不触发闭眼风险、focus alert、beep 或 TTS
 
 ### 情绪路径
 
 持续负面情绪会触发分层提醒：
 
-- `fear`：持续 3 秒，HIGH risk，beep + TTS + 语音对话
-- `sad`：持续 3 秒，MED risk，beep + TTS + 语音对话
-- `disgust`：持续 3 秒，LOW risk，beep + TTS + 语音对话
+- `fear`：持续 3 秒，HIGH risk，beep + TTS + 5 秒首轮语音对话
+- `sad`：持续 3 秒，MED risk，beep + TTS + 5 秒首轮语音对话
+- `disgust`：持续 3 秒，LOW risk，beep + TTS + 5 秒首轮语音对话
 - `anger`：持续 3 秒，HIGH risk，beep + 短句 TTS，不启动录音对话
 - `surprise`：持续 3 秒，MED risk，beep + 短句 TTS，不启动录音对话
 - `happy` / `neutral`：不触发表情告警
 - 闭眼告警和情绪告警共享默认 10 秒 cooldown
+- 自动情绪对话串行处理；当前 dialogue 未结束时，新的情绪触发会被丢弃，不排队
+- 每次助手回复播报后，系统继续监听 3 秒 follow-up；如果检测到后续语音就继续下一轮，直到 3 秒内没有后续语音
 
 Dashboard 中的 `Emotion Alert Rules` 卡片展示这些规则，`Emotion timer` 展示当前情绪已经持续多久以及距离触发还有多久。
 
@@ -238,11 +242,13 @@ flowchart LR
 
 - 文字输入会得到文字回复和语音播报
 - 手动语音输入会把转写文本和回复都写入聊天框，并播报回复
-- 自动告警语音对话也会把转写文本和模型回复写入聊天框
+- 所有用户输入在程序拿到文本后都会立即显示到聊天框
+- 用户输入显示后会立即插入 `...` 助手占位；模型回复到达后原地替换这个占位
+- 自动情绪语音对话也会把每轮转写文本和模型回复写入聊天框
 - 语音和文字输入输出限定为中文和英文
 - 空语音转写不会调用 LLM
 - GUI 启动后自动开启 wake-word 监听，关键词包括 `hey moss`、`hey`、`moss`
-- `Hold to Talk` 按钮支持按住说话
+- `Hold to Talk` 按钮支持按住说话，并具有最高音频优先级
 
 ### 并发控制
 
@@ -252,7 +258,9 @@ Windows 语音组件不能安全地被多个线程随意抢占，所以项目做
 - 语音 session 锁：避免多个完整语音流程重叠
 - 单消费者 TTS 队列：所有播报串行执行
 - 优先级调度：闭眼/情绪告警最高，其次是语音对话回复，最后是普通聊天回复
-- 录音前会等待 TTS 空闲，避免录到程序自己的语音
+- 普通录音前会等待 TTS 空闲，避免录到程序自己的语音
+- `Hold to Talk` 会清空 pending TTS、打断当前 TTS，并立即开始录音
+- wake-word 和自动 follow-up 监听不会抢占 TTS，避免录到系统自己的播报
 
 ## Prompt 设计
 
@@ -440,11 +448,11 @@ python -m drivesense.frontend.gui --device cuda
 常用调试参数：
 
 ```powershell
-python -m drivesense.frontend.gui --device cuda --save-eye-crops
+python -m drivesense.frontend.gui --device cuda --save-eye-crops --save-eye-crops-interval-seconds 1 --save-eye-crops-limit 100 --save-eye-crops-dir debug_exports\eye_crops
 python -m drivesense.frontend.gui --device cpu --no-enable-voice-dialogue
 ```
 
-`--save-eye-crops` 会把本次运行的眼睛裁剪图覆盖保存到 `debug_exports/eye_crops/`。
+`--save-eye-crops` 会把本次运行的眼睛裁剪图覆盖保存到 `debug_exports/eye_crops/`。上面的命令每 1 秒保存一次 driver 眼睛裁剪样本，最多保存 100 张。
 
 ### 命令行视觉模式
 
