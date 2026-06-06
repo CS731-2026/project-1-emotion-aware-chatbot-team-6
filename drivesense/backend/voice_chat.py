@@ -42,7 +42,7 @@ class VoiceChatResult:
 
 
 class VoiceChatPipeline:
-    """Complete voice chat: record -> transcribe -> chat -> speak."""
+    """Run a serialized record -> transcribe -> chat -> speak dialogue."""
 
     _pipeline_lock = threading.Lock()
 
@@ -82,6 +82,8 @@ class VoiceChatPipeline:
         Returns:
             VoiceChatResult with transcribed user input, bot reply, and metrics.
         """
+        # The pipeline lock rejects duplicate calls to this object; the shared
+        # session lock also blocks competing voice flows elsewhere in the app.
         if not type(self)._pipeline_lock.acquire(blocking=False):
             raise RuntimeError("Another voice interaction is already running.")
         if not VoiceIOGate.acquire_session(blocking=False):
@@ -129,6 +131,8 @@ class VoiceChatPipeline:
                 if not is_supported_zh_en_text(user_input):
                     raise ValueError("Only Chinese and English voice input is supported.")
                 if on_user_input is not None:
+                    # Publish transcription before the remote LLM call so the
+                    # driver sees their input immediately.
                     on_user_input(user_input)
 
                 print("Generating response...")
@@ -165,6 +169,8 @@ class VoiceChatPipeline:
                 self.tts.speak(
                     bot_response.text,
                     emotion=emotion,
+                    # Automatic dialogue must finish speaking before opening
+                    # the next follow-up microphone window.
                     wait=auto_trigger,
                     priority=TTS_PRIORITY_VOICE_REPLY,
                 )
@@ -173,6 +179,8 @@ class VoiceChatPipeline:
 
                 if not auto_trigger or follow_up_seconds <= 0:
                     break
+                # Every successful automatic turn opens another short window;
+                # the loop ends only when that window contains no speech.
                 current_duration = follow_up_seconds
                 wait_for_tts_idle = False
                 if on_status is not None:

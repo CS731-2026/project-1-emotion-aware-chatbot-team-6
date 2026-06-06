@@ -35,7 +35,11 @@ class TranscriptionResult:
 
 
 class VoiceIOGate:
-    """Global guard for microphone access and full voice sessions."""
+    """Coordinate microphone, dialogue-session, and TTS playback ownership.
+
+    The separate locks prevent simultaneous microphone captures and overlapping
+    automatic dialogues, while the TTS guard prevents recording system speech.
+    """
 
     _mic_lock = threading.Lock()
     _session_lock = threading.Lock()
@@ -90,6 +94,8 @@ class VoiceIOGate:
                 cls._tts_active_until = 0.0
                 cls._tts_interrupted = False
             else:
+                # Keep a short tail guard because audio devices may finish
+                # emitting sound slightly after the TTS call returns.
                 cls._tts_active_until = time.monotonic() + guard_seconds
 
     @classmethod
@@ -120,6 +126,7 @@ class VoiceIOGate:
 
 
 def detect_text_language(text: str) -> str | None:
+    """Identify whether text primarily contains supported Chinese or English."""
     stripped = (text or "").strip()
     if not stripped:
         return None
@@ -133,6 +140,7 @@ def detect_text_language(text: str) -> str | None:
 
 
 def is_supported_zh_en_text(text: str) -> bool:
+    """Reject text containing scripts outside the supported zh/en UI contract."""
     stripped = (text or "").strip()
     if not stripped:
         return False
@@ -247,6 +255,7 @@ def record_microphone_audio(
 
 
 def save_wav(audio: np.ndarray, sample_rate: int, output_path: Path) -> None:
+    """Write normalized mono float audio as a 16-bit PCM WAV file."""
     audio_int16 = np.clip(audio, -1.0, 1.0)
     audio_int16 = (audio_int16 * 32767).astype(np.int16)
     with wave.open(str(output_path), "wb") as handle:
@@ -257,6 +266,8 @@ def save_wav(audio: np.ndarray, sample_rate: int, output_path: Path) -> None:
 
 
 class WhisperTranscriber:
+    """Own a reusable faster-whisper model for local speech transcription."""
+
     def __init__(
         self,
         model_size: str = "base",
@@ -279,6 +290,7 @@ class WhisperTranscriber:
         sample_rate: int = 16000,
         language: str | None = None,
     ) -> TranscriptionResult:
+        """Transcribe captured audio through a temporary WAV with VAD enabled."""
         if audio.size == 0:
             raise ValueError("No audio was captured.")
 
@@ -369,6 +381,7 @@ class TextToSpeech:
 
     @classmethod
     def interrupt_all(cls) -> None:
+        """Stop active speech and discard queued speech for manual PTT priority."""
         TTSQueue.instance().clear_pending()
         with cls._engine_lock:
             process = cls._sapi_process

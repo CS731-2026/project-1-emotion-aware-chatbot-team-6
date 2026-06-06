@@ -57,6 +57,12 @@ class ClassifierDict(TypedDict):
 
 
 class EmotionMajorityWindow:
+    """Stabilize post-processed frame labels with a fixed-size majority vote.
+
+    Ties are resolved in favor of the most recently observed label so the UI
+    can react to a genuine state change without waiting for the window to empty.
+    """
+
     def __init__(self, size: int = EMOTION_SMOOTHING_WINDOW_SIZE) -> None:
         if size <= 0:
             raise ValueError("Emotion majority window size must be positive.")
@@ -80,9 +86,11 @@ class EmotionMajorityWindow:
         latest_confidences: dict[str, float] = {}
         for index, (label, confidence) in enumerate(self._window):
             counts[label] = counts.get(label, 0) + 1
+            # Overwriting these values preserves the latest occurrence of each label.
             latest_indices[label] = index
             latest_confidences[label] = confidence
 
+        # Prefer the latest label when multiple labels have the same vote count.
         winner = max(
             counts,
             key=lambda label: (counts[label], latest_indices[label]),
@@ -262,6 +270,11 @@ def build_eval_transform(img_size: int) -> transforms.Compose:
 
 
 def apply_emotion_postprocess(label: str, confidence: float) -> tuple[str, float]:
+    """Apply the conservative confidence rule used by the live UI.
+
+    Low-confidence sad and anger predictions are displayed as neutral to avoid
+    triggering interventions from weak single-frame evidence.
+    """
     if (
         label in LOW_CONFIDENCE_NEUTRAL_EMOTIONS
         and confidence < LOW_CONFIDENCE_NEUTRAL_THRESHOLD
@@ -271,6 +284,7 @@ def apply_emotion_postprocess(label: str, confidence: float) -> tuple[str, float
 
 
 def normalize_checkpoint_path(model_path: Path | None) -> Path | None:
+    """Accept either a checkpoint file or a run directory containing one."""
     if model_path is None:
         return None
     if model_path.is_dir():
@@ -279,6 +293,7 @@ def normalize_checkpoint_path(model_path: Path | None) -> Path | None:
 
 
 def infer_task_from_metadata(metadata: dict) -> str | None:
+    """Infer whether checkpoint metadata describes emotion or eye classification."""
     task = metadata.get("task")
     if task in {"emotion", "eye"}:
         return task
@@ -292,12 +307,15 @@ def infer_task_from_metadata(metadata: dict) -> str | None:
 
 
 def resolve_latest_timm_model(runs_root: Path, task: str) -> Path:
+    """Return the newest valid checkpoint whose metadata matches the task."""
     candidates: list[Path] = []
     for metadata_path in runs_root.glob("*/metadata.json"):
         checkpoint_path = metadata_path.parent / "best_model.pth"
         if not checkpoint_path.exists():
             continue
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        # Task filtering prevents an eye checkpoint from being loaded as the
+        # emotion classifier merely because it was trained more recently.
         if infer_task_from_metadata(metadata) == task:
             candidates.append(checkpoint_path)
 
@@ -310,6 +328,7 @@ def resolve_latest_timm_model(runs_root: Path, task: str) -> Path:
 def resolve_classifier_paths(
     emotion_path: Path | None, eye_path: Path | None, runs_root: Path
 ) -> tuple[Path, Path]:
+    """Resolve explicit model paths or fall back to the latest matching runs."""
     resolved_emotion = normalize_checkpoint_path(emotion_path) or resolve_latest_timm_model(
         runs_root, "emotion"
     )
@@ -325,6 +344,7 @@ def resolve_classifier_paths(
 
 
 def ensure_face_model(face_model_path: Path) -> Path:
+    """Download the face detector only when it is absent locally."""
     if face_model_path.exists():
         return face_model_path
 
@@ -335,6 +355,7 @@ def ensure_face_model(face_model_path: Path) -> Path:
 
 
 def resolve_devices(device_arg: str) -> tuple[str, torch.device]:
+    """Resolve one device value for Ultralytics and one for PyTorch/timm."""
     normalized = device_arg.strip().lower()
     if normalized.isdigit():
         if not torch.cuda.is_available():
@@ -350,6 +371,7 @@ def resolve_devices(device_arg: str) -> tuple[str, torch.device]:
 
 
 def load_timm_classifier(checkpoint_path: Path, device: torch.device) -> ClassifierDict:
+    """Reconstruct a timm classifier and its evaluation transform from metadata."""
     metadata_path = checkpoint_path.parent / "metadata.json"
     metadata = None
     if metadata_path.exists():
@@ -389,6 +411,7 @@ def load_timm_classifier(checkpoint_path: Path, device: torch.device) -> Classif
 def classify_crops(
     classifier: ClassifierDict, crops_bgr: list[np.ndarray], device: torch.device
 ) -> list[tuple[str, float]]:
+    """Return the top-1 label and confidence for each image crop."""
     topk_predictions = classify_crops_with_topk(classifier, crops_bgr, device, topk=1)
     outputs: list[tuple[str, float]] = []
     for predictions in topk_predictions:
@@ -406,6 +429,7 @@ def classify_crops_with_topk(
     topk: int = 3,
     top_k: int | None = None,
 ) -> list[list[tuple[str, float]]] | list[dict[str, object]]:
+    """Batch-classify crops while preserving the legacy GUI return format."""
     if not crops_bgr:
         return []
 
@@ -511,6 +535,11 @@ def expand_box(*args: object) -> tuple[int, int, int, int]:
 def estimate_eye_boxes(
     face_box: tuple[int, int, int, int] | tuple[int, ...]
 ) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Estimate eye regions from face proportions rather than facial landmarks.
+
+    This approximation is fast, but its accuracy depends on face pose and on
+    the quality of the detected face box.
+    """
     if len(face_box) == 4:
         x1, y1, x2, y2 = face_box
     elif len(face_box) >= 2:
@@ -580,6 +609,7 @@ def choose_driver_face(
     strategy: str,
     previous_driver_center_x: float | None = None,
 ) -> int | dict[str, object] | None:
+    """Select the driver face, preferring continuity with the previous frame."""
     if not face_boxes:
         return None
 
@@ -592,6 +622,8 @@ def choose_driver_face(
         return faces[cast(int, selected)]
 
     if previous_driver_center_x is not None:
+        # Preserve identity across nearby frames before applying the configured
+        # fallback strategy; this reduces sudden switches to a passenger.
         previous_center_px = previous_driver_center_x * max(frame_width, 1)
         distance_pairs = [
             (idx, abs((((box[0] + box[2]) / 2) - previous_center_px)))
@@ -643,6 +675,7 @@ def filter_primary_face_candidates(
     min_face_area_ratio: float = 0.015,
     relative_min_face_scale: float = 0.35,
 ) -> list[int]:
+    """Reject small background faces before selecting the primary driver."""
     if not face_boxes:
         return []
 
@@ -659,6 +692,8 @@ def filter_primary_face_candidates(
     kept_indices = [
         idx for idx, area in enumerate(face_areas) if area >= threshold_area
     ]
+    # Always retain the largest face so detection does not disappear entirely
+    # when every face falls below the configured thresholds.
     return kept_indices or [int(np.argmax(np.asarray(face_areas)))]
 
 
