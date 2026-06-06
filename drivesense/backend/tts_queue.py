@@ -20,7 +20,11 @@ class _SpeakJob:
 
 
 class TTSQueue:
-    """Single-consumer priority queue for all pyttsx3 speech work."""
+    """Serialize speech jobs so only one TTS engine instance speaks at a time.
+
+    Higher-priority alerts may discard lower-priority pending jobs. Explicit
+    user recording can clear the queue through ``clear_pending``.
+    """
 
     _instance: "TTSQueue | None" = None
     _instance_lock = threading.Lock()
@@ -115,6 +119,7 @@ class TTSQueue:
                 self._jobs = kept
                 heapq.heapify(self._jobs)
 
+            # heapq is a min-heap, so negate priority to dispatch larger values first.
             heapq.heappush(self._jobs, (-priority, job.seq, job))
             self._cv.notify()
 

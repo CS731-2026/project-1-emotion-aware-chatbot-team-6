@@ -20,7 +20,17 @@ dist/
 
 # Data and training outputs
 dataset/
+dataset.rar
 prepared_datasets/
 runs/
 runs_timm/
 debug_exports/
+
+# Local database artifacts
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal

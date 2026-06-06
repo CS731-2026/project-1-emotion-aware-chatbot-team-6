@@ -191,11 +191,14 @@ def _build_emotion_alert_prompt(
 
 
 class FocusMonitor:
-    """Watch the driver's eye state AND emotion, run voice interventions.
+    """Track sustained eye/emotion conditions and serialize interventions.
 
     Two trigger paths:
-      A) Closed eyes >= threshold -> full intervention
-      B) Dangerous emotion sustained >= threshold -> intervention
+      A) Closed eyes >= threshold -> beep and fixed TTS only
+      B) Sustained emotion -> either TTS only or a full voice dialogue
+
+    Only one intervention can be active at a time. New triggers are discarded
+    while an event is being handled so multiple recordings cannot overlap.
     """
 
     def __init__(
@@ -230,6 +233,8 @@ class FocusMonitor:
         if enabled:
             return
         with self._state.lock:
+            # Disabling the monitor must also discard partial closed-eye time;
+            # otherwise re-enabling it could trigger an immediate stale alert.
             self._state.closed_eye_started_at = None
             self._state.closed_eye_duration = 0.0
             self._state.last_warning_active = False
@@ -315,6 +320,8 @@ class FocusMonitor:
             )
 
             if should_trigger_eye:
+                # Acquire the shared intervention lock before leaving the state
+                # mutex; emotion and eye triggers use the same serialized path.
                 self._state.is_handling_event = True
                 self._state.last_trigger_at = now
                 self._state.repeat_count += 1
@@ -432,7 +439,7 @@ class FocusMonitor:
         return (now - self._state.last_trigger_at) < self.config.cooldown_seconds
 
     def _launch_intervention(self, emotion: str, trigger_type: str = "eye") -> None:
-        """Run the beep -> TTS -> dialogue loop on a background thread."""
+        """Run the intervention off the perception thread to preserve frame rate."""
         with self._state.lock:
             chat_model = self._state.chat_model
             temperature = self._state.temperature
@@ -475,7 +482,8 @@ class FocusMonitor:
                 and normalized_emotion in EMOTION_FULL_DIALOGUE
             )
 
-            # TTS alert sentence
+            # Full-dialogue emotions wait for alert TTS to finish before opening
+            # the microphone; TTS-only paths return without recording.
             if self._tts is not None:
                 try:
                     if trigger_type == "emotion":

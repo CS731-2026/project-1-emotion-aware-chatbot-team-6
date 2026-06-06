@@ -86,6 +86,7 @@ class ChatbotResponse:
 
 
 def format_driver_state(driver_state: dict[str, Any] | None) -> str:
+    """Format the approved driver-state subset as compact prompt context."""
     sanitized_state = sanitize_driver_state(driver_state)
     if not sanitized_state:
         return "No structured driver state is available."
@@ -119,6 +120,7 @@ def format_driver_state(driver_state: dict[str, Any] | None) -> str:
 
 
 def sanitize_driver_state(driver_state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Apply the privacy boundary for state sent to the remote LLM provider."""
     if not driver_state:
         return None
     return {
@@ -132,6 +134,7 @@ def trim_history(
     conversation_history: list[dict[str, str]] | None,
     max_messages: int = DEFAULT_MAX_HISTORY_MESSAGES,
 ) -> list[dict[str, str]]:
+    """Keep a bounded user/assistant-only history for predictable prompt size."""
     if not conversation_history:
         return []
 
@@ -150,6 +153,7 @@ def build_system_prompt(
     provider_safe: bool = False,
     response_language: str = "en",
 ) -> str:
+    """Build a short-response prompt that treats vision signals as uncertain."""
     normalized_emotion = emotion.strip().lower() if emotion else "neutral"
     emotion_rule = EMOTION_PROMPT_RULES.get(
         normalized_emotion,
@@ -198,6 +202,8 @@ def build_system_prompt(
 
 
 class DriverAssistantChatbot:
+    """OpenRouter-backed assistant with bounded context and fallback handling."""
+
     def __init__(
         self,
         api_key: str | None = None,

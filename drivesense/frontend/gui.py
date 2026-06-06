@@ -546,6 +546,12 @@ class ChatBubble(QFrame):
 
 
 class VisionWorker(QObject):
+    """Own the real-time perception loop and publish one UI-ready driver state.
+
+    All downstream features consume the same post-processed state so the
+    dashboard, History page, FocusMonitor, and chatbot context stay consistent.
+    """
+
     frame_ready = pyqtSignal(QImage)
     state_ready = pyqtSignal(object)
     voice_dialogue_ready = pyqtSignal(object)
@@ -606,6 +612,8 @@ class VisionWorker(QObject):
                 on_voice_user_input=self.voice_user_input_ready.emit,
                 on_voice_status=self.voice_status_ready.emit,
             )
+            # Smoothing happens after confidence post-processing and before the
+            # shared driver state is sent to any UI or intervention component.
             emotion_window = EmotionMajorityWindow()
 
             cap = cv2.VideoCapture(self.args.camera_index)
@@ -1039,6 +1047,8 @@ class VisionWorker(QObject):
 
 
 class ChatWorker(QThread):
+    """Run remote LLM requests without blocking the Qt event loop."""
+
     result_ready = pyqtSignal(object)
     error = pyqtSignal(str)
 
@@ -1089,6 +1099,8 @@ class ChatWorker(QThread):
 
 
 class SpeechWorker(QThread):
+    """Capture and transcribe manual speech outside the Qt event loop."""
+
     transcription_ready = pyqtSignal(str)
     error = pyqtSignal(str)
 
@@ -1116,6 +1128,7 @@ class SpeechWorker(QThread):
 
     @classmethod
     def get_transcriber(cls, model_size: str) -> WhisperTranscriber:
+        """Reuse the expensive Whisper model across manual recordings."""
         device = "cpu"
         key = (model_size, device)
         with cls._cache_lock:
@@ -1154,6 +1167,8 @@ class SpeechWorker(QThread):
 
 
 class DriverAssistantWindow(QMainWindow):
+    """Own the UI state and coordinate vision, chat, and audio workers."""
+
     wake_word_detected_signal = pyqtSignal()
     continued_voice_detected_signal = pyqtSignal()
     continued_timeout_signal = pyqtSignal()
@@ -1924,6 +1939,7 @@ class DriverAssistantWindow(QMainWindow):
         self.wake_word_status_label.setText(f"Wake word: {wake_word_state}")
 
     def record_history_sample(self, driver_state: dict[str, Any]) -> None:
+        """Record the final UI-visible state at a bounded 0.5-second cadence."""
         now = time.perf_counter()
         if now - self._last_history_point_at < 0.5:
             return
@@ -1937,6 +1953,8 @@ class DriverAssistantWindow(QMainWindow):
         driver_detected = bool(driver_state.get("driver_detected", False))
         emotion = str(driver_state.get("emotion", "neutral")).lower()
         if driver_detected and emotion in emotion_confidences:
+            # History intentionally records the selected UI label, not the raw
+            # seven-class probability vector produced by the classifier.
             emotion_confidences[emotion] = max(
                 0.0,
                 min(1.0, float(driver_state.get("emotion_confidence", 0.0))),
@@ -1993,15 +2011,18 @@ class DriverAssistantWindow(QMainWindow):
         self.append_log("history", f"Exported emotion chart to {emotion_path}")
 
     def add_message(self, text: str, is_user: bool) -> ChatBubble:
+        """Append a chat bubble and scroll after Qt completes the layout pass."""
         bubble = ChatBubble(text, is_user=is_user)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
         QTimer.singleShot(0, self.scroll_chat_to_bottom)
         return bubble
 
     def show_processing_placeholder(self) -> None:
+        """Reserve the assistant reply position while a request is running."""
         self.pending_assistant_bubbles.append(self.add_message("...", is_user=False))
 
     def replace_processing_placeholder(self, text: str) -> None:
+        """Replace the oldest pending placeholder to preserve reply ordering."""
         if self.pending_assistant_bubbles:
             bubble = self.pending_assistant_bubbles.pop(0)
             bubble.set_text(text)
@@ -2023,6 +2044,7 @@ class DriverAssistantWindow(QMainWindow):
         self.video_label.setPixmap(pixmap)
 
     def update_emotion_state(self, state: dict) -> None:
+        """Consume the same postprocessed driver state used by alerts and history."""
         self.current_driver_state = sanitize_driver_state(state) or {}
         self.current_emotion = state["emotion"]
         self.current_risk = state["risk"]
@@ -2173,6 +2195,8 @@ class DriverAssistantWindow(QMainWindow):
             return
 
         self.input_edit.clear()
+        # Render the user's message and progress placeholder before starting the
+        # asynchronous model request.
         self.add_message(text, is_user=True)
         self.show_processing_placeholder()
         history_snapshot = list(self.conversation_history)
@@ -2190,6 +2214,7 @@ class DriverAssistantWindow(QMainWindow):
         history_snapshot: list[dict[str, str]],
         auto_trigger: bool,
     ) -> None:
+        """Start the single allowed GUI chat request and disable new requests."""
         assert self.chatbot is not None
         self.send_button.setEnabled(False)
         self.mic_button.setEnabled(False)
@@ -2216,6 +2241,7 @@ class DriverAssistantWindow(QMainWindow):
         self.chat_worker.start()
 
     def handle_chat_response(self, payload: dict) -> None:
+        # Replace the visible progress marker before queueing spoken output.
         self.replace_processing_placeholder(payload["text"])
         self.conversation_history.append({"role": "assistant", "content": payload["text"]})
         self.speak_reply_async(payload["text"], payload.get("emotion", self.current_emotion))
@@ -2241,6 +2267,7 @@ class DriverAssistantWindow(QMainWindow):
 
     @pyqtSlot(str)
     def handle_voice_user_input(self, text: str) -> None:
+        """Display transcription immediately while the voice pipeline gets a reply."""
         cleaned = text.strip()
         if not cleaned:
             return
@@ -2296,6 +2323,7 @@ class DriverAssistantWindow(QMainWindow):
 
     @pyqtSlot(str)
     def handle_auto_voice_status(self, message: str) -> None:
+        """Route backend lifecycle messages into the three audio status fields."""
         lower = message.lower()
         if "tts" in lower or "beep" in lower:
             self.set_voice_output_state(message)
@@ -2335,6 +2363,7 @@ class DriverAssistantWindow(QMainWindow):
         self.refresh_voice_status_labels()
 
     def _pause_voice_listeners_for_tts(self) -> None:
+        """Prevent wake-word and follow-up listeners from capturing system TTS."""
         if self.continued_listener is not None:
             self.continued_listener.stop(wait=False)
         if self.wake_word_listener is not None and self.wake_word_listening:
@@ -2343,6 +2372,7 @@ class DriverAssistantWindow(QMainWindow):
         self.update_audio_control_buttons()
 
     def interrupt_tts_for_manual_recording(self) -> None:
+        """Give explicit push-to-talk input priority over all queued speech."""
         TextToSpeech.interrupt_all()
         if self.continued_listener is not None:
             self.continued_listener.stop(wait=False)
@@ -2398,6 +2428,7 @@ class DriverAssistantWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_tts_finished(self) -> None:
+        """Open follow-up listening only after reply speech has fully completed."""
         if self.speech_worker is not None:
             self.set_voice_output_state("idle")
             self.append_log("voice", "TTS callback ignored during manual recording")
@@ -2433,6 +2464,7 @@ class DriverAssistantWindow(QMainWindow):
         Otherwise use VAD with configured silence threshold.
         """
         if push_to_talk:
+            # Manual input is the only recording path allowed to preempt TTS.
             self.interrupt_tts_for_manual_recording()
         if not self.voice_input_enabled:
             self.set_voice_input_state("listening stopped")
@@ -2602,6 +2634,7 @@ class DriverAssistantWindow(QMainWindow):
         self.update_audio_control_buttons()
 
     def stop_all_listening(self) -> None:
+        """Stop every microphone path controlled by the listening master switch."""
         if self.continued_listener is not None:
             self.continued_listener.stop(wait=False)
         if self.wake_word_listener is not None and self.wake_word_listening:
@@ -2706,6 +2739,7 @@ class DriverAssistantWindow(QMainWindow):
         self.append_log("voice", "Follow-up timeout; returned to wake-word listening")
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
+        """Stop background workers before Qt destroys their owning window."""
         if self.wake_word_listener is not None and self.wake_word_listening:
             self.wake_word_listener.stop()
         if self.continued_listener is not None:
